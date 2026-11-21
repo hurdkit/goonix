@@ -27,6 +27,7 @@ cleanup() {
 trap cleanup EXIT
 export NIX_STORE_DIR="$fixture/store" GUIX_DATABASE_DIRECTORY="$fixture/db"
 export GUIX_STATE_DIRECTORY="$fixture/var" GUILE_AUTO_COMPILE=0
+export GUIX_LOG_DIRECTORY="$fixture/var/log/guix"
 export HS7_FIXTURE="$fixture" HS7_PHASE=hold
 export HS7_HOLDER_SOCKET="$socket" HS7_COLLECTOR_SOCKET="$socket"
 unset GUIX

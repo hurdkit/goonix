@@ -7,6 +7,7 @@ daemon=${GOONIX_TEST_DAEMON:-$root/guix-daemon}
 "$root/daemon/test/differential/prepare-write-fixture.sh" "$fixture"
 export NIX_STORE_DIR="$fixture/store" GUIX_DATABASE_DIRECTORY="$fixture/db"
 export GUIX_STATE_DIRECTORY="$fixture/var" GUIX_DAEMON_SOCKET="$fixture/var/socket"
+export GUIX_LOG_DIRECTORY="$fixture/var/log/guix"
 export HS7_ROOT="$fixture" GUIX="$root/scripts/guix"
 goonix_start_capped "$root/pre-inst-env" "$daemon" --disable-chroot --listen="$GUIX_DAEMON_SOCKET" >"$fixture/daemon.log" 2>&1
 pid=$GOONIX_TEST_PID

@@ -41,8 +41,9 @@ import Goonix.Store.ReadOnly
 import Goonix.Store.References (scanReferences)
 import Goonix.Store.Settings
 import Goonix.Store.Config (ServerConfig, configGuixProgram, configBuildUsers, configSharedScheduler, configStore, configDatabase, configStateDirectory)
-import Goonix.Store.GuixProgram (guixProgram)
-import Goonix.Store.Substitute (substitutableInfos, substitutePath)
+import Goonix.Store.GuixProgram (guixProgram, canonPath)
+import qualified Goonix.Config as Config
+import Goonix.Store.Substitute (substitutableInfos, substitutePath, packSettings)
 import Goonix.Store.Writing
 import System.Posix.ByteString (RawFilePath)
 import qualified System.Posix.Directory.ByteString as Dir
@@ -59,10 +60,12 @@ import System.Posix.User (getEffectiveGroupID, getEffectiveUserID)
 import System.FilePath (takeDirectory)
 import System.Directory (findExecutable)
 import System.IO.Error (ioeGetErrorString, isDoesNotExistError)
-import System.Posix.Types (Fd (..))
+import System.Posix.Types (Fd (..), CUid (..), CGid (..))
 import Foreign.C.String (CString, withCString)
 import Foreign.C.Types (CInt (..), CSize (..))
 import Foreign.Marshal.Alloc (alloca)
+import Foreign.Marshal.Array (withArray, withArray0)
+import Foreign.Marshal.Utils (withMany)
 import Foreign.Ptr (Ptr, castPtr, nullPtr)
 import Foreign.Storable (peek)
 import Goonix.Build.Sandbox
@@ -508,13 +511,19 @@ runBuilderWithUser buildUser rootFd store settings trace mode drvPath drv = do
     spawned <- if settingBool "build-use-sandbox" True settings && not (isBuiltin)
       then spawnSandboxedBuilder buildUser settings store work drvPath actualDrv command env writeFd
       else do
-        -- As in builtins.cc, the downloader inherits the daemon's environment.
+        -- As in builtins.cc, the downloader inherits the daemon's environment,
+        -- plus NIX_STORE (for strip-store-file-name) and _NIX_OPTIONS (the packed
+        -- settings), which C++ builtinDownload sets before exec (builtins.cc:49-52).
         inherited <- if isBuiltin then getEnvironment else pure []
-        let childEnvironment = if isBuiltin then inherited else env
-        (_, _, _, process) <- createProcess command
-          { cwd = Just (C.unpack work), env = Just childEnvironment, std_out = UseHandle writeHandle, std_err = UseHandle writeHandle, create_group = True }
-        pid <- maybe 0 fromIntegral <$> getPid process
-        pure (pid, waitForProcess process, Nothing, [])
+        let childEnvironment = if isBuiltin
+              then inherited ++ [("NIX_STORE", C.unpack (storeDirectory store)),
+                                 ("_NIX_OPTIONS", C.unpack (packSettings settings))]
+              else env
+        case cmdspec command of
+          RawCommand executable arguments -> do
+            pid <- spawnDirectBuilder buildUser executable arguments childEnvironment work writeFd
+            pure (pid, waitForSandbox pid, Nothing, [])
+          ShellCommand _ -> throwIO (storeError "shell builders are not supported")
     let (pid, _, _, _) = spawned
     -- The child exists before this handler is installed only while masked.
     -- Cancellation after this point cannot orphan it in the fork/wait gap.
@@ -598,6 +607,10 @@ runBuilderWithUser buildUser rootFd store settings trace mode drvPath drv = do
 
 foreign import ccall unsafe "goonix_spawn_sandbox"
   c_spawn_sandbox :: CString -> CString -> CInt -> Ptr CInt -> IO CInt
+
+foreign import ccall unsafe "goonix_spawn_builtin"
+  c_spawn_builtin :: CString -> Ptr CString -> Ptr CString -> CString -> CInt -> CInt
+                  -> CUid -> CGid -> Ptr CGid -> CInt -> Ptr CInt -> IO CInt
 
 topLevelStorePath :: Store -> RawFilePath -> RawFilePath
 topLevelStorePath store path =
@@ -793,6 +806,34 @@ waitForSandbox pid = do
     Just (Stopped _) -> waitForSandbox pid
     Nothing -> throwIO (storeError "cannot wait for sandbox helper")
 
+-- | Spawn a non-sandboxed builder (a builtin such as guix perform-download, or
+-- an ordinary builder when the sandbox is disabled) as the leased build user.
+-- C++ runs builtins outside the chroot but "under a separate build user, though"
+-- (build.cc:2555-2558): the child drops to the build user before exec.  A root
+-- daemon that ran the builtin as root would be refused by perform-download
+-- ("refusing to run with elevated privileges").  The C shim drops supplementary
+-- groups, gid, then uid (C++ setIDsAction order) between fork and exec; with no
+-- build user the child keeps the daemon's identity (C++ build-users-group empty).
+spawnDirectBuilder :: Maybe BuildUser -> FilePath -> [String] -> [(String, String)] -> RawFilePath -> Fd -> IO Int
+spawnDirectBuilder buildUser executable arguments environment work (Fd logFd) = do
+  let argv = executable : arguments
+      envStrings = map (\(name, value) -> name ++ "=" ++ value) environment
+      dropIds = maybe 0 (const 1) buildUser
+      uid = maybe 0 (fromIntegral . buildUserUid) buildUser
+      gid = maybe 0 (fromIntegral . buildUserGid) buildUser
+      groups = maybe [] (map fromIntegral . buildUserGroups) buildUser
+  withCString executable $ \program' ->
+    withMany withCString argv $ \argvPtrs ->
+    withArray0 nullPtr argvPtrs $ \argv' ->
+    withMany withCString envStrings $ \envPtrs ->
+    withArray0 nullPtr envPtrs $ \env' ->
+    withCString (C.unpack work) $ \work' ->
+    withArray groups $ \groups' ->
+    alloca $ \pidPointer -> do
+      result <- c_spawn_builtin program' argv' env' work' logFd dropIds uid gid groups'
+        (fromIntegral (length groups)) pidPointer
+      if result < 0 then throwIO (storeError "cannot spawn builder") else fromIntegral <$> peek pidPointer
+
 makeSandboxRoot :: Store -> IO RawFilePath
 makeSandboxRoot store = do
   let parent = maybe "/tmp" (<> "/build") (storeStateDirectory store)
@@ -858,10 +899,13 @@ checkBuiltOutputs store drvPath replacements retain = forM_ replacements $ \(ori
 
 buildLogPath :: Settings -> Store -> ByteString -> IO RawFilePath
 buildLogPath settings store drvPath = do
+  -- C++ nixLogDir = canonPath(getEnv("GUIX_LOG_DIRECTORY", NIX_LOG_DIR))
+  -- (globals.cc:63): the configured log directory (NIX_LOG_DIR, /var/log/guix),
+  -- NOT the state directory.  The client looks there for `guix build --log-file`;
+  -- a state-dir fallback (/var/guix/log/guix) made CI report "Could not find
+  -- build log".  Canonicalised as C++ does.
   configured <- getEnv "GUIX_LOG_DIRECTORY"
-  let base = case configured of
-        Just path -> path
-        Nothing -> maybe "/tmp" (<> "/log/guix") (storeStateDirectory store)
+  let base = canonPath (maybe (C.pack Config.logDirectory) id configured)
       basename = B.drop (B.length (storeDirectory store) + 1) drvPath
       suffix = case setting "build-log-compression" "gzip" settings of
         "none" -> ""
