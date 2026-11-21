@@ -9,6 +9,7 @@
 #include <string.h>
 
 #include <sys/types.h>
+#include <grp.h>
 
 /* Equivalent to the C++ daemon's killUser: the short-lived child changes to
    the leased uid so kill(-1, SIGKILL) affects only that uid, including itself. */
@@ -159,6 +160,42 @@ int goonix_spawn_discover(const char *program, int *pid_out)
   result = posix_spawn(&pid, program, NULL, &attributes, argv, environ);
   posix_spawnattr_destroy(&attributes);
   if (result != 0) { errno = result; return -1; }
+  *pid_out = (int)pid;
+  return 0;
+}
+
+/* goonix: spawn a builtin builder (guix perform-download) as the leased build
+   user, outside the chroot.  C++ runs builtins outside the chroot but "under a
+   separate build user, though" (build.cc:2555-2558): the child drops to the
+   build user before execBuilderOrBuiltin.  A root daemon that ran the builtin
+   as root would be refused by perform-download ("refusing to run with elevated
+   privileges").  The drop order matches C++ setIDsAction (spawn.cc):
+   setgroups, then setgid, then setuid, each verified.  Only this tiny C shim
+   runs between fork and exec; no Haskell (threaded RTS).  When drop_ids is 0
+   (no build user, unprivileged daemon) the child keeps the daemon's identity,
+   as C++ does when build-users-group is empty. */
+int goonix_spawn_builtin(const char *program, char *const argv[],
+                         char *const envp[], const char *work_dir,
+                         int log_fd, int drop_ids,
+                         uid_t uid, gid_t gid, const gid_t *groups, int ngroups,
+                         int *pid_out)
+{
+  pid_t pid = fork();
+  if (pid < 0) return -1;
+  if (pid == 0) {
+    if (setpgid(0, 0) < 0) _exit(127);
+    if (dup2(log_fd, STDOUT_FILENO) < 0 || dup2(log_fd, STDERR_FILENO) < 0)
+      _exit(127);
+    if (log_fd > STDERR_FILENO) close(log_fd);
+    if (work_dir && chdir(work_dir) < 0) _exit(127);
+    if (drop_ids) {
+      if (setgroups((size_t)ngroups, groups) < 0) _exit(126);
+      if (setgid(gid) < 0 || getgid() != gid || getegid() != gid) _exit(126);
+      if (setuid(uid) < 0 || getuid() != uid || geteuid() != uid) _exit(126);
+    }
+    execve(program, argv, envp);
+    _exit(127);
+  }
   *pid_out = (int)pid;
   return 0;
 }

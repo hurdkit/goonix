@@ -8,6 +8,7 @@ module Goonix.Store.Substitute
   , substitutableInfo
   , substitutableInfos
   , substitutePath
+  , packSettings
   ) where
 
 import Control.Exception (SomeException, bracket, catch, throwIO)
