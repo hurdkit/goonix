@@ -43,7 +43,6 @@ import Goonix.Store.Writing
 import qualified Goonix.Store.Collector as Collector
 import Goonix.Store.Path (validateStoreName)
 import Goonix.Store.Ca (assertNotReserved)
-import Goonix.Store.CaBuild (isStorePathStrict)
 import Goonix.Store.CaStore (initCaRecords, realisedOutputPath, queryGoonixBuildGraph, goonixRecordFields)
 import Goonix.Store.Derivation (parseDerivation)
 import Goonix.Store.Records (queryRecords)
@@ -226,8 +225,7 @@ dispatch config store client settingsRef rootFd rootPath clientVersion operation
     writeFrame client stderrLast
     writeSocket client (encodeInt 1)
   10 -> do
-    path <- readStringSocket client
-    _ <- assertStorePath store path
+    path <- readStorePath store client
     settings <- readIORef settingsRef
     ensureStorePath config rootFd store settings (buildTrace settings client) path
     writeFrame client stderrLast
@@ -240,8 +238,7 @@ dispatch config store client settingsRef rootFd rootPath clientVersion operation
     writeFrame client stderrLast
     writeSocket client (encodeString path)
   11 -> do
-    path <- readStringSocket client
-    _ <- assertStorePath store path
+    path <- readStorePath store client
     appendTempRoot rootFd path
     writeFrame client stderrLast
     writeSocket client (encodeInt 1)
@@ -254,7 +251,7 @@ dispatch config store client settingsRef rootFd rootPath clientVersion operation
     writeFrame client stderrLast
     writeSocket client (encodeInt 1)
   16 -> do
-    path <- readStringSocket client
+    path <- readStorePath store client
     sign <- readIntSocket client
     archive <- exportPath store path (sign == 1)
     writeSocket client (encodeInt stderrWrite <> encodeString archive)
@@ -293,8 +290,7 @@ dispatch config store client settingsRef rootFd rootPath clientVersion operation
               _ -> throwIO (storeError "unsupported garbage-collection action")
     writeFrame client stderrLast
     writeSocket client (encodeStrings deleted <> encodeWord64 freed <> encodeWord64 0)
-  1 -> queryOnePath $ \_ path -> do
-    _ <- assertStorePath store path
+  1 -> queryOnePath $ \_ path ->
     encodeBool <$> isValidPath store path
   4 -> queryOnePath $ \_ path -> encodeString . encodeBase16 <$> queryPathHash store path
   5 -> queryOnePath $ \_ path -> encodeStrings <$> queryReferences store path
@@ -321,8 +317,7 @@ dispatch config store client settingsRef rootFd rootPath clientVersion operation
     writeFrame client stderrLast
     writeSocket client (encodeString path)
   3 -> do
-    path <- readStringSocket client
-    _ <- assertStorePath store path
+    path <- readStorePath store client
     settings <- readIORef settingsRef
     result <- if settingBool "build-use-substitutes" False settings
       then substitutablePaths config settings [path] else pure []
@@ -372,8 +367,7 @@ dispatch config store client settingsRef rootFd rootPath clientVersion operation
   -- goonix: resolved-output and signed-record queries (HS-11).  No choice
   -- mutation in a query and no client registration (C++ nix-daemon.cc).
   82 -> do
-    drvPath <- readStringSocket client
-    assertStrictPath store drvPath
+    drvPath <- readStorePathStrict store client
     output <- readStringSocket client
     drv <- readDerivationFile drvPath
     path <- realisedOutputPath store drvPath drv output
@@ -386,17 +380,12 @@ dispatch config store client settingsRef rootFd rootPath clientVersion operation
     writeFrame client stderrLast
     writeSocket client (encodeStrings (goonixRecordFields records False))
   84 -> do
-    drvPath <- readStringSocket client
-    assertStrictPath store drvPath
+    drvPath <- readStorePathStrict store client
     (records, hints) <- queryGoonixBuildGraph store drvPath
     writeFrame client stderrLast
     writeSocket client (encodeStrings (goonixRecordFields records True) <> encodeStrings hints)
   _ -> throwIO (StoreError (C.pack ("invalid operation " ++ show operation)) 1)
   where
-    assertStrictPath store path = do
-      unless (isStorePathStrict (storeDirectory store) path) $
-        throwIO (storeError ("path `" ++ C.unpack path ++ "' is not a valid store path"))
-      either (throwIO . storeError) pure (assertNotReserved (storeDirectory store) path)
     readDerivationFile path = do
       bytes <- B.readFile (C.unpack path)
       either (throwIO . storeError) pure (parseDerivation bytes)
@@ -407,8 +396,7 @@ dispatch config store client settingsRef rootFd rootPath clientVersion operation
       writeFrame client stderrLast
       writeSocket client reply
     queryOnePath action = do
-      path <- readStringSocket client
-      _ <- assertStorePath store path
+      path <- readStorePath store client
       reply <- action store path
       writeFrame client stderrLast
       writeSocket client reply
@@ -588,6 +576,27 @@ readArchiveChunk client = do
 
 readStorePathsSocket :: Socket -> IO [ByteString]
 readStorePathsSocket = readStringsSocket
+
+-- | C++ readStorePath (store-api.cc:337): read one store path, asserting the
+-- store prefix AND that it is not a goonix reserved name (placeholder/self
+-- token).  The path-set reads (readStorePathsSocket) deliberately do NOT refuse
+-- reserved names, matching C++ readStorePaths.  The Haskell daemon answers a
+-- reserved path with a store error and keeps the connection (C++ rethrows while
+-- parsing and drops it); the refusal itself is the parity requirement.
+readStorePath :: Store -> Socket -> IO ByteString
+readStorePath store client = do
+  path <- readStringSocket client
+  _ <- assertStorePath store path
+  either (throwIO . storeError) pure (assertNotReserved (storeDirectory store) path)
+  pure path
+
+-- | C++ readStorePathStrict (store-api.cc:357): the strict single-path read.
+readStorePathStrict :: Store -> Socket -> IO ByteString
+readStorePathStrict store client = do
+  path <- readStringSocket client
+  _ <- assertStorePathStrict store path
+  either (throwIO . storeError) pure (assertNotReserved (storeDirectory store) path)
+  pure path
 
 readStringsSocket :: Socket -> IO [ByteString]
 readStringsSocket client = do
