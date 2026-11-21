@@ -11,8 +11,10 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as C
 import Data.List (sort)
+import qualified Data.Map.Strict as Map
 import Data.Word (Word8)
 import Goonix.Store.Ca
+import Goonix.Store.Derivation (parseDerivation, writeDerivation, outputs, inputDrvs)
 import Goonix.Store.Hash (Hash (..), HashAlgorithm (..), sha256)
 import System.Directory (createDirectoryIfMissing, removePathForcibly, getTemporaryDirectory)
 import System.Exit (die)
@@ -97,6 +99,9 @@ main = do
 
     let resolved = lookupObj vectors "resolvedDerivation"
         bytes = field resolved "bytes"
+    case parseDerivation bytes of
+      Left err -> die ("resolved derivation parse: " ++ err)
+      Right parsed -> check "shared resolved derivation canonical bytes" (writeDerivation parsed == bytes)
     check "shared resolved-addressed path vector"
       (resolvedAddressedPath store "out" "hello" bytes == field resolved "resolvedPath")
     check "shared resolved-addressed sibling path vector"
@@ -104,6 +109,12 @@ main = do
 
     let unresolved = lookupObj vectors "unresolvedDerivation"
         unresolvedBytes = field unresolved "bytes"
+    case parseDerivation unresolvedBytes of
+      Left err -> die ("unresolved derivation parse: " ++ err)
+      Right parsed -> do
+        check "shared unresolved derivation canonical bytes" (writeDerivation parsed == unresolvedBytes)
+        check "shared unresolved derivation has two outputs and an input derivation"
+          (Map.size (outputs parsed) == 2 && Map.size (inputDrvs parsed) == 1)
     check "shared placeholder bytes match the unresolved derivation serializer"
       (makePlaceholder store unresolvedBytes (field unresolved "output") (field unresolved "name")
         == store <> "/" <> field unresolved "placeholderHash" <> "-" <> field unresolved "name")
