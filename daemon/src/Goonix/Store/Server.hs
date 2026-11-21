@@ -42,6 +42,11 @@ import Goonix.Store.Wire
 import Goonix.Store.Writing
 import qualified Goonix.Store.Collector as Collector
 import Goonix.Store.Path (validateStoreName)
+import Goonix.Store.Ca (assertNotReserved)
+import Goonix.Store.CaBuild (isStorePathStrict)
+import Goonix.Store.CaStore (initCaRecords, realisedOutputPath, queryGoonixBuildGraph, goonixRecordFields)
+import Goonix.Store.Derivation (parseDerivation)
+import Goonix.Store.Records (queryRecords)
 import System.Posix.Env.ByteString (getEnv)
 import Goonix.Store.Files (withTempRootFile, withCollectorGCLock, withOtherTemporaryRoots, appendTempRoot, deleteTree, mkdirParents, directoryEntries, catchMissing, deduplicateTree)
 import System.Posix.IO (closeFd)
@@ -135,7 +140,9 @@ handleClient config counter client = do
     pure (next, C.pack (show pid <> "-" <> show next))
   catch
     (withTempRootFile (temporaryRootsPath config <> "/" <> rootName) (storeGcLockPath config) $ \rootFd ->
-      bracket (openStore (configStore config) (configDatabase config)) closeStore $ \store ->
+      bracket (openStore (configStore config) (configDatabase config)) closeStore $ \store -> do
+        -- goonix: the records tables are created if absent (HS-11).
+        initCaRecords store
         catch (handleConnection config store { storeStateDirectory = configStateDirectory config } client settingsRef rootFd (temporaryRootsPath config <> "/" <> rootName)) report)
     report
   where
@@ -362,8 +369,37 @@ dispatch config store client settingsRef rootFd rootPath clientVersion operation
     settings <- readIORef settingsRef
     writeFrame client stderrLast
     writeSocket client (encodeStrings (substituteURLs settings))
+  -- goonix: resolved-output and signed-record queries (HS-11).  No choice
+  -- mutation in a query and no client registration (C++ nix-daemon.cc).
+  82 -> do
+    drvPath <- readStringSocket client
+    assertStrictPath store drvPath
+    output <- readStringSocket client
+    drv <- readDerivationFile drvPath
+    path <- realisedOutputPath store drvPath drv output
+    writeFrame client stderrLast
+    writeSocket client (encodeString path)
+  83 -> do
+    resolvedHash <- readStringSocket client
+    output <- readStringSocket client
+    records <- queryRecords (database store) resolvedHash output
+    writeFrame client stderrLast
+    writeSocket client (encodeStrings (goonixRecordFields records False))
+  84 -> do
+    drvPath <- readStringSocket client
+    assertStrictPath store drvPath
+    (records, hints) <- queryGoonixBuildGraph store drvPath
+    writeFrame client stderrLast
+    writeSocket client (encodeStrings (goonixRecordFields records True) <> encodeStrings hints)
   _ -> throwIO (StoreError (C.pack ("invalid operation " ++ show operation)) 1)
   where
+    assertStrictPath store path = do
+      unless (isStorePathStrict (storeDirectory store) path) $
+        throwIO (storeError ("path `" ++ C.unpack path ++ "' is not a valid store path"))
+      either (throwIO . storeError) pure (assertNotReserved (storeDirectory store) path)
+    readDerivationFile path = do
+      bytes <- B.readFile (C.unpack path)
+      either (throwIO . storeError) pure (parseDerivation bytes)
     encodeInfo (path, deriver, references, downloadSize, narSize) = encodeString path
       <> encodeString deriver <> encodeStrings references <> encodeWord64 downloadSize <> encodeWord64 narSize
     queryAll action = do

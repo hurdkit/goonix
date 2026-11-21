@@ -16,6 +16,7 @@ import Data.Word (Word8)
 import Goonix.Store.Ca
 import Goonix.Store.Derivation (parseDerivation, writeDerivation, outputs, inputDrvs)
 import Goonix.Store.Hash (Hash (..), HashAlgorithm (..), sha256)
+import Goonix.Store.Records (BuildRecord (..), canonicalBuildRecordPayload)
 import System.Directory (createDirectoryIfMissing, removePathForcibly, getTemporaryDirectory)
 import System.Exit (die)
 import System.Posix.Files (createSymbolicLink, setFileMode)
@@ -118,6 +119,22 @@ main = do
     check "shared placeholder bytes match the unresolved derivation serializer"
       (makePlaceholder store unresolvedBytes (field unresolved "output") (field unresolved "name")
         == store <> "/" <> field unresolved "placeholderHash" <> "-" <> field unresolved "name")
+
+    let recordVector = lookupObj vectors "record"
+        record = BuildRecord
+          { recordResolvedHash = field recordVector "resolvedHash"
+          , recordResolvedDerivation = field recordVector "derivation"
+          , recordOutput = field recordVector "output"
+          , recordPath = field recordVector "path"
+          , recordOrigin = field recordVector "origin"
+          , recordRelocationChecked = num recordVector "relocationChecked" /= 0
+          , recordSignature = ""
+          }
+        payload = canonicalBuildRecordPayload record
+        expectedPayload = B.pack [round n | JNum n <- arr recordVector "payload"]
+    check "shared canonical record payload bytes" (payload == expectedPayload)
+    check "shared canonical record payload hash"
+      (printHashHex (Hash SHA256 (sha256 payload)) == field recordVector "sha256")
   putStrLn "CA-0 shared vectors (Haskell): PASS"
   where
     withTempDir action = do

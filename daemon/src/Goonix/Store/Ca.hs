@@ -26,6 +26,8 @@ module Goonix.Store.Ca
   , encodeReserved
   , put64
   , putBytes
+  , treeDomain
+  , contentDomain
   ) where
 
 import Data.Bits ((.&.), shiftR)
@@ -102,16 +104,20 @@ makePlaceholder store unresolvedBytes output name = case checkOutputName output 
     in store <> "/" <> encodeReserved (sha256 (prefix <> unresolvedBytes)) False <> "-" <> name
 
 -- | A reserved path is a store path whose 32-character hash part uses only the
--- reserved alphabet (C++ reservedPath).
+-- reserved alphabet (C++ reservedPath).  C++ uses baseNameOf (the full
+-- basename, hash included), NOT storePathToName (which strips the hash).
 reservedPath :: ByteString -> ByteString -> Bool
 reservedPath store path =
-  let base = storePathToName store path
+  let base = baseNameOf path
       hashPart = B.take 32 base
   in isStorePath store path
      && B.length path >= B.length store + 35
      && B.length base >= 34
-     && B.length base >= 33 && B.index base 32 == 45 -- '-'
+     && B.index base 32 == 45 -- '-'
      && B.all (\c -> c `B.elem` alphabet) hashPart
+
+baseNameOf :: ByteString -> ByteString
+baseNameOf = snd . C.breakEnd (== '/')
 
 isStorePath :: ByteString -> ByteString -> Bool
 isStorePath store path =
@@ -123,11 +129,11 @@ isReservedStorePath = reservedPath
 
 isPlaceholderPath :: ByteString -> ByteString -> Bool
 isPlaceholderPath store path =
-  reservedPath store path && B.index (storePathToName store path) 0 == 101 -- 'e'
+  reservedPath store path && B.index (baseNameOf path) 0 == 101 -- 'e'
 
 isTokenStorePath :: ByteString -> ByteString -> Bool
 isTokenStorePath store path =
-  reservedPath store path && B.index (storePathToName store path) 0 /= 101
+  reservedPath store path && B.index (baseNameOf path) 0 /= 101
 
 assertNotReserved :: ByteString -> ByteString -> Either String ()
 assertNotReserved store path

@@ -132,7 +132,8 @@ data DecodeResult a
 workerMagic1, workerMagic2, protocolVersion :: Word32
 workerMagic1 = 0x6e697863
 workerMagic2 = 0x6478696f
-protocolVersion = 0x164
+-- goonix: 0x166 adds the resolved-derivation graph record queries (82-84).
+protocolVersion = 0x166
 
 stderrNext, stderrRead, stderrWrite, stderrLast, stderrError :: Word32
 stderrNext = 0x6f6c6d67
@@ -199,6 +200,10 @@ operations =
   , Operation 35 "wopVerifyStore" [SInt (name "checkContents"), SInt (name "repair")] [SBool result]
   , Operation 80 "wopBuiltinBuilders" [] [SStrings strings]
   , Operation 81 "wopSubstituteURLs" [] [SStrings strings]
+  -- goonix: resolved-output and signed-record queries (HS-11).
+  , Operation 82 "wopQueryRealisedOutput" [SString path, SString (name "output")] [SString path]
+  , Operation 83 "wopQueryBuildRecords" [SString (name "resolvedHash"), SString (name "output")] [SStrings strings]
+  , Operation 84 "wopQueryBuildGraph" [SString path] [SStrings strings, SStrings (name "hints")]
   ]
 
 operationByCode :: Word32 -> Maybe Operation
