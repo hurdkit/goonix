@@ -15,6 +15,7 @@ run_one() {
   mkdir -p "$fixture/store" "$fixture/db" "$fixture/var" "$fixture/substituter-data"
   export NIX_STORE_DIR="$fixture/store" GUIX_DATABASE_DIRECTORY="$fixture/db"
   export GUIX_STATE_DIRECTORY="$fixture/var" GUIX_DAEMON_SOCKET="$fixture/var/socket"
+  export GUIX_LOG_DIRECTORY="$fixture/var/log/guix"
   export GUIX_BINARY_SUBSTITUTE_URL="file://$fixture/substituter-data"
   export GUIX_TEST_SUBSTITUTE_URLS="$GUIX_BINARY_SUBSTITUTE_URL"
   export HS7_FIXTURE="$fixture" GUIX="$root/scripts/guix"

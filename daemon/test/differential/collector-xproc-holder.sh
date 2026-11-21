@@ -37,6 +37,7 @@ cleanup() {
 trap cleanup EXIT
 export NIX_STORE_DIR="$fixture/store" GUIX_DATABASE_DIRECTORY="$fixture/db"
 export GUIX_STATE_DIRECTORY="$fixture/var" GUILE_AUTO_COMPILE=0
+export GUIX_LOG_DIRECTORY="$fixture/var/log/guix"
 export COL_FIXTURE="$fixture" COL_SOCKET="$socket"
 unset GUIX
 mkdir -p "$NIX_STORE_DIR" "$GUIX_DATABASE_DIRECTORY" "$GUIX_STATE_DIRECTORY"

@@ -10,6 +10,7 @@ if test -e "$fixture"; then chmod -R u+rwX "$fixture" 2>/dev/null || true; rm -r
 "$root/daemon/test/differential/prepare-write-fixture.sh" "$fixture"
 export NIX_STORE_DIR="$fixture/store" GUIX_DATABASE_DIRECTORY="$fixture/db"
 export GUIX_STATE_DIRECTORY="$fixture/var" GUIX_DAEMON_SOCKET="$fixture/var/socket"
+export GUIX_LOG_DIRECTORY="$fixture/var/log/guix"
 export GUIX="$root/scripts/guix"
 export GUILE_AUTO_COMPILE=0
 rm -f "$GUIX_DAEMON_SOCKET"

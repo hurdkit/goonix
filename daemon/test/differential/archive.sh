@@ -11,6 +11,7 @@ cp "$root/tests/keys/openpgp/signing-key.pub" "$fixture/config/signing-key.pub"
 chmod 0600 "$fixture/config/signing-key.sec"
 export NIX_STORE_DIR="$fixture/store" GUIX_DATABASE_DIRECTORY="$fixture/db"
 export GUIX_STATE_DIRECTORY="$fixture/var" GUIX_DAEMON_SOCKET="$fixture/var/socket"
+export GUIX_LOG_DIRECTORY="$fixture/var/log/guix"
 export GUIX_CONFIGURATION_DIRECTORY="$fixture/config" HS3_ROOT="$fixture"
 export GUIX=${GUIX:-/run/current-system/sw/bin/guix}
 "$daemon" --disable-chroot --listen="$GUIX_DAEMON_SOCKET" >"$fixture/daemon.log" 2>&1 &

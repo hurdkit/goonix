@@ -21,6 +21,7 @@ run_one() {
   chmod 0555 "$fixture/input-tree/sub/b"
   printf 'flat payload\n' > "$fixture/flat.txt"
   export NIX_STORE_DIR="$fixture/store" GUIX_DATABASE_DIRECTORY="$fixture/db" GUIX_STATE_DIRECTORY="$fixture/var" GUIX_DAEMON_SOCKET="$fixture/var/socket" HS3_ROOT="$fixture" GUIX_CONFIGURATION_DIRECTORY="$fixture/config" GUIX=/run/current-system/sw/bin/guix
+  export GUIX_LOG_DIRECTORY="$fixture/var/log/guix"
   "$daemon" --disable-chroot --listen="$GUIX_DAEMON_SOCKET" >"$out/$name.log" 2>&1 &
   pid=$!
   trap 'kill "$pid" 2>/dev/null || true' EXIT

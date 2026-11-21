@@ -10,6 +10,7 @@ mkdir -p "$out"
 export NIX_STORE_DIR="$fixture/store"
 export GUIX_DATABASE_DIRECTORY="$fixture/db"
 export GUIX_STATE_DIRECTORY="$fixture/var"
+export GUIX_LOG_DIRECTORY="$fixture/var/log/guix"
 export GUIX_DAEMON_SOCKET="$fixture/var/socket"
 daemon=$root/daemon/dist-newstyle/build/x86_64-linux/ghc-9.10.3/guix-daemon-hs-0.1.0.0/x/guix-daemon/build/guix-daemon/guix-daemon
 "$daemon" --disable-chroot --listen="$GUIX_DAEMON_SOCKET" >"$out/daemon.log" 2>&1 &

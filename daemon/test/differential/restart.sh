@@ -19,6 +19,7 @@ run_one() {
   mkdir -p "$fixture/store" "$fixture/db" "$fixture/var"
   export NIX_STORE_DIR="$fixture/store" GUIX_DATABASE_DIRECTORY="$fixture/db"
   export GUIX_STATE_DIRECTORY="$fixture/var" GUIX_DAEMON_SOCKET="$fixture/var/socket"
+  export GUIX_LOG_DIRECTORY="$fixture/var/log/guix"
   export HS7_FIXTURE="$fixture" GUIX="$root/scripts/guix"
   export GUILE_AUTO_COMPILE=0
   local daemon step pid daemon_scope
