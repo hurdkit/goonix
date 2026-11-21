@@ -1,4 +1,4 @@
-;; PR #6 CI-like regression client (reviewer mail m21bc93f58d74404f, item 3).
+;; PR #6 CI-like regression client.
 ;; Run inside the user namespace as a client WITHOUT GUIX_LOG_DIRECTORY.
 ;; Builds: builtin:download (file:// URI), builtin:git-download (local repo),
 ;; one ordinary derivation in the chroot, and a deliberately failing derivation
