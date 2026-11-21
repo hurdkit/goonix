@@ -653,25 +653,39 @@ runBuilderWithUser buildUser rootFd store settings trace mode originalPath drvPa
   closeLog logHandle
   case status of
     ExitSuccess -> do
-      forM_ sandboxRoot $ \root -> forM_ sandboxOutputs $ \path -> do
-        let produced = root <> path
-        exists <- Files.fileExist produced
-        unless exists $ throwIO (storeError ("builder for `" ++ C.unpack drvPath ++ "' failed to produce output path `" ++ C.unpack path ++ "'"))
-        deleteTree path
-        makeParentsWritable root path
-        copyTree produced path
-      forM_ sandboxRoot $ \root -> do
-        Files.setFileMode root 0o755
-        deleteTree root
-      registration <- try $ if caCheck
-        then checkCaBuiltOutputs buildUser settings rootFd store trace originalPath drvPath drv
-        else if mode == Check
-        then checkBuiltOutputs store drvPath replacements (keepFailed settings)
-        else if isCaResolved
-          then registerCaBuiltOutputs buildUser settings rootFd store originalPath drvPath drv
-          else registerBuiltOutputs store drvPath drv
+      -- The sandbox output copy is part of registration: a builder that exits
+      -- 0 without producing an output fails here, and the failure must reach
+      -- the client as "@ build-failed drv - 1 <msg>" (C++ checks the output in
+      -- registerOutputs, build.cc:3196, inside the traced try/catch).  Throwing
+      -- outside the try lost the trace and the client saw only @ build-started.
+      registration <- try $ do
+        forM_ sandboxRoot $ \root -> forM_ sandboxOutputs $ \path -> do
+          let produced = root <> path
+          exists <- Files.fileExist produced
+          unless exists $ throwIO (storeError ("builder for `" ++ C.unpack drvPath ++ "' failed to produce output path `" ++ C.unpack path ++ "'"))
+          deleteTree path
+          makeParentsWritable root path
+          copyTree produced path
+        forM_ sandboxRoot $ \root -> do
+          Files.setFileMode root 0o755
+          deleteTree root
+        if caCheck
+          then checkCaBuiltOutputs buildUser settings rootFd store trace originalPath drvPath drv
+          else if mode == Check
+          then checkBuiltOutputs store drvPath replacements (keepFailed settings)
+          else if isCaResolved
+            then registerCaBuiltOutputs buildUser settings rootFd store originalPath drvPath drv
+            else registerBuiltOutputs store drvPath drv
       case registration of
         Left (exception :: SomeException) -> do
+          -- The try block deletes the sandbox root after a successful copy; a
+          -- registration failure after that point must not touch it again
+          -- (setFileMode on a missing root would throw and lose the trace).
+          forM_ sandboxRoot $ \root -> do
+            exists <- Files.fileExist root
+            when exists $ do
+              Files.setFileMode root 0o755
+              deleteTree root
           forM_ redirected $ \path -> deleteTree path
           let (message, status) = registrationFailure exception
           buildFailed work (Just (message, status))
