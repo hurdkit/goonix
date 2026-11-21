@@ -19,6 +19,7 @@
 using namespace nix;
 namespace nix {
 void checkRewriteForTest(const Path & path, const string & from, const string & to);
+string encodeReservedForTest(const Hash & digest, bool token);
 }
 
 static unsigned failures = 0;
@@ -928,6 +929,30 @@ int main(int argc, char ** argv)
         "unknown placeholder fails closed");
     check(throws([] { validateTokenPath("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello"); }),
         "ordinary base32 is not a token");
+
+    /* Upstream's remove-store-references marker is 32 'e' characters.  It is
+       ordinary upstream data, so it is NOT a reserved goonix name; and no
+       goonix name may BE it, so encodeReserved bumps such a placeholder's
+       last character to 'o'.  Vector: an ALL-ZERO digest encodes to a
+       leading 'e', 30 more 'e's and a final 'o'.  Must match reserved-hash
+       in guix/ca.scm, which is checked against the same vector there. */
+    {
+        std::string marker(32, 'e');
+        Hash zero(htSHA256);
+        memset(zero.hash, 0, zero.hashSize);
+        check(encodeReservedForTest(zero, false)
+                  == marker.substr(0, 31) + "o",
+            "all-zero digest encodes to e...eo, never the nuke-refs marker");
+        check(encodeReservedForTest(zero, true)[0] != 'e',
+            "a self token never starts with 'e', even for an all-zero digest");
+        check(!isReservedStorePath(settings.nixStore + "/" + marker + "-hello"),
+            "upstream nuke-refs marker is not a reserved store path");
+        check(!isPlaceholderPath(settings.nixStore + "/" + marker + "-hello"),
+            "upstream nuke-refs marker is not a placeholder");
+        check(isPlaceholderPath(settings.nixStore + "/" + marker.substr(0, 31)
+                                + "o-hello"),
+            "the bumped e...eo encoding is still a placeholder");
+    }
 
     return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

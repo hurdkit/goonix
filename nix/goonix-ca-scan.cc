@@ -20,6 +20,11 @@
 using namespace nix;
 
 static const string reservedAlphabet = "eout";
+/* Upstream's remove-store-references marker: 32 'e' characters.  It is
+   ordinary upstream data, never a goonix name (encodeReserved bumps a
+   placeholder that would encode to it), so this scanner exempts it exactly
+   as reservedHashPart in nix/libstore/ca.cc does. */
+static const string nukeRefsMarker(32, 'e');
 static const size_t overlapSize = 32;
 
 static string decoderError(const char * message)
@@ -50,9 +55,11 @@ struct Scanner {
     {
         for (size_t offset = 0; offset + 32 <= pending.size(); ++offset) {
             if (reservedAlphabet.find(pending[offset]) == string::npos) continue;
-            if (pending.substr(offset, 32).find_first_not_of(reservedAlphabet) != string::npos)
+            string candidate = pending.substr(offset, 32);
+            if (candidate.find_first_not_of(reservedAlphabet) != string::npos)
                 continue;
-            string hash = pending.substr(offset, 32);
+            if (candidate == nukeRefsMarker) continue;
+            string hash = candidate;
             bool self = tokens.count(hash);
             /* A known output token is itself a leftover, even when it is not
                a full store path.  An unknown reserved hash is a placeholder
