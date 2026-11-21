@@ -74,7 +74,8 @@ import Goonix.Build.Seccomp (nativeArchitecture, slirpSeccompFilter)
 import System.Environment (getEnvironment, getExecutablePath, lookupEnv)
 import System.Posix.Env.ByteString (getEnv)
 -- goonix: content addressing (HS-11).
-import Goonix.Store.Ca (goonixAddressed, resolvedDerivation, addressingOf, Addressing (..), tokenPath)
+import Goonix.Store.Ca (goonixAddressed, resolvedDerivation, addressingOf, Addressing (..), tokenPath, selfToken)
+import Goonix.Store.DeepScan (checkDeepOutput)
 import Goonix.Store.CaBuild (resolveDerivation, checkInputAddressedPolicy, contentOutputOrder, finaliseContentOutput, Finalised (..), removeGoonixEnvironment, materialiseGoonixFiles, checkResolvedDerivation)
 import Goonix.Store.CaStore (realisedOutputPath, selectGoonixOutputs, writeResolvedDerivation, recordGoonixOutput, recordBuild, resolvedHashOf, initCaRecords)
 import Goonix.Store.Records (chosenOutput, chooseOutput, allChoices)
@@ -630,7 +631,7 @@ runBuilderWithUser buildUser rootFd store settings trace mode originalPath drvPa
         then checkBuiltOutputs store drvPath replacements (keepFailed settings)
         else if goonixAddressed (Map.lookup "goonixAddressing" (environment drv))
                && resolvedDerivation (Map.lookup "goonixResolved" (environment drv))
-          then registerCaBuiltOutputs rootFd store originalPath drvPath drv
+          then registerCaBuiltOutputs buildUser settings rootFd store originalPath drvPath drv
           else registerBuiltOutputs store drvPath drv
       case registration of
         Left (exception :: SomeException) -> do
@@ -659,7 +660,12 @@ runBuilderWithUser buildUser rootFd store settings trace mode originalPath drvPa
             Nothing -> ("builder failed", 1)
           timedOut = status == 101
           reason = "failed: " ++ failure
-      traceFailed trace drvPath (if timedOut then "timeout" else "builder failed")
+      -- goonix: the C++ goal traces "@ build-failed drv - 1 e.msg()"
+      -- (build.cc:1531), so the failure detail reaches the client's
+      -- build-output port; the client matches (build-failed drv . _) and
+      -- ignores the extra fields.  A bare "builder failed" hid why a CA
+      -- output was rejected (deep-scan/opaque/placeholder diagnostics).
+      traceFailed trace drvPath (if timedOut then "timeout" else "1 " ++ failure)
       when (mode == Normal && not timedOut && settingBool "build-cache-failures" False settings && not (isFixedOutput drv)) $
         mapM_ (registerFailedPath store . outputPath) (Map.elems (outputs drv))
       if keepFailed settings
@@ -1035,8 +1041,8 @@ registerBuiltOutputs store drvPath drv = forM_ (Map.elems (outputs drv)) $ \outp
 -- finalised from their token trees to content-addressed paths in sibling
 -- dependency order; resolved/fixed outputs keep their paths.  Every realised
 -- output becomes a signed permanent fact and the original derivation's choice.
-registerCaBuiltOutputs :: Fd -> Store -> ByteString -> ByteString -> Derivation -> IO ()
-registerCaBuiltOutputs rootFd store originalPath drvPath drv = do
+registerCaBuiltOutputs :: Maybe BuildUser -> Settings -> Fd -> Store -> ByteString -> ByteString -> Derivation -> IO ()
+registerCaBuiltOutputs buildUser settings rootFd store originalPath drvPath drv = do
   let storeDir = storeDirectory store
       addressing = addressingOf (Map.lookup "goonixAddressing" (environment drv))
       isContent = addressing == Right Content
@@ -1081,6 +1087,12 @@ registerCaBuiltOutputs rootFd store originalPath drvPath drv = do
       exists <- Files.fileExist token
       unless exists $ throwIO (storeError ("builder for `" ++ C.unpack drvPath ++ "' failed to produce output path `" ++ C.unpack token ++ "'"))
       _ <- canonicaliseAndHash store token
+      -- goonix: deep CA scan (C++ checkDeepOutput) before finalisation, when
+      -- goonix-deep-scan is set.  Every output's self token is checked in the
+      -- decompressed tree; a found token or helper failure aborts the build.
+      let deepTokens = map selfToken (Map.keys (outputs drv))
+          deepUser = fmap (\user -> (fromIntegral (buildUserUid user), fromIntegral (buildUserGid user))) buildUser
+      checkDeepOutput settings token deepTokens deepUser (pure ())
       finalised <- finaliseContentOutput storeDir token output name allPaths finals "" (appendTempRoot rootFd)
       enforceCaReferencePolicy store drv (finalPath finalised) token finals (finalReferences finalised)
       deduplicateTree storeDir (finalPath finalised)

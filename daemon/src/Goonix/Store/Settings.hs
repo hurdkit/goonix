@@ -90,7 +90,7 @@ applySetOptions minor fields initial = do
     zero = B.replicate 8 0
     intValue = littleInt
     applyPair settings (key, value)
-      | key `elem` ["build-timeout", "build-max-silent-time", "build-max-log-size", "build-max-jobs", "build-cores", "build-repeat", "multiplexed-build-output"] = setSetting key value settings
+      | key `elem` ["build-timeout", "build-max-silent-time", "build-max-log-size", "build-max-jobs", "build-cores", "build-repeat", "multiplexed-build-output", "goonix-deep-scan"] = setSetting key value settings
       | key == "user-name" = settings
       | trusted settings = setSetting key value settings
       | otherwise = setSetting ("untrusted-" <> key) value settings

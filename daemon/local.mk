@@ -79,6 +79,7 @@ EXTRA_DIST += \
   daemon/src/Goonix/Store/Path.hs daemon/src/Goonix/Store/Derivation.hs \
   daemon/src/Goonix/Store/Nar.hs daemon/src/Goonix/Store/References.hs \
   daemon/src/Goonix/Store/Ca.hs \
+  daemon/src/Goonix/Store/DeepScan.hs \
   daemon/test/ca-vectors/Main.hs \
   daemon/proxy/Main.hs \
   daemon/test/wire-proxy/Main.hs daemon/test/wire-proxy/run.sh \

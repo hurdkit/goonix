@@ -23,7 +23,7 @@ module Goonix.Store.CaBuild
   , isStorePathStrict
   ) where
 
-import Control.Exception (bracket, catch, throwIO, SomeException)
+import Control.Exception (bracket, catch, throwIO, onException, SomeException)
 import Control.Monad (forM, forM_, unless, when, foldM)
 import Data.Bits ((.&.), (.|.))
 import Data.ByteString (ByteString)
@@ -186,7 +186,13 @@ rewriteRegularFile path from to mode = do
                               B.drop (n - len) (B.take n pending) == B.take len from] ++ [n])
         in adjusted
       rewrite part = either caError pure (replaceWhole part from to path True)
-  bracket (openBinaryFile (C.unpack path) ReadMode) (hClose) $ \input ->
+      -- C++ AutoDelete cleanup(temporary, false): remove the temporary on any
+      -- failure (cancelled only after the rename succeeds), so a rejected
+      -- output does not leave a .goonix-rewrite that poisons the next build.
+      removeTemporary = do
+        present <- Files.fileExist temporary
+        when present (Files.removeLink temporary)
+  (bracket (openBinaryFile (C.unpack path) ReadMode) (hClose) $ \input ->
     bracket (openBinaryFile (C.unpack temporary) WriteMode) (\output -> hClose output) $ \output -> do
       let loop pending = do
             chunk <- B.hGetSome input (128 * 1024)
@@ -197,7 +203,8 @@ rewriteRegularFile path from to mode = do
                     count = process combined
                 rewrite (B.take count combined) >>= B.hPut output
                 loop (B.drop count combined)
-      loop B.empty
+      loop B.empty)
+    `onException` removeTemporary
   Files.setFileMode temporary mode
   restoreMtime temporary False
   Files.rename temporary path
