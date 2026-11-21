@@ -78,6 +78,8 @@ EXTRA_DIST += \
   daemon/src/Goonix/Store/Substitute.hs daemon/src/Goonix/Store/Archive.hs daemon/src/Goonix/Build/Engine.hs daemon/src/Goonix/Build/Offload.hs daemon/src/Goonix/Build/Scheduler.hs daemon/cbits/sockets.c daemon/cbits/files.c \
   daemon/src/Goonix/Store/Path.hs daemon/src/Goonix/Store/Derivation.hs \
   daemon/src/Goonix/Store/Nar.hs daemon/src/Goonix/Store/References.hs \
+  daemon/src/Goonix/Store/Ca.hs \
+  daemon/test/ca-vectors/Main.hs \
   daemon/proxy/Main.hs \
   daemon/test/wire-proxy/Main.hs daemon/test/wire-proxy/run.sh \
   daemon/test/wire-proxy/inventory.scm daemon/test/check-build-flags.scm \
