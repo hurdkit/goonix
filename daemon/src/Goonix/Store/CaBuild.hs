@@ -318,11 +318,11 @@ isStorePathStrict :: ByteString -> ByteString -> Bool
 isStorePathStrict store path =
   B.length path > B.length store + 1
   && B.take (B.length store + 1) path == store <> "/"
-  && let name = storePathToName store path
-         hash = B.take 32 name
-     in B.length name >= 34 && B.index name 32 == 45
+  && let basename = B.drop (B.length store + 1) path
+         hash = B.take 32 basename
+     in B.length basename >= 34 && B.index basename 32 == 45
         && B.all (`B.elem` base32Alphabet) hash
-        && either (const False) (const True) (validateStoreName (B.drop 33 name))
+        && either (const False) (const True) (validateStoreName (B.drop 33 basename))
 
 -- | C++ checkResolvedDerivation: marked resolved, no floating inputs, outputs
 -- are tokens (content) or strict paths (resolved/fixed), environment agrees,
