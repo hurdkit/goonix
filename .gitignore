@@ -159,3 +159,11 @@ tmp
 /gnu/packages/aux-files/guile-guile-launcher.o
 /guile
 .DS_Store
+
+# goonix: local HS-0 build products, test stores and generated vectors.
+/hs0-*
+/hs1-*
+/.hs0-*
+/daemon/test/formats/.build/
+/daemon/test/properties/.build/
+/test-tmp/

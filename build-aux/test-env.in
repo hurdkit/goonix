@@ -39,6 +39,11 @@ case "$1" in
 	;;
 esac
 
+# goonix: bootstrap-Guile programs abort when they inherit Guile 3's
+# compiled-module path.  pre-inst-env restores the test client's own
+# compiled path; its source paths retain the extension modules.
+unset GUILE_LOAD_COMPILED_PATH
+
 if [ -x "@abs_top_builddir@/guix-daemon" ]
 then
     NIX_STORE_DIR="@GUIX_TEST_ROOT@/store"
@@ -115,16 +120,50 @@ then
 running 'guix-daemon $extra_options'" >&2
     fi
 
+    # goonix: do not use the development shell's TMPDIR for slirp's chroot.
+    # It may contain a disconnected FUSE mount, which breaks the setup scan.
+    GOONIX_DAEMON_TMPDIR="@GUIX_TEST_ROOT@/daemon-tmp-$$"
+    mkdir -m 0700 "$GOONIX_DAEMON_TMPDIR"
+
     # Launch the daemon without chroot support because is may be
     # unavailable, for instance if we're not running as root.
+    TMPDIR="$GOONIX_DAEMON_TMPDIR"				\
     "@abs_top_builddir@/pre-inst-env"				\
 	"@abs_top_builddir@/guix-daemon"			\
         $extra_options						\
+        ${GUIX_TEST_DAEMON_OPTIONS:-}                         \
         --allow-aslr                                            \
 	--substitute-urls="$GUIX_BINARY_SUBSTITUTE_URL" &
 
     daemon_pid=$!
-    trap "kill $daemon_pid ; rm -rf $GUIX_STATE_DIRECTORY" EXIT
+
+    # goonix: optionally observe, never rewrite, the existing daemon protocol.
+    if test -n "${GOONIX_WIRE_PROXY:-}"
+    then
+        actual_socket="$GUIX_STATE_DIRECTORY/daemon-socket/socket"
+        proxy_socket="$GUIX_STATE_DIRECTORY/daemon-socket/proxy"
+        transcript="${GOONIX_WIRE_TRANSCRIPT:-@abs_top_builddir@/hs0-transcripts/$$.wire.log}"
+        if test "${GOONIX_WIRE_GZIP:-0}" = 1
+        then
+            transcript="$transcript.gz"
+        fi
+        mkdir -p "`dirname \"$transcript\"`"
+        "$GOONIX_WIRE_PROXY" "$actual_socket" "$proxy_socket" "$transcript" &
+        proxy_pid=$!
+        GUIX_DAEMON_SOCKET="$proxy_socket"
+        export GUIX_DAEMON_SOCKET
+        # Wait for the listening endpoint, not just the process.  Otherwise
+        # the first open-connection can mistake startup for a dead daemon.
+        proxy_wait=0
+        while test ! -S "$proxy_socket" && test "$proxy_wait" -lt 100
+        do
+            kill -0 "$proxy_pid" || exit 1
+            sleep 0.01
+            proxy_wait=$((proxy_wait + 1))
+        done
+        test -S "$proxy_socket" || exit 1
+    fi
+    trap 'test -z "${proxy_pid:-}" || kill "$proxy_pid"; kill "$daemon_pid"; rm -rf "$GUIX_STATE_DIRECTORY"' EXIT
 
     # The test suite expects the 'guile-bootstrap' package to be available.
     # Normally the Guile bootstrap tarball is downloaded by a fixed-output

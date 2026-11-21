@@ -1,0 +1,15 @@
+(use-modules (guix store) (guix tests) (guix derivations) (guix packages)
+             (ice-9 textual-ports))
+
+(let* ((s (open-connection (getenv "GUIX_DAEMON_SOCKET")))
+       (script (add-text-to-store s "transcript-builder.sh" "printf local > $out\n" '()))
+       (bash (add-to-store s "bash" #t "sha256"
+                (search-bootstrap-binary "bash" (%current-system))))
+       (drv (derivation s "transcript-offload" bash (list "-e" script)
+              #:env-vars '(("requiredSystemFeatures" . "kvm"))
+              #:inputs (list (list bash) (list script)))))
+  (call-with-output-file (getenv "HS5_DERIVATION_COPY")
+    (lambda (port) (display (call-with-input-file (derivation-file-name drv) get-string-all) port)))
+  (set-build-options s #:use-substitutes? #f #:print-build-trace #t)
+  (build-derivations s (list drv))
+  (close-connection s)))

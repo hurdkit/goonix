@@ -1,0 +1,21 @@
+(use-modules (guix store) (guix tests) (guix derivations) (guix packages)
+             (gnu packages bootstrap) (srfi srfi-34))
+(let ((s (open-connection (getenv "GUIX_DAEMON_SOCKET"))))
+  (let* ((bash (add-to-store s "bash" #t "sha256"
+                (search-bootstrap-binary "bash" (%current-system))))
+         (d1 (derivation s "fails" bash '("-c" "false") #:sources (list bash)))
+         (d2 (build-expression->derivation s "sleep-then-succeed"
+               '(begin (sleep 2) (mkdir %output))
+               #:guile-for-build (package-derivation s %bootstrap-guile (%current-system)))))
+    (set-build-options s #:use-substitutes? #f #:keep-going? #t)
+    (guard (c ((store-protocol-error? c)
+               (format #t "status=~s message=~s\nd1-valid=~s d2-valid=~s\nd2-drv-valid=~s d2-drv=~s\n"
+                       (store-protocol-error-status c)
+                       (store-protocol-error-message c)
+                       (valid-path? s (derivation->output-path d1))
+                       (valid-path? s (derivation->output-path d2))
+                       (valid-path? s (derivation-file-name d2))
+                       (derivation-file-name d2))))
+      (build-derivations s (list d1 d2))
+      (format #t "unexpected success\n"))
+    (close-connection s)))

@@ -1,0 +1,7 @@
+packages:
+  .
+
+-- The daemon deliberately uses only GHC's boot libraries and the C libraries
+-- already used by the C++ daemon.  A cross build must not need Hackage.
+with-compiler: ghc
+jobs: 8

@@ -1,0 +1,17 @@
+(use-modules (guix store) (srfi srfi-11) (ice-9 rdelim))
+
+(define (assert condition message)
+  (unless condition (error message)))
+
+(define fixture (getenv "HS7_FIXTURE"))
+(define store (open-connection (getenv "HS7_COLLECTOR_SOCKET")))
+(define a-path (call-with-input-file (string-append fixture "/held-path") read-line))
+(define b-path (call-with-input-file (string-append fixture "/keeper-path") read-line))
+(let-values (((deleted freed) (collect-garbage store)))
+  (assert (member a-path deleted) "disconnected client's path was not collected")
+  (assert (not (member b-path deleted)) "connected client's temporary root was deleted"))
+(assert (not (valid-path? store a-path)) "disconnected client's path remains valid")
+(assert (not (file-exists? a-path)) "disconnected client's path remains on disk")
+(assert (valid-path? store b-path) "connected client's path became invalid")
+(assert (file-exists? b-path) "connected client's path lost its files")
+(format #t "HS-7 disconnected temporary-root expiry with live client: PASS\n")

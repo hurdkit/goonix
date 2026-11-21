@@ -1,5 +1,23 @@
 dnl -*- Autoconf -*- fragment for the C++ daemon.
 
+# goonix: the Haskell daemon is selected only when a compiler is available.
+AC_ARG_WITH([ghc],
+  [AS_HELP_STRING([--with-ghc=PROGRAM], [Haskell compiler for guix-daemon])],
+  [GHC="$withval"], [GHC=""])
+AC_ARG_ENABLE([haskell-daemon],
+  [AS_HELP_STRING([--disable-haskell-daemon], [build the C++ daemon even with GHC])],
+  [guix_build_haskell_daemon="$enableval"],
+  [guix_build_haskell_daemon="auto"])
+if test "x$GHC" = "x"; then
+  AC_PATH_PROG([GHC], [ghc])
+fi
+AS_IF([test "x$guix_build_haskell_daemon" = "xyes" && test "x$GHC" = "x"],
+  [AC_MSG_ERROR([--enable-haskell-daemon requires --with-ghc=PROGRAM or ghc in PATH])])
+AS_IF([test "x$GHC" = "x"], [guix_build_haskell_daemon=no])
+AM_CONDITIONAL([BUILD_HASKELL_DAEMON],
+  [test "x$guix_build_daemon" = "xyes" && test "x$guix_build_haskell_daemon" != "xno"])
+AC_SUBST([GHC])
+
 AC_MSG_CHECKING([whether to build daemon])
 AC_MSG_RESULT([$guix_build_daemon])
 

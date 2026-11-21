@@ -1,0 +1,10 @@
+dist-newstyle/
+dist/
+.build/
+*.hi
+*.o
+*.dyn_hi
+*.dyn_o
+.depends.mk
+ghc-build/
+src/Goonix/Config.hs

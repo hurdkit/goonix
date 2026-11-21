@@ -1,0 +1,12 @@
+(use-modules (guix store) (guix serialization) (rnrs io ports) (rnrs bytevectors))
+(let* ((s (open-connection))
+       (root (getenv "HS3_ROOT"))
+       (file (add-text-to-store s "signed.txt" "signed payload\n" '()))
+       (dump (call-with-bytevector-output-port
+              (lambda (port) (export-paths s (list file) port #:sign? #t))))
+       (target (string-append root "/imported")))
+  (format #t "signed-export-bytes=~a\n" (bytevector-length dump))
+  (let ((imported (import-paths s (open-bytevector-input-port dump))))
+    (format #t "imported=~s valid=~s\n" imported (valid-path? s file))
+    (format #t "contents=~s\n" (call-with-input-file file get-string-all)))
+  (close-connection s))
