@@ -23,8 +23,10 @@ import qualified Data.Map.Strict as Map
 import qualified Data.Int
 import Data.Word (Word64)
 import Goonix.Store.Base32 (encodeBase16, encodeBase32)
+import Goonix.Store.Ca (goonixAddressed, resolvedDerivation)
+import Goonix.Store.CaBuild (checkGoonixDerivationOutputs)
 import Goonix.Store.Database
-import Goonix.Store.Derivation (parseDerivation, outputs, outputPath, outputHash, parseHashInfo)
+import Goonix.Store.Derivation (parseDerivation, outputs, outputPath, outputHash, parseHashInfo, environment)
 import Goonix.Store.Files
 import Goonix.Store.Hash
 import Goonix.Store.Nar
@@ -124,6 +126,14 @@ registerPath store path (Hash algorithm digest) size references deriver = do
         when (B.isSuffixOf ".drv" path) $ do
           bytes <- B.readFile (C.unpack path)
           derivation <- either (throwIO . storeError) pure (parseDerivation bytes)
+          -- goonix: address-specific output validation (C++ checkGoonixBatchRegistration,
+          -- local-store.cc:996, run after addValidPath with checkOutputs=false): a CA
+          -- derivation's output paths must match their placeholder/token/fixed identity
+          -- and its environment the logical token; a malformed CA derivation is refused
+          -- and the registration rolled back.
+          when (goonixAddressed (Map.lookup "goonixAddressing" (environment derivation))
+                || resolvedDerivation (Map.lookup "goonixResolved" (environment derivation))) $
+            either (throwIO . storeError) pure (checkGoonixDerivationOutputs (storeDirectory store) path derivation)
           forM_ (Map.elems (outputs derivation)) $ \output ->
             unless (B.null (outputHash output)) $ do
               (_, algorithm, digest) <- either (throwIO . storeError) pure (parseHashInfo output)

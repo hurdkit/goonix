@@ -303,8 +303,35 @@ buildDerivationNow userPool config rootFd store settings trace hook mode wanted 
         resolved <- resolveDerivation (storeDirectory store) drvPath drv (realisedOutputPath store)
         resolvedPath <- writeResolvedDerivation rootFd store drvPath resolved
         appendTempRoot rootFd resolvedPath
-        selected <- selectGoonixOutputs store drvPath resolved
-        pure (resolvedPath, selected, drvPath)
+        -- goonix: a --check of a content-addressed derivation rebuilds at the
+        -- logical token, never the selected final path (C++ prepareResolvedBuild,
+        -- build-ca.cc:50).  A normal build keeps the selected candidate.
+        if mode == Check && addressingOf (Map.lookup "goonixAddressing" (environment resolved)) == Right Content
+          then do
+            let tokenised = resolved
+                  { outputs = Map.mapWithKey (\output out ->
+                      if not (B.null (outputHash out)) then out
+                      else out { outputPath = tokenPath (storeDirectory store) output
+                        (storePathToName (storeDirectory store) (outputPath (outputs drv Map.! output))) })
+                      (outputs resolved)
+                  }
+                synced = tokenised { environment = foldl (\env (output, out) ->
+                  Map.insert output (outputPath out) env) (environment tokenised) (Map.toList (outputs tokenised)) }
+            pure (resolvedPath, synced, drvPath)
+          else do
+            selected <- selectGoonixOutputs store drvPath resolved
+            pure (resolvedPath, selected, drvPath)
+      else if mode == Check
+              && goonixAddressed (Map.lookup "goonixAddressing" (environment drv))
+              && resolvedDerivation (Map.lookup "goonixResolved" (environment drv))
+              && addressingOf (Map.lookup "goonixAddressing" (environment drv)) == Right Content
+        then do
+          -- goonix: a --check of an already-resolved CA derivation rebuilds at the
+          -- logical token (C++ bmCheck).  The on-disk resolved derivation carries
+          -- the token outputs already; sync the environment to them.
+          let synced = drv { environment = foldl (\env (output, out) ->
+                Map.insert output (outputPath out) env) (environment drv) (Map.toList (outputs drv)) }
+          pure (drvPath, synced, drvPath)
       else pure (drvPath, drv, drvPath)
   forM_ (Set.toList (inputSrcs buildDrv)) $ \input -> do
     present <- isValidPath store input
@@ -543,10 +570,19 @@ runBuilder userPool rootFd store settings trace mode originalPath drvPath drv =
 runBuilderWithUser :: Maybe BuildUser -> Fd -> Store -> Settings -> BuildTrace -> BuildMode -> ByteString -> ByteString -> Derivation -> IO ()
 runBuilderWithUser buildUser rootFd store settings trace mode originalPath drvPath drv = do
   let isBuiltin = "builtin:" `B.isPrefixOf` builder drv
+      isCaResolved = goonixAddressed (Map.lookup "goonixAddressing" (environment drv))
+        && resolvedDerivation (Map.lookup "goonixResolved" (environment drv))
+      isCaContent = addressingOf (Map.lookup "goonixAddressing" (environment drv)) == Right Content
+      -- goonix: a --check of a resolved CA derivation builds at the logical
+      -- token (C++ bmCheck, build-ca.cc:300), never the generic hash redirect:
+      -- the token is rewritten to the content-addressed path and compared to
+      -- the recorded choice.  The generic redirect would delete/rewrite the
+      -- valid final output and mis-handle a self-referencing result.
+      caCheck = mode == Check && isCaResolved && isCaContent
       outPaths = map outputPath (Map.elems (outputs drv))
-      redirected = if mode == Check then map (redirectOutput store drvPath) outPaths else outPaths
+      redirected = if mode == Check && not caCheck then map (redirectOutput store drvPath) outPaths else outPaths
       replacements = zip outPaths redirected
-      actualDrv = if mode == Check then replaceDerivationPaths replacements drv else drv
+      actualDrv = if mode == Check && not caCheck then replaceDerivationPaths replacements drv else drv
   mapM_ (appendTempRoot rootFd) outPaths
   inputRoots <- derivationInputs store drvPath Set.empty drv
   mapM_ (appendTempRoot rootFd) (Set.toList inputRoots)
@@ -620,17 +656,18 @@ runBuilderWithUser buildUser rootFd store settings trace mode originalPath drvPa
       forM_ sandboxRoot $ \root -> forM_ sandboxOutputs $ \path -> do
         let produced = root <> path
         exists <- Files.fileExist produced
-        unless exists $ throwIO (storeError ("builder for `" ++ C.unpack drvPath ++ "' failed: did not produce output `" ++ C.unpack path ++ "'"))
+        unless exists $ throwIO (storeError ("builder for `" ++ C.unpack drvPath ++ "' failed to produce output path `" ++ C.unpack path ++ "'"))
         deleteTree path
         makeParentsWritable root path
         copyTree produced path
       forM_ sandboxRoot $ \root -> do
         Files.setFileMode root 0o755
         deleteTree root
-      registration <- try $ if mode == Check
+      registration <- try $ if caCheck
+        then checkCaBuiltOutputs buildUser settings rootFd store trace originalPath drvPath drv
+        else if mode == Check
         then checkBuiltOutputs store drvPath replacements (keepFailed settings)
-        else if goonixAddressed (Map.lookup "goonixAddressing" (environment drv))
-               && resolvedDerivation (Map.lookup "goonixResolved" (environment drv))
+        else if isCaResolved
           then registerCaBuiltOutputs buildUser settings rootFd store originalPath drvPath drv
           else registerBuiltOutputs store drvPath drv
       case registration of
@@ -913,7 +950,7 @@ splitBytes separator input = case B.breakSubstring separator input of
 checkBuiltOutputs :: Store -> ByteString -> [(ByteString, ByteString)] -> Bool -> IO ()
 checkBuiltOutputs store drvPath replacements retain = forM_ replacements $ \(original, temporary) -> do
   exists <- Files.fileExist temporary
-  unless exists $ throwIO (storeError ("builder for `" ++ C.unpack drvPath ++ "' did not produce output `" ++ C.unpack original ++ "'"))
+  unless exists $ throwIO (storeError ("builder for `" ++ C.unpack drvPath ++ "' failed to produce output path `" ++ C.unpack original ++ "'"))
   -- The check build ran with the output redirected to `temporary`, so a builder
   -- that embeds $out (e.g. the bootstrap Guile wrapper) wrote `temporary` into
   -- its output.  Rewrite those paths back to `original` before hashing, as the
@@ -1016,7 +1053,7 @@ registerBuiltOutputs :: Store -> ByteString -> Derivation -> IO ()
 registerBuiltOutputs store drvPath drv = forM_ (Map.elems (outputs drv)) $ \output -> do
   let path = outputPath output
   exists <- Files.fileExist path
-  unless exists $ throwIO (storeError ("builder for `" ++ C.unpack drvPath ++ "' failed: did not produce output `" ++ C.unpack path ++ "'"))
+  unless exists $ throwIO (storeError ("builder for `" ++ C.unpack drvPath ++ "' failed to produce output path `" ++ C.unpack path ++ "'"))
   _ <- canonicaliseAndHash store path
   when (not (B.null (outputHash output))) $ verifyFixedOutput output path
   deduplicateTree (storeDirectory store) path
@@ -1069,7 +1106,7 @@ registerCaBuiltOutputs buildUser settings rootFd store originalPath drvPath drv 
       _ -> pure False
     unless alreadyFinalised $ do
       exists <- Files.fileExist path
-      unless exists $ throwIO (storeError ("builder for `" ++ C.unpack drvPath ++ "' failed: did not produce output `" ++ C.unpack path ++ "'"))
+      unless exists $ throwIO (storeError ("builder for `" ++ C.unpack drvPath ++ "' failed to produce output path `" ++ C.unpack path ++ "'"))
       _ <- canonicaliseAndHash store path
       when (not (B.null (outputHash out))) $ verifyFixedOutput out path
       deduplicateTree storeDir path
@@ -1081,22 +1118,67 @@ registerCaBuiltOutputs buildUser settings rootFd store originalPath drvPath drv 
       recordGoonixOutput store originalPath drvPath output path "local"
   where
     tokenOutputName token = head ([output | (output, out) <- Map.toList (outputs drv), outputPath out == token] ++ ["out"])
-    storeDir = storeDirectory store
     finaliseOne allPaths (finals, finaliseds) (output, token) = do
-      let name = storePathToName storeDir token
-      exists <- Files.fileExist token
-      unless exists $ throwIO (storeError ("builder for `" ++ C.unpack drvPath ++ "' failed to produce output path `" ++ C.unpack token ++ "'"))
-      _ <- canonicaliseAndHash store token
-      -- goonix: deep CA scan (C++ checkDeepOutput) before finalisation, when
-      -- goonix-deep-scan is set.  Every output's self token is checked in the
-      -- decompressed tree; a found token or helper failure aborts the build.
-      let deepTokens = map selfToken (Map.keys (outputs drv))
-          deepUser = fmap (\user -> (fromIntegral (buildUserUid user), fromIntegral (buildUserGid user))) buildUser
-      checkDeepOutput settings token deepTokens deepUser (pure ())
-      finalised <- finaliseContentOutput storeDir token output name allPaths finals "" (appendTempRoot rootFd)
-      enforceCaReferencePolicy store drv (finalPath finalised) token finals (finalReferences finalised)
-      deduplicateTree storeDir (finalPath finalised)
+      finalised <- finaliseCaOutput buildUser settings rootFd store drvPath drv allPaths finals output token
       pure (Map.insert token (finalPath finalised) finals, Map.insert token finalised finaliseds)
+
+-- | Finalise one content-addressed output token to its content-addressed path
+-- (C++ finaliseContentOutput via finaliseOne): canonicalise, deep-scan when
+-- configured, rewrite the token tree, enforce the reference policy.  Shared by
+-- the normal registration and the --check rebuild.
+finaliseCaOutput :: Maybe BuildUser -> Settings -> Fd -> Store -> ByteString -> Derivation
+                 -> [ByteString] -> Map.Map ByteString ByteString -> ByteString -> ByteString -> IO Finalised
+finaliseCaOutput buildUser settings rootFd store drvPath drv allPaths finals output token = do
+  let storeDir = storeDirectory store
+      name = storePathToName storeDir token
+  exists <- Files.fileExist token
+  unless exists $ throwIO (storeError ("builder for `" ++ C.unpack drvPath ++ "' failed to produce output path `" ++ C.unpack token ++ "'"))
+  _ <- canonicaliseAndHash store token
+  -- goonix: deep CA scan (C++ checkDeepOutput) before finalisation, when
+  -- goonix-deep-scan is set.  Every output's self token is checked in the
+  -- decompressed tree; a found token or helper failure aborts the build.
+  let deepTokens = map selfToken (Map.keys (outputs drv))
+      deepUser = fmap (\user -> (fromIntegral (buildUserUid user), fromIntegral (buildUserGid user))) buildUser
+  checkDeepOutput settings token deepTokens deepUser (pure ())
+  finalised <- finaliseContentOutput storeDir token output name allPaths finals "" (appendTempRoot rootFd)
+  enforceCaReferencePolicy store drv (finalPath finalised) token finals (finalReferences finalised)
+  deduplicateTree storeDir (finalPath finalised)
+  pure finalised
+
+-- | C++ bmCheck for a resolved CA derivation (build-ca.cc:300): rebuild each
+-- content output at its logical token, finalise to the content-addressed path,
+-- register it if new and record a "local-check" fact; if the rebuilt path
+-- differs from the recorded choice, report non-reproducibility and keep both
+-- records (the choice is preserved).  The generic hash-redirect check is NOT
+-- used: it would delete/rewrite the valid final output.
+checkCaBuiltOutputs :: Maybe BuildUser -> Settings -> Fd -> Store -> BuildTrace -> ByteString -> ByteString -> Derivation -> IO ()
+checkCaBuiltOutputs buildUser settings rootFd store trace originalPath drvPath drv = do
+  inputClosure <- Set.unions . map Set.fromList <$> mapM (referenceClosure store) (Set.toList (inputSrcs drv))
+  let allPaths = Set.toList (Set.union inputClosure (Set.fromList (map outputPath (Map.elems (outputs drv)))))
+  order <- contentOutputOrder drv allPaths ""
+  (finals, _) <- foldM (checkOne allPaths) (Map.empty, Map.empty) order
+  -- Fixed and resolved-addressed outputs in a CA derivation: verify in place.
+  forM_ (Map.toList (outputs drv)) $ \(output, out) ->
+    when (not (B.null (outputHash out))) $ do
+      let path = outputPath out
+      exists <- Files.fileExist path
+      unless exists $ throwIO (storeError ("builder for `" ++ C.unpack drvPath ++ "' failed to produce output path `" ++ C.unpack path ++ "'"))
+      verifyFixedOutput out path
+  where
+    checkOne allPaths (finals, seen) (output, token) = do
+      finalised <- finaliseCaOutput buildUser settings rootFd store drvPath drv allPaths finals output token
+      let checkFinal = finalPath finalised
+      valid <- isValidPath store checkFinal
+      unless valid $
+        registerPath store checkFinal (finalNarHash finalised) (finalNarSize finalised)
+          (finalReferences finalised) drvPath
+      recordGoonixOutput store originalPath drvPath output checkFinal "local-check"
+      chosen <- chosenOutput (database store) originalPath output
+      when (not (B.null chosen) && checkFinal /= chosen) $
+        traceFailed trace drvPath ("goonix: `" ++ C.unpack originalPath
+          ++ "' is not reproducible: output `" ++ C.unpack output ++ "' rebuilt to `"
+          ++ C.unpack checkFinal ++ "', choice is `" ++ C.unpack chosen ++ "' (second record stored)")
+      pure (Map.insert token checkFinal finals, Map.insert token finalised seen)
 
 -- | C++ checkGoonixReferences: an output-name reference specifier names that
 -- output's FINAL path (or the path being checked for the current token).
@@ -1134,7 +1216,7 @@ verifyFixedOutput output path = do
     then hashNar path
     else hashFile algorithm path
   when (hashDigest hash /= expected) $
-    throwIO (storeError ("output `" ++ C.unpack path ++ "' has the wrong hash"))
+    throwIO (storeError ("hash mismatch for store item '" ++ C.unpack path ++ "'"))
   where
     toUpperAscii character
       | character >= 'a' && character <= 'z' = toEnum (fromEnum character - 32)

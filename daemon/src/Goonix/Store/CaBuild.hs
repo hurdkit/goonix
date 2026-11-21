@@ -9,6 +9,7 @@
 module Goonix.Store.CaBuild
   ( resolveDerivation
   , checkResolvedDerivation
+  , checkGoonixDerivationOutputs
   , checkInputAddressedPolicy
   , contentOutputOrder
   , finaliseContentOutput
@@ -40,7 +41,7 @@ import Goonix.Store.Derivation
 import Goonix.Store.Files (directoryEntries, deleteTree, mkdirParents)
 import Goonix.Store.Hash
 import Goonix.Store.Nar (hashNar, dumpNar)
-import Goonix.Store.Path (storePathToName, validateStoreName)
+import Goonix.Store.Path (makeFixedOutputPath, storePathToName, validateStoreName)
 import Goonix.Store.References (scanReferences)
 import System.Posix.ByteString (RawFilePath)
 import System.Posix.Types (FileMode)
@@ -370,6 +371,62 @@ checkResolvedDerivation store drv = do
   scan (builder drv)
   forM_ (args drv) scan
   forM_ (Map.elems (environment drv)) scan
+
+-- | C++ checkGoonixDerivationOutputs (ca.cc:260), run by checkGoonixBatchRegistration
+-- when a CA derivation is registered (local-store.cc:996, after addValidPath with
+-- checkOutputs=false).  Validates each output's path identity AND its environment
+-- path.  For an unresolved content/resolved-addressed derivation the output path
+-- is the placeholder (hash of the blank derivation bytes) while the environment
+-- carries the logical self token -- the two deliberately differ.  A malformed CA
+-- derivation (e.g. an output outside the store) fails the placeholder identity and
+-- is refused, rolling the registration back.
+checkGoonixDerivationOutputs :: ByteString -> ByteString -> Derivation -> Either String ()
+checkGoonixDerivationOutputs store drvPath drv = do
+  addressing <- addressingOf (Map.lookup "goonixAddressing" (environment drv))
+  let name = derivationName drvPath
+      blank = blankOutputPaths drv
+      bytes = writeDerivation blank
+      resolved = resolvedDerivation (Map.lookup "goonixResolved" (environment drv))
+      tokenForm = drv
+        { outputs = Map.mapWithKey (\output out -> if not (B.null (outputHash out)) then out
+            else out { outputPath = tokenPath store output (storePathToName store (outputPath out)) }) (outputs drv)
+        , environment = foldl (\env (output, out) ->
+            if not (B.null (outputHash out)) then env
+            else Map.insert output (tokenPath store output (storePathToName store (outputPath out))) env)
+            (Map.delete "goonixResolved" (environment drv)) (Map.toList (outputs drv))
+        }
+      provisionalBytes = writeDerivation tokenForm
+      suffix output = if output == "out" then "" else "-" <> output
+  forM_ (Map.toList (outputs drv)) $ \(output, out) -> do
+    let path = outputPath out
+        outName = name <> suffix output
+    expected <- if not (B.null (outputHash out))
+      then do
+        (recursive, algorithm, digest) <- parseHashInfo out
+        pure (makeFixedOutputPath store recursive algorithm digest outName)
+      else case addressing of
+        Content -> pure (if resolved
+          then tokenPath store output outName
+          else makePlaceholder store bytes output outName)
+        Resolved -> pure (if resolved
+          then resolvedAddressedPath store output outName provisionalBytes
+          else makePlaceholder store bytes output outName)
+        Input -> Left ("goonix: input-addressed output `" ++ C.unpack output ++ "' reached CA validation")
+    when (path /= expected) $
+      Left ("goonix: output `" ++ C.unpack output ++ "' has incorrect path `" ++ C.unpack path
+        ++ "', expected `" ++ C.unpack expected ++ "'")
+    let expectedEnvironment =
+          if goonixAddressed (Map.lookup "goonixAddressing" (environment drv))
+             && not resolved && B.null (outputHash out)
+            then tokenPath store output outName
+            else expected
+    case Map.lookup output (environment drv) of
+      Just value | value == expectedEnvironment -> Right ()
+      _ -> Left ("goonix: output `" ++ C.unpack output ++ "' has an incorrect environment path")
+  where
+    derivationName path =
+      let n = storePathToName store path
+      in if ".drv" `B.isSuffixOf` n then B.take (B.length n - 4) n else n
 
 -- | C++ checkInputAddressedPolicy: an input-addressed derivation may not depend
 -- on a content/resolved-addressed one.  `load' reads an input derivation; an
