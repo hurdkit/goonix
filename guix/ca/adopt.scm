@@ -41,17 +41,64 @@
 ;;;
 ;;; Code:
 
+;; Memoisation ACROSS calls, per store connection.
+;;
+;; The 'adopted policy calls adopt-derivation for EVERY package it lowers
+;; (guix/ca/policy.scm, adopt-lowered-derivation).  A cache made inside each
+;; call therefore memoises nothing across packages: each one re-adopted, and
+;; item-flagged? rescanned, its whole reference closure.  On the CA-6 boot
+;; gate that was O(packages x closure): the client read 165.9 GB from a
+;; 6.05 GB store (~27 passes, all page cache) with the daemon idle, and gcc
+;; came round once per package.
+;;
+;; Two caches, both keyed by the store CONNECTION's SOCKET so the tests'
+;; separate daemons never share results:
+;;   %adopt-caches: socket -> (derivation file name -> adopted derivation)
+;;   %scan-caches:  socket -> (realised store path -> flagged?)
+;; The scan cache is sound because a store item never changes once valid.
+;;
+;; The key is the SOCKET, not the <store-connection> record: upstream warns
+;; at guix/store.scm's build-accumulator that "cache-object-mapping and
+;; similar functional setters change the store's object identity", so two
+;; lowerings on one connection pass DIFFERENT record objects.  Keying on the
+;; record made every lookup miss (measured: a shared dependency was scanned
+;; once per lowering even with the cache in place).  The socket is the
+;; connection's stable identity, as upstream's own eq? test there uses.
+;; Weak keys let a closed connection's tables be collected.
+(define %adopt-caches (make-weak-key-hash-table))
+(define %scan-caches (make-weak-key-hash-table))
+
+(define (connection-cache caches store)
+  "Return the table for STORE's connection in CACHES, creating it on first
+use.  Keyed by the connection's socket, which is stable across the record
+copies that the store monad's functional setters make."
+  (let ((key (store-connection-socket store)))
+    (or (hashq-ref caches key)
+        (let ((table (make-hash-table)))
+          (hashq-set! caches key table)
+          table))))
+
 (define (item-flagged? store path)
   "Whether the store item at PATH is flagged by the scanner: it carries a
 self-reference the rewriter cannot provably reverse (a fragment, a UTF-16
 encoding, a hidden archive member, or a self-referencing name or link).  A
-whole plain self-reference is rewritable and does not flag the item."
-  (let ((report (scan-store-item path)))
-    (or (> (scan-report-fragments report) 0)
-        (> (scan-report-utf16 report) 0)
-        (> (scan-report-hidden report) 0)
-        (> (scan-report-names report) 0)
-        (> (scan-report-links report) 0))))
+whole plain self-reference is rewritable and does not flag the item.
+
+The answer is memoised per store connection and per realised PATH: a valid
+store item never changes, so it is scanned at most once per connection."
+  (let ((cache (connection-cache %scan-caches store)))
+    (let ((cached (hash-ref cache path 'unset)))
+      (if (not (eq? cached 'unset))
+          cached
+          (let ((flagged
+                 (let ((report (scan-store-item path)))
+                   (or (> (scan-report-fragments report) 0)
+                       (> (scan-report-utf16 report) 0)
+                       (> (scan-report-hidden report) 0)
+                       (> (scan-report-names report) 0)
+                       (> (scan-report-links report) 0)))))
+            (hash-set! cache path flagged)
+            flagged)))))
 
 (define (glibc-derivation? drv)
   "Whether DRV builds glibc, which must be built from source in adopted mode
@@ -74,12 +121,18 @@ is refused by name and whose contents are therefore never read."
   "Adopt DRV, an upstream input-addressed derivation: return a
 content-addressed derivation whose output is DRV's tree with every store
 reference rewritten to its adopted counterpart and its own path rewritten to
-the content address.  References are adopted recursively, memoised per item;
-an item the scanner flags, and glibc, is built content-addressed from source
-instead of adopted (its derivation is returned unchanged for the policy to
-re-lower).  The rewrite goes through graft-derivation/shallow under
-%graft-content-addressed?, so it is the two-pass content-addressed graft."
-  (define cache (make-hash-table))
+the content address.  References are adopted recursively; an item the scanner
+flags, and glibc, is built content-addressed from source instead of adopted
+(its derivation is returned unchanged for the policy to re-lower).  The
+rewrite goes through graft-derivation/shallow under
+%graft-content-addressed?, so it is the two-pass content-addressed graft.
+
+Results are memoised ACROSS calls in %adopt-caches, keyed by the store
+connection and then by derivation file name, because the 'adopted policy
+calls this for every package it lowers: a per-call cache would re-adopt and
+rescan the whole closure once per package.  The scan reports are memoised
+separately in item-flagged?."
+  (define cache (connection-cache %adopt-caches store))
   (define (adopt drv)
     (let ((key (derivation-file-name drv)))
       (or (hash-ref cache key)

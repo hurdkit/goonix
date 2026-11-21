@@ -3,6 +3,7 @@
              (guix tests)
              (guix ca)
              (guix ca policy)
+             (guix ca scan)
              (guix sets)
              (guix derivations)
              (guix gexp)
@@ -469,6 +470,44 @@ NarSize: 1234\nNarHash: sha256:~a\nReferences: \nSystem: ~a\nDeriver: ~a\n"
           (false-if-exception (delete-file cache-info))
           (false-if-exception (delete-file (string-append dir "/" nar-file)))
           (false-if-exception (delete-file-recursively tmp-lib)))))))
+
+(test-group "a shared dependency is scanned and adopted once across lowerings"
+  ;; The CA-6 gate rescanned the whole closure for EVERY package lowered under
+  ;; the 'adopted policy: adopt-derivation made a fresh cache per call, so
+  ;; gcc came round once per package (O(packages x closure)).  Measured on the
+  ;; gate client: rchar 165.9 GB against a 6.05 GB store, ~27 passes, with the
+  ;; daemon idle.  Two packages sharing one dependency must scan that
+  ;; dependency ONCE and adopt it ONCE, counted with a hook, not a timer.
+  (let* ((shared (trivial "ca-policy-memo-shared"
+                          #~(call-with-output-file #$output
+                              (lambda (p) (display "SHARED" p)))))
+         (left  (trivial "ca-policy-memo-left"
+                         #~(call-with-output-file #$output
+                             (lambda (p) (format p "~a/L" #$shared)))
+                         `(("shared" ,shared))))
+         (right (trivial "ca-policy-memo-right"
+                         #~(call-with-output-file #$output
+                             (lambda (p) (format p "~a/R" #$shared)))
+                         `(("shared" ,shared)))))
+    (parameterize ((%package-addressing-policy 'adopted)
+                   (%upstream-package?
+                    (upstream-package-set
+                     (list->setq (list shared left right %bootstrap-guile)))))
+      (let* ((shared-ia (parameterize ((%package-addressing-policy 'input))
+                          (package-derivation store shared)))
+             (_ (build-derivations store (list shared-ia)))
+             (shared-out (realised-output-path store shared-ia "out")))
+        ;; Record every scanned path via the hook, then count the SHARED
+        ;; item's occurrences: unrelated items (bootstrap guile, the two
+        ;; tops) must not mask the property.
+        (let ((scans '()))
+          (parameterize ((%scan-count
+                          (lambda (path) (set! scans (cons path scans)))))
+            (package-derivation store left)
+            (package-derivation store right))
+          (test-equal "a dependency shared by two packages is scanned exactly once"
+            1
+            (count (lambda (p) (string=? p shared-out)) scans)))))))
 
 (close-connection store)
 (test-end)
