@@ -11,6 +11,7 @@
 -- as C++ does, and every spawn site uses it.
 module Goonix.Store.GuixProgram
   ( guixProgram
+  , stateDirectory
   , canonPath
   ) where
 
@@ -46,6 +47,19 @@ guixProgram = do
             _ -> binDir <> "/guix")
       writeIORef guixProgramCache (Just program)
       pure program
+
+-- | The state directory, resolved once as C++ Settings::processEnvironment
+-- (globals.cc:64): @nixStateDir = canonPath(getEnv("GUIX_STATE_DIRECTORY",
+-- NIX_STATE_DIR))@, where NIX_STATE_DIR is the configure-time
+-- localstatedir/guix (Goonix.Config.stateDirectory).  A plain ByteString, never
+-- Maybe: no code path may run without a state directory, so indirect roots,
+-- findRoots, the GC lock and temporary roots all share this one value.
+stateDirectory :: IO B.ByteString
+stateDirectory = do
+  explicit <- getEnv "GUIX_STATE_DIRECTORY"
+  pure (canonPath (case explicit of
+    Just dir | not (B.null dir) -> dir
+    _ -> C.pack Config.stateDirectory))
 
 -- | C++ canonPath (util.cc, resolveSymlinks = false): require an absolute
 -- path, collapse repeated slashes, drop "." components and resolve ".."

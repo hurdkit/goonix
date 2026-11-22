@@ -56,7 +56,7 @@ import System.IO (hPutStrLn, stderr)
 serve :: ServerConfig -> IO ()
 serve config = do
   socketPath <- getEnv "GUIX_DAEMON_SOCKET"
-  let path = maybe (configStateDirectory config `orElseBytes` "/var/guix" <> "/daemon-socket/socket") id socketPath
+  let path = maybe (configStateDirectory config <> "/daemon-socket/socket") id socketPath
   serveSocket config path
 
 serveSocket :: ServerConfig -> ByteString -> IO ()
@@ -67,7 +67,7 @@ serveSocket config path = do
 serveListener :: ServerConfig -> Socket -> IO ()
 serveListener config listener = do
   initialiseState config
-  users <- loadUserPool (maybe "/var/guix" id (configStateDirectory config)) (setting "build-users-group" "" (configDefaultSettings config))
+  users <- loadUserPool (configStateDirectory config) (setting "build-users-group" "" (configDefaultSettings config))
   -- HS-12: one shared scheduler per daemon process — one job limit and one goal
   -- per derivation across all clients.  The daemon-wide build-max-jobs comes
   -- from the default settings; a client's own --max-jobs still bounds its
@@ -94,14 +94,12 @@ initialiseState config = do
     groupEntry <- getGroupEntryForName (C.unpack buildGroup)
     Files.setOwnerAndGroup (configStore config) 0 (fromIntegral (groupID groupEntry))
     Files.setFileMode (configStore config) 0o1775
-  case configStateDirectory config of
-    Nothing -> pure ()
-    Just state -> do
-      user <- getUserEntryForID uid
-      mkdirParents (state <> "/gcroots/auto")
-      mkdirParents (state <> "/profiles/per-user/" <> C.pack (userName user))
-      Files.setFileMode (state <> "/profiles/per-user") 0o755
-      Files.setFileMode (state <> "/profiles/per-user/" <> C.pack (userName user)) 0o755
+  let state = configStateDirectory config
+  user <- getUserEntryForID uid
+  mkdirParents (state <> "/gcroots/auto")
+  mkdirParents (state <> "/profiles/per-user/" <> C.pack (userName user))
+  Files.setFileMode (state <> "/profiles/per-user") 0o755
+  Files.setFileMode (state <> "/profiles/per-user/" <> C.pack (userName user)) 0o755
 
 activationSockets :: IO [Socket]
 activationSockets = do
@@ -146,8 +144,8 @@ handleClient config counter client = do
     pure (next, C.pack (show pid <> "-" <> show next))
   catch
     (withTempRootFile (temporaryRootsPath config <> "/" <> rootName) (storeGcLockPath config) $ \rootFd ->
-      bracket (openStore (configStore config) (configDatabase config)) closeStore $ \store ->
-        catch (handleConnection config store { storeStateDirectory = configStateDirectory config } client settingsRef rootFd (temporaryRootsPath config <> "/" <> rootName)) report)
+      bracket (openStore (configStore config) (configDatabase config) (configStateDirectory config)) closeStore $ \store ->
+        catch (handleConnection config store client settingsRef rootFd (temporaryRootsPath config <> "/" <> rootName)) report)
     report
   where
     report exception = hPutStrLn stderr ("guix-daemon: " ++ show (exception :: SomeException))
@@ -156,14 +154,10 @@ reportOperation :: String -> SomeException -> IO ()
 reportOperation where' exception = hPutStrLn stderr ("guix-daemon operation " ++ where' ++ ": " ++ show exception)
 
 temporaryRootsPath :: ServerConfig -> ByteString
-temporaryRootsPath config = case configStateDirectory config of
-  Just state -> state <> "/temproots"
-  Nothing -> "/tmp/goonix-temproots"
+temporaryRootsPath config = configStateDirectory config <> "/temproots"
 
 storeGcLockPath :: ServerConfig -> ByteString
-storeGcLockPath config = case configStateDirectory config of
-  Just state -> state <> "/gc.lock"
-  Nothing -> configStore config <> "/.gc.lock"
+storeGcLockPath config = configStateDirectory config <> "/gc.lock"
 
 handleConnection :: ServerConfig -> Store -> Socket -> IORef Settings -> Fd -> ByteString -> IO ()
 handleConnection config store client settingsRef rootFd rootPath = do
@@ -586,7 +580,3 @@ writeFrame client frame = writeSocket client (encodeInt frame)
 
 void :: IO a -> IO ()
 void action = action >> pure ()
-
-orElseBytes :: Maybe ByteString -> ByteString -> ByteString
-orElseBytes (Just value) _ = value
-orElseBytes Nothing fallback = fallback

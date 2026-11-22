@@ -403,10 +403,8 @@ withdrawRoots gcPath owner = atomically $
 
 -- | The GC-lock path of a store, the key of its root-announcement table and
 -- the file two daemons on one store exclude each other through.
-storeGcLockPathOf :: ByteString -> Maybe ByteString -> ByteString
-storeGcLockPathOf storeDir stateDir = case stateDir of
-  Just state -> state <> "/gc.lock"
-  Nothing -> storeDir <> "/.gc.lock"
+storeGcLockPathOf :: ByteString -> ByteString -> ByteString
+storeGcLockPathOf _storeDir stateDir = stateDir <> "/gc.lock"
 
 -- While THIS process's collector holds the GC lock exclusively, a new client of
 -- this process may create its temporary-root file without taking the shared GC

@@ -148,8 +148,8 @@ retryRegistration action = go (0 :: Int)
 
 addIndirectRoot :: Store -> ByteString -> IO ()
 addIndirectRoot store link = do
-  state <- maybe (throwIO (storeError "no state directory")) pure (storeStateDirectory store)
-  let digest = hashDigest (Hash SHA1 (sha1 link))
+  let state = storeStateDirectory store
+      digest = hashDigest (Hash SHA1 (sha1 link))
       root = state <> "/gcroots/auto/" <> encodeBase32Short digest
   makeSymlinkAtomic link root
 

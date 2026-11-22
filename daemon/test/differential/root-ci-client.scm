@@ -10,7 +10,7 @@
 (use-modules (guix store) (guix derivations) (guix monads) (guix download)
              (guix git-download) (guix hash) (guix base32) (guix tests)
              (guix utils) (gnu packages bootstrap) (gcrypt hash) (rnrs io ports) (rnrs bytevectors)
-             (ice-9 match) (ice-9 textual-ports) (ice-9 string-fun) (srfi srfi-1) (srfi srfi-34))
+             (ice-9 match) (ice-9 textual-ports) (ice-9 string-fun) (ice-9 ftw) (srfi srfi-1) (srfi srfi-34))
 
 (define work (cadr (command-line)))
 (define gitrev (caddr (command-line)))
@@ -147,6 +147,42 @@
                 (string-contains listing b-base) (string-contains listing c-base))
         (and (string-contains listing b-base)
              (not (string-contains listing c-base)))))))
+
+;; --- 7. indirect root under the configure-time state directory ---
+;; The installed (CI-like) daemon gets only TMPDIR/LC_ALL/PATH, so
+;; GUIX_STATE_DIRECTORY is unset.  C++ falls back to the configure-time
+;; localstatedir/guix (globals.cc:64); the daemon must resolve the state
+;; directory the same way, not fail with "no state directory".  Register a
+;; built item as an indirect root: the link must appear under
+;; <state>/gcroots/auto, find-roots must list it, and delete-paths must refuse
+;; the rooted path as alive.
+(define root-drv (derivation store "pr6-root" bash
+                             '("-c" "echo rooted > $out")
+                             #:sources (list bash)))
+(define root-out (derivation->output-path root-drv))
+(record "indirect-root-added"
+  (guard (c (else (format #t "  indirect-root error: ~a~%" c) #f))
+    (and (build-derivations store (list root-drv))
+         (add-indirect-root store root-out)
+         ;; The auto root link exists under the state directory's gcroots/auto.
+         (let ((auto (string-append work "/var-guix/gcroots/auto")))
+           (and (file-exists? auto)
+                (let ((entries (scandir auto (lambda (e) (not (member e '("." "..")))))))
+                  (and (pair? entries)
+                       (any (lambda (e)
+                              (let ((link (string-append auto "/" e)))
+                                (and (eq? (stat:type (lstat link)) 'symlink)
+                                     (string=? (readlink link) root-out))))
+                            entries))))))))
+(record "indirect-root-listed"
+  (guard (c (else (format #t "  find-roots error: ~a~%" c) #f))
+    (any (lambda (pair) (string=? (cdr pair) root-out)) (find-roots store))))
+(record "indirect-root-alive"
+  (guard (c ((store-protocol-error? c)
+             (string-contains (store-protocol-error-message c) "alive"))
+            (else (format #t "  delete-paths error: ~a~%" c) #f))
+    (delete-paths store (list root-out))
+    #f))
 
 (close-connection store)
 (let ((failed (filter (lambda (p) (not (cdr p))) results)))
