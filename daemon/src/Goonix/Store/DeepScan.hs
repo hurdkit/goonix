@@ -9,6 +9,7 @@
 module Goonix.Store.DeepScan
   ( checkDeepOutput
   , deepScanHelperPath
+  , readDiagnostic
   ) where
 
 import Control.Exception (SomeException, bracket, catch, evaluate, throwIO, try)
@@ -120,20 +121,22 @@ withCStringArray strings action = go strings []
 -- child if it exceeds its time limit (C++ polls with a deadline).
 readDiagnostic :: Handle -> Int -> CPid -> IO String
 readDiagnostic handle timeoutSeconds pid = do
-  result <- timeout (timeoutSeconds * 1000000) (hGetContents handle)
+  -- hGetContents is LAZY: it returns a thunk immediately without blocking, so
+  -- wrapping only hGetContents in `timeout` would never fire (the thunk is
+  -- produced instantly) and the real blocking read would happen later, outside
+  -- any deadline.  Force the bounded string INSIDE the timeout so the deadline
+  -- actually bounds the read: a helper that keeps the pipe open and never exits
+  -- is killed when the limit expires, as C++ does with its poll deadline.
+  result <- timeout (timeoutSeconds * 1000000) $ do
+    contents <- hGetContents handle
+    let bounded = take 65536 contents
+    _ <- evaluate (length bounded)
+    pure bounded
   case result of
     Nothing -> do
       _ <- try (signalProcess sigKILL pid) :: IO (Either SomeException ())
       ioError (userError ("deep CA scan helper exceeded its " ++ show timeoutSeconds ++ " second limit"))
-    Just contents -> do
-      -- hGetContents is lazy: force the whole string HERE, while the handle is
-      -- still open (inside runDeepScanHelper's bracket).  Otherwise the delayed
-      -- read runs after bracket closes the handle, when foundMessage forces the
-      -- string, and crashes the build thread ("delayed read on closed handle"),
-      -- which closes the client connection (the client sees a nar-error).
-      let bounded = take 65536 contents
-      _ <- evaluate (length bounded)
-      pure bounded
+    Just bounded -> pure bounded
 
 waitFor :: CPid -> IO ProcessStatus
 waitFor pid = do

@@ -82,6 +82,7 @@ EXTRA_DIST += \
   daemon/src/Goonix/Store/Ca.hs \
   daemon/src/Goonix/Store/DeepScan.hs \
   daemon/test/ca-vectors/Main.hs \
+  daemon/test/deep-scan-timeout.hs daemon/test/deep-scan-timeout.sh \
   daemon/proxy/Main.hs \
   daemon/test/wire-proxy/Main.hs daemon/test/wire-proxy/run.sh \
   daemon/test/wire-proxy/inventory.scm daemon/test/check-build-flags.scm \
