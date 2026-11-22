@@ -6,6 +6,7 @@ module Goonix.Store.Server
   ( serve
   , serveSocket
   , serveListener
+  , openListener
   , activationSockets
   , handleConnection
   , ServerConfig (..)
@@ -50,7 +51,7 @@ import System.Posix.Env.ByteString (getEnv)
 import Goonix.Store.Files (withTempRootFile, withCollectorGCLock, withOtherTemporaryRoots, appendTempRoot, deleteTree, mkdirParents, directoryEntries, catchMissing, deduplicateTree)
 import System.Posix.IO (closeFd)
 import qualified System.Posix.Files.ByteString as Files
-import System.Posix.User (getUserEntryForID, userName)
+import System.Posix.User (getUserEntryForID, userName, getGroupEntryForName, groupID)
 import System.Posix.Process (getProcessID)
 import System.Posix.Types (Fd (..))
 import System.Posix.User (getRealUserID)
@@ -86,10 +87,20 @@ serveListener config listener = do
 initialiseState :: ServerConfig -> IO ()
 initialiseState config = do
   mkdirParents (configStore config)
+  -- C++ LocalStore ctor (local-store.cc:86-107): for a multi-user install
+  -- (root daemon + build-users-group), the store is owned root:buildUsersGroup
+  -- with mode 01775 so build users can create outputs (a builtin runs outside
+  -- the chroot and writes the store directly).  Without this a root daemon's
+  -- builtin build fails "Permission denied" writing /gnu/store/<output>.
+  uid <- getRealUserID
+  let buildGroup = setting "build-users-group" "" (configDefaultSettings config)
+  when (uid == 0 && not (B.null buildGroup)) $ do
+    groupEntry <- getGroupEntryForName (C.unpack buildGroup)
+    Files.setOwnerAndGroup (configStore config) 0 (fromIntegral (groupID groupEntry))
+    Files.setFileMode (configStore config) 0o1775
   case configStateDirectory config of
     Nothing -> pure ()
     Just state -> do
-      uid <- getRealUserID
       user <- getUserEntryForID uid
       mkdirParents (state <> "/gcroots/auto")
       mkdirParents (state <> "/profiles/per-user/" <> C.pack (userName user))

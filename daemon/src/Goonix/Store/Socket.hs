@@ -26,6 +26,7 @@ import Control.Exception (throwIO)
 import Control.Monad (forever)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as B
+import qualified Data.ByteString.Char8 as C
 import Foreign.C.String (CString, withCString)
 import Foreign.C.Error (Errno (..), getErrno)
 import Foreign.C.Types (CInt (..), CUInt (..))
@@ -41,6 +42,7 @@ import System.Posix.Types (Fd (..))
 data Socket = Socket !Fd !(Maybe (MVar ()))
 
 foreign import ccall unsafe "goonix_listen_unix" c_listen_unix :: CString -> IO CInt
+foreign import ccall unsafe "goonix_socket_errno" c_socket_errno :: IO CInt
 foreign import ccall unsafe "goonix_listen_tcp" c_listen_tcp :: CString -> CString -> IO CInt
 foreign import ccall safe "goonix_accept" c_accept :: CInt -> IO CInt
 foreign import ccall unsafe "goonix_peer_uid" c_peer_uid :: CInt -> Ptr CUInt -> IO CInt
@@ -50,8 +52,23 @@ foreign import ccall unsafe "goonix_peek_socket" c_peek_socket :: CInt -> IO CIn
 
 listenUnix :: RawFilePath -> IO Socket
 listenUnix path = (\fd -> Socket (Fd fd) Nothing) <$> do
-  fd <- B.useAsCString path c_listen_unix
-  if fd < 0 then socketError "cannot bind/listen on Unix socket" else pure fd
+  result <- B.useAsCString path c_listen_unix
+  if result >= 0
+    then pure result
+    else do
+      errno <- c_socket_errno
+      let file = C.unpack path
+          errnoText = ": errno=" ++ show (case errno of CInt number -> number)
+          message = case result of
+            -1 -> "cannot create Unix domain socket" ++ errnoText
+            -2 -> "creating directory for socket '" ++ file ++ "'" ++ errnoText
+            -3 -> "cannot change current directory to socket directory of '" ++ file ++ "'" ++ errnoText
+            -4 -> "socket file name '" ++ file ++ "' is too long"
+            -5 -> "cannot bind to socket '" ++ file ++ "'" ++ errnoText
+            -6 -> "cannot change current directory back from socket '" ++ file ++ "'" ++ errnoText
+            -7 -> "cannot listen on socket '" ++ file ++ "'" ++ errnoText
+            _ -> "cannot bind/listen on Unix socket '" ++ file ++ "'" ++ errnoText
+      socketError message
 
 listenTcp :: String -> String -> IO Socket
 listenTcp host service = (\fd -> Socket (Fd fd) Nothing) <$> withCString host (\host' -> withCString service $ \service' -> do

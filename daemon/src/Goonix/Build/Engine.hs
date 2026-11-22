@@ -41,7 +41,9 @@ import Goonix.Store.ReadOnly
 import Goonix.Store.References (scanReferences)
 import Goonix.Store.Settings
 import Goonix.Store.Config (ServerConfig, configGuixProgram, configBuildUsers, configSharedScheduler, configStore, configDatabase, configStateDirectory)
-import Goonix.Store.Substitute (substitutableInfos, substitutePath)
+import Goonix.Store.GuixProgram (guixProgram, canonPath)
+import qualified Goonix.Config as Config
+import Goonix.Store.Substitute (substitutableInfos, substitutePath, packSettings)
 import Goonix.Store.Writing
 import System.Posix.ByteString (RawFilePath)
 import qualified System.Posix.Directory.ByteString as Dir
@@ -58,10 +60,12 @@ import System.Posix.User (getEffectiveGroupID, getEffectiveUserID)
 import System.FilePath (takeDirectory)
 import System.Directory (findExecutable)
 import System.IO.Error (ioeGetErrorString, isDoesNotExistError)
-import System.Posix.Types (Fd (..))
+import System.Posix.Types (Fd (..), CUid (..), CGid (..))
 import Foreign.C.String (CString, withCString)
 import Foreign.C.Types (CInt (..), CSize (..))
 import Foreign.Marshal.Alloc (alloca)
+import Foreign.Marshal.Array (withArray, withArray0)
+import Foreign.Marshal.Utils (withMany)
 import Foreign.Ptr (Ptr, castPtr, nullPtr)
 import Foreign.Storable (peek)
 import Goonix.Build.Sandbox
@@ -400,7 +404,7 @@ buildWithHook userPool rootFd store settings trace pool mode originalPath drvPat
                 writeIORef (fst currentPool) Nothing
                 finally
                   (do
-                    inputRoots <- Set.toList <$> derivationInputs store drvPath Set.empty drv
+                    inputRoots <- Set.toList <$> derivationInputs store drvPath drv
                     inputs <- Set.toList . Set.fromList . concat <$> mapM (referenceClosure store) (drvPath:inputRoots)
                     let outputPaths = map outputPath (Map.elems (outputs drv))
                     logPath <- buildLogPath settings store drvPath
@@ -495,20 +499,41 @@ offloadFailed settings store trace drvPath drv status = do
     mapM_ (registerFailedPath store . outputPath) (Map.elems (outputs drv))
   throwIO (StoreError (C.pack ("build of " ++ C.unpack drvPath ++ " failed: " ++ failure)) statusCode)
 
-derivationInputs :: Store -> ByteString -> Set.Set ByteString -> Derivation -> IO (Set.Set ByteString)
-derivationInputs store drvPath seen current = do
-  let direct = Set.filter (\path -> not ("builtin:" `B.isPrefixOf` path))
-        (if "builtin:" `B.isPrefixOf` builder current
+-- | The input paths of a derivation, matching C++ DerivationGoal::inputsRealised
+-- (nix/libstore/build.cc:1108-1125): the selected outputs of each DIRECT input
+-- derivation plus the input sources.  It NEVER recurses into an input
+-- derivation's own inputs.  The caller computeFSClosures these (referenceClosure)
+-- to get the chroot/offload closure.  Recursing collected the whole build-time
+-- graph down to source tarballs, which (a) crashes with "path ... is not valid"
+-- when a transitive source is absent (a CI store keeps packages but not their
+-- sources) and (b) leaks undeclared build-time dependencies into the chroot.
+--
+-- The builder's top-level store path is included for a non-builtin builder: the
+-- Haskell sandbox (guix-sandbox.cc) mounts only this closure, with no whole-"/"
+-- mount, so the builder executable must be in it.  C++ instead relies on the
+-- builder being a declared input (Guix gexp->derivation declares guile-for-build).
+derivationInputs :: Store -> ByteString -> Derivation -> IO (Set.Set ByteString)
+derivationInputs store drvPath current = do
+  let isBuiltin = "builtin:" `B.isPrefixOf` builder current
+      direct = Set.filter (\path -> not ("builtin:" `B.isPrefixOf` path))
+        (if isBuiltin
           then inputSrcs current
           else Set.insert (topLevelStorePath store (builder current)) (inputSrcs current))
   dependencies <- mapM (\(path, selected) -> (\drv -> (path, selected, drv)) <$> readStoreDerivation path)
-    (filter (\(path, _) -> Set.notMember path seen) (Map.toList (inputDrvs current)))
-  let dependencyOutputs = Set.fromList
-        [ outputPath output
-        | (path, selected, dependency) <- dependencies
-        , output <- Map.elems (if Set.null selected then outputs dependency else Map.restrictKeys (outputs dependency) selected)
-        ]
-  foldM (\seen' (path, _selected, drv) -> derivationInputs store path seen' drv) (Set.insert drvPath (Set.union seen (Set.union direct dependencyOutputs))) dependencies
+    (Map.toList (inputDrvs current))
+  -- C++: for each direct input derivation, iterate the SELECTED output names; a
+  -- selected name absent from the input's outputs is an error; an EMPTY selection
+  -- selects nothing (the loop over i.second is empty).
+  dependencyOutputs <- fmap concat $ forM dependencies $ \(path, selected, dependency) ->
+    if Set.null selected
+      then pure []
+      else forM (Set.toList selected) $ \name ->
+        case Map.lookup name (outputs dependency) of
+          Just output -> pure (outputPath output)
+          Nothing -> throwIO (storeError
+            ("derivation `" ++ C.unpack drvPath ++ "' requires non-existent output `"
+              ++ C.unpack name ++ "' from input derivation `" ++ C.unpack path ++ "'"))
+  pure (Set.union direct (Set.fromList dependencyOutputs))
   where
     readStoreDerivation path = do
       bytes <- B.readFile (C.unpack path)
@@ -584,7 +609,7 @@ runBuilderWithUser buildUser rootFd store settings trace mode originalPath drvPa
       replacements = zip outPaths redirected
       actualDrv = if mode == Check && not caCheck then replaceDerivationPaths replacements drv else drv
   mapM_ (appendTempRoot rootFd) outPaths
-  inputRoots <- derivationInputs store drvPath Set.empty drv
+  inputRoots <- derivationInputs store drvPath drv
   mapM_ (appendTempRoot rootFd) (Set.toList inputRoots)
   withWritableStore (storeDirectory store) $ mapM_ deleteTree redirected
   work <- makeBuildDirectory store
@@ -604,22 +629,28 @@ runBuilderWithUser buildUser rootFd store settings trace mode originalPath drvPa
   (readFd, writeFd) <- createPipe
   writeHandle <- fdToHandle writeFd
   readHandle <- fdToHandle readFd
-  guixProgram <- maybe "guix" C.unpack <$> getEnv "GUIX"
+  guixProgram' <- C.unpack <$> guixProgram
   let command = if "builtin:" `B.isPrefixOf` builder drv
-        then proc guixProgram ["perform-download", C.unpack drvPath, C.unpack (outputPath (outputs actualDrv Map.! "out"))]
+        then proc guixProgram' ["perform-download", C.unpack drvPath, C.unpack (outputPath (outputs actualDrv Map.! "out"))]
         else proc (C.unpack (builder drv)) (map C.unpack materialisedArgs)
   (childPid, wait, sandboxRoot, sandboxOutputs) <-
     try (mask $ \restore -> do
     spawned <- if settingBool "build-use-sandbox" True settings && not (isBuiltin)
       then spawnSandboxedBuilder buildUser settings store work drvPath actualDrv command env writeFd
       else do
-        -- As in builtins.cc, the downloader inherits the daemon's environment.
+        -- As in builtins.cc, the downloader inherits the daemon's environment,
+        -- plus NIX_STORE (for strip-store-file-name) and _NIX_OPTIONS (the packed
+        -- settings), which C++ builtinDownload sets before exec (builtins.cc:49-52).
         inherited <- if isBuiltin then getEnvironment else pure []
-        let childEnvironment = if isBuiltin then inherited else env
-        (_, _, _, process) <- createProcess command
-          { cwd = Just (C.unpack work), env = Just childEnvironment, std_out = UseHandle writeHandle, std_err = UseHandle writeHandle, create_group = True }
-        pid <- maybe 0 fromIntegral <$> getPid process
-        pure (pid, waitForProcess process, Nothing, [])
+        let childEnvironment = if isBuiltin
+              then inherited ++ [("NIX_STORE", C.unpack (storeDirectory store)),
+                                 ("_NIX_OPTIONS", C.unpack (packSettings settings))]
+              else env
+        case cmdspec command of
+          RawCommand executable arguments -> do
+            pid <- spawnDirectBuilder buildUser executable arguments childEnvironment work writeFd
+            pure (pid, waitForSandbox pid, Nothing, [])
+          ShellCommand _ -> throwIO (storeError "shell builders are not supported")
     let (pid, _, _, _) = spawned
     -- The child exists before this handler is installed only while masked.
     -- Cancellation after this point cannot orphan it in the fork/wait gap.
@@ -727,6 +758,10 @@ runBuilderWithUser buildUser rootFd store settings trace mode originalPath drvPa
 foreign import ccall unsafe "goonix_spawn_sandbox"
   c_spawn_sandbox :: CString -> CString -> CInt -> Ptr CInt -> IO CInt
 
+foreign import ccall unsafe "goonix_spawn_builtin"
+  c_spawn_builtin :: CString -> Ptr CString -> Ptr CString -> CString -> CInt -> CInt
+                  -> CUid -> CGid -> Ptr CGid -> CInt -> Ptr CInt -> IO CInt
+
 topLevelStorePath :: Store -> RawFilePath -> RawFilePath
 topLevelStorePath store path =
   storeDirectory store <> "/" <> C.takeWhile (/= '/') (B.drop (B.length (storeDirectory store) + 1) path)
@@ -788,7 +823,7 @@ spawnSandboxedBuilder buildUser settings store work drvPath drv command env (Fd 
           (sandboxFlagSlirpNetwork .|. (if ipv6 then sandboxFlagIpv6Network else 0) .|.
             (if isolate then sandboxFlagIsolateHostLoopback else 0),
             C.pack program, slirpSeccompFilter nativeArchitecture)
-  inputs <- derivationInputs store drvPath Set.empty drv
+  inputs <- derivationInputs store drvPath drv
   let writableInputs = Set.fromList [work, storeDirectory store]
   closure <- Set.unions . map Set.fromList <$> mapM (referenceClosure store) (Set.toList inputs)
   let sandboxWork = "/tmp/guix-build-" <> storePathToName (storeDirectory store) drvPath <> "-0"
@@ -924,6 +959,34 @@ waitForSandbox pid = do
     Just (Stopped _) -> waitForSandbox pid
     Nothing -> throwIO (storeError "cannot wait for sandbox helper")
 
+-- | Spawn a non-sandboxed builder (a builtin such as guix perform-download, or
+-- an ordinary builder when the sandbox is disabled) as the leased build user.
+-- C++ runs builtins outside the chroot but "under a separate build user, though"
+-- (build.cc:2555-2558): the child drops to the build user before exec.  A root
+-- daemon that ran the builtin as root would be refused by perform-download
+-- ("refusing to run with elevated privileges").  The C shim drops supplementary
+-- groups, gid, then uid (C++ setIDsAction order) between fork and exec; with no
+-- build user the child keeps the daemon's identity (C++ build-users-group empty).
+spawnDirectBuilder :: Maybe BuildUser -> FilePath -> [String] -> [(String, String)] -> RawFilePath -> Fd -> IO Int
+spawnDirectBuilder buildUser executable arguments environment work (Fd logFd) = do
+  let argv = executable : arguments
+      envStrings = map (\(name, value) -> name ++ "=" ++ value) environment
+      dropIds = maybe 0 (const 1) buildUser
+      uid = maybe 0 (fromIntegral . buildUserUid) buildUser
+      gid = maybe 0 (fromIntegral . buildUserGid) buildUser
+      groups = maybe [] (map fromIntegral . buildUserGroups) buildUser
+  withCString executable $ \program' ->
+    withMany withCString argv $ \argvPtrs ->
+    withArray0 nullPtr argvPtrs $ \argv' ->
+    withMany withCString envStrings $ \envPtrs ->
+    withArray0 nullPtr envPtrs $ \env' ->
+    withCString (C.unpack work) $ \work' ->
+    withArray groups $ \groups' ->
+    alloca $ \pidPointer -> do
+      result <- c_spawn_builtin program' argv' env' work' logFd dropIds uid gid groups'
+        (fromIntegral (length groups)) pidPointer
+      if result < 0 then throwIO (storeError "cannot spawn builder") else fromIntegral <$> peek pidPointer
+
 makeSandboxRoot :: Store -> IO RawFilePath
 makeSandboxRoot store = do
   let parent = maybe "/tmp" (<> "/build") (storeStateDirectory store)
@@ -989,10 +1052,13 @@ checkBuiltOutputs store drvPath replacements retain = forM_ replacements $ \(ori
 
 buildLogPath :: Settings -> Store -> ByteString -> IO RawFilePath
 buildLogPath settings store drvPath = do
+  -- C++ nixLogDir = canonPath(getEnv("GUIX_LOG_DIRECTORY", NIX_LOG_DIR))
+  -- (globals.cc:63): the configured log directory (NIX_LOG_DIR, /var/log/guix),
+  -- NOT the state directory.  The client looks there for `guix build --log-file`;
+  -- a state-dir fallback (/var/guix/log/guix) made CI report "Could not find
+  -- build log".  Canonicalised as C++ does.
   configured <- getEnv "GUIX_LOG_DIRECTORY"
-  let base = case configured of
-        Just path -> path
-        Nothing -> maybe "/tmp" (<> "/log/guix") (storeStateDirectory store)
+  let base = canonPath (maybe (C.pack Config.logDirectory) id configured)
       basename = B.drop (B.length (storeDirectory store) + 1) drvPath
       suffix = case setting "build-log-compression" "gzip" settings of
         "none" -> ""

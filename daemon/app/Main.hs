@@ -16,6 +16,7 @@ import Foreign.Ptr (Ptr)
 import Foreign.Storable (peek)
 import qualified Goonix.Config as Config
 import Goonix.Store.Config
+import Goonix.Store.GuixProgram (guixProgram)
 import Goonix.Store.Server
 import Goonix.Store.Settings
 import Goonix.Store.Socket (Socket)
@@ -66,7 +67,7 @@ main = do
                 store <- storeDirectory args
                 database <- databasePath
                 state <- getEnv "GUIX_STATE_DIRECTORY"
-                guix <- getEnv "GUIX"
+                guix <- guixProgram
                 case parseDaemonOptions args of
                     Left message -> hPutStrLn stderr message >> exitFailure
                     Right options -> do
@@ -75,7 +76,7 @@ main = do
                               , configDatabase = database
                               , configDefaultSettings = settings options
                               , configStateDirectory = state
-                              , configGuixProgram = maybe (C.pack (Config.binaryDirectory ++ "/guix")) id guix
+                              , configGuixProgram = guix
                               }
                         when (settingBool "build-discover" False (configDefaultSettings config)) $
                           startDiscovery (configGuixProgram config)
@@ -112,9 +113,18 @@ serveMany config listeners = do
 
 serveManyPaths :: ServerConfig -> [B.ByteString] -> IO ()
 serveManyPaths config paths = do
+    -- Open every listener FIRST, one after another, before any accept loop is
+    -- forked (as the C++ daemon opens all its sockets before serving).  Binding
+    -- a Unix socket mutates the process-wide umask and working directory
+    -- (goonix_listen_unix chdir-binds the relative name under umask(0111));
+    -- doing it inside a forkIO per path let two binds race — one could bind
+    -- ./socket in the other's directory, and another thread's mkdir in the
+    -- umask window could create directories without x bits.  Sequential opens
+    -- remove that race; only the accept loops run concurrently.
+    listeners <- mapM openListener paths
     done <- newEmptyMVar
-    forM_ paths $ \path -> forkIO $ do
-        result <- try (serveSocket config path)
+    forM_ listeners $ \listener -> forkIO $ do
+        result <- try (serveListener config listener)
         case result of
             Left exception -> hPutStrLn stderr (show (exception :: SomeException))
             Right _ -> pure ()

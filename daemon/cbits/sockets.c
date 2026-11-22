@@ -15,28 +15,83 @@
 #include <stdint.h>
 #include <stdlib.h>
 
+/* goonix: bind a Unix-domain socket exactly as the C++ daemon's
+   open_unix_domain_socket (nix/nix-daemon/guix-daemon.cc): create the parent
+   directories, chdir into them and bind the relative name "./socket" (so the
+   108-byte sun_path limit applies to the basename, not the whole path), unlink
+   a stale socket first, bind under umask(0111) so the socket is 0666, chdir
+   back, then listen.  Returns the fd, or -step on failure so the caller can
+   name the file and the step, as the C++ messages do:
+     -1 socket, -2 createDirs, -3 chdir(dir), -4 name too long,
+     -5 bind, -6 chdir(/), -7 listen.
+   The working directory is restored even when a step fails. */
+static int mkdir_parents_socket(const char *path) {
+  size_t n = strlen(path);
+  char copy[n + 1];
+  memcpy(copy, path, n + 1);
+  for (size_t i = 1; i <= n; i++) {
+    if (copy[i] == '/' || copy[i] == '\0') {
+      char saved = copy[i];
+      copy[i] = '\0';
+      if (mkdir(copy, 0777) < 0 && errno != EEXIST) return -1;
+      copy[i] = saved;
+    }
+  }
+  return 0;
+}
+
 int goonix_listen_unix(const char *path) {
   int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
   if (fd < 0) return -1;
+
+  /* dirOf(path) and baseNameOf(path). */
+  const char *slash = strrchr(path, '/');
+  char dir[slash ? (size_t)(slash - path) + 1 : 2];
+  const char *base;
+  if (slash) {
+    if (slash == path) { dir[0] = '/'; dir[1] = '\0'; }
+    else { memcpy(dir, path, (size_t)(slash - path)); dir[slash - path] = '\0'; }
+    base = slash + 1;
+  } else { dir[0] = '.'; dir[1] = '\0'; base = path; }
+
+  if (mkdir_parents_socket(dir) < 0) { close(fd); return -2; }
+
+  /* Save the working directory so it can be restored on every exit path. */
+  char saved_cwd[4096];
+  if (getcwd(saved_cwd, sizeof saved_cwd) == NULL) { close(fd); return -3; }
+  if (chdir(dir) < 0) { close(fd); return -3; }
+
+  char rel[2 + strlen(base) + 1];
+  rel[0] = '.'; rel[1] = '/';
+  memcpy(rel + 2, base, strlen(base) + 1);
   struct sockaddr_un address;
   memset(&address, 0, sizeof address);
-  size_t length = strlen(path);
-  if (length >= sizeof(address.sun_path)) { close(fd); errno = ENAMETOOLONG; return -1; }
-  address.sun_family = AF_UNIX;
-  memcpy(address.sun_path, path, length + 1);
-  unlink(path);
-  if (bind(fd, (struct sockaddr *)&address, sizeof address) < 0 || listen(fd, 5) < 0 ||
-      /* umask is process-wide: do not race directory creation in other
-         connection threads.  Set the socket's mode after binding instead. */
-      fchmodat(AT_FDCWD, path, 0666, 0) < 0) {
-    int saved = errno;
-    close(fd);
-    unlink(path);
-    errno = saved;
-    return -1;
+  if (strlen(rel) >= sizeof(address.sun_path)) {
+    if (chdir(saved_cwd) < 0) { /* best effort restore */ }
+    close(fd); errno = ENAMETOOLONG; return -4;
   }
+  address.sun_family = AF_UNIX;
+  memcpy(address.sun_path, rel, strlen(rel) + 1);
+
+  unlink(path);
+
+  mode_t oldMode = umask(0111);
+  int res = bind(fd, (struct sockaddr *)&address, sizeof address);
+  umask(oldMode);
+  if (res < 0) {
+    int saved = errno;
+    if (chdir(saved_cwd) < 0) { /* best effort restore */ }
+    close(fd); errno = saved; return -5;
+  }
+
+  if (chdir(saved_cwd) < 0) { int saved = errno; close(fd); errno = saved; return -6; }
+
+  if (listen(fd, 5) < 0) { int saved = errno; close(fd); errno = saved; return -7; }
   return fd;
 }
+
+/* The errno of the last failed socket step, for the caller's message. */
+int goonix_socket_errno(void) { return errno; }
 
 int goonix_listen_tcp(const char *host, const char *service) {
   struct addrinfo hints, *addresses = NULL;

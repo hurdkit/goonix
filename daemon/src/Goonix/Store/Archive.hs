@@ -26,6 +26,7 @@ import Goonix.Store.ReadOnly
 import Goonix.Store.Wire
 import Goonix.Store.Writing
 import Goonix.Store.Files (deleteTree, restoreNar, deduplicateTree)
+import Goonix.Store.GuixProgram (guixProgram)
 import System.Posix.ByteString (RawFilePath)
 import System.IO (Handle, hPutStrLn, hFlush)
 import System.Process (CreateProcess (..), StdStream (..), createProcess, proc, waitForProcess)
@@ -290,7 +291,7 @@ verifySignature signature = authenticate ("verify " ++ show (B.length signature)
 
 authenticate :: String -> IO ByteString
 authenticate command = do
-  program <- maybe "guix" id <$> getEnv "GUIX"
+  program <- C.unpack <$> guixProgram
   (input, output, _, process) <- createProcess (proc program ["authenticate"])
     { std_in = CreatePipe, std_out = CreatePipe }
   case (input, output) of

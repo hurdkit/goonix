@@ -16,6 +16,29 @@ preparation. The C++ daemon instead isolates each client in its own process.
 (inventory 1.1 and 9.25).  A vanished client is handled by cancelling its
 Haskell thread rather than by the `SIGPOLL` flag (inventory 1.3).
 
+Because it is one process, the daemon also creates the store and state
+directories once at start-up (`initialiseState`) rather than per client as the
+C++ `LocalStore` constructor does on each connection (inventory 1.1). The
+observable on-disk layout after a connection differs in these incidental ways,
+none of which changes the store's behaviour:
+
+- The GC lock is `STATE/gc.lock` here, `DB/big-lock` in C++ (inventory 5.3).
+  Both are process-wide exclusive locks for collection; the path is internal.
+- `gcroots/auto` is created at start-up here; C++ creates it lazily when the
+  first indirect root is added. Both daemons read it when finding roots.
+- C++ writes a `DB/schema` version file and creates `STORE/.links` at store
+  open; here the schema is applied from the compiled SQL on each open and
+  `.links` is created on the first deduplication. Neither is read by a client.
+- C++ creates the `gcroots/profiles -> profiles` symlink at store open. It is
+  redundant: both root walkers scan `profiles` directly and follow a
+  symlink-to-directory no further, so the symlink adds no root. It is not
+  created here.
+
+The Unix-socket start-up itself matches the C++ `open_unix_domain_socket`
+exactly (create the socket directory, chdir and bind the relative `./socket`,
+unlink a stale socket, bind 0666 under `umask(0111)`, chdir back, listen); see
+`daemon/test/differential/socket-startup.sh`.
+
 Recursive NAR uploads and hash rewriting are streamed instead of retaining a
 whole store item in memory (inventory 9.20).
 

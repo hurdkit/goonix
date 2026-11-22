@@ -5,6 +5,7 @@ root=$(CDPATH= cd -- "$(dirname "$0")/../../.." && pwd)
 fixture=${1:-/tmp/goonix-hs4-build}
 "$root/daemon/test/differential/prepare-write-fixture.sh" "$fixture"
 export NIX_STORE_DIR="$fixture/store" GUIX_DATABASE_DIRECTORY="$fixture/db" GUIX_STATE_DIRECTORY="$fixture/var" GUIX_DAEMON_SOCKET="$fixture/var/socket"
+export GUIX_LOG_DIRECTORY="$fixture/var/log/guix"
 hs=$root/guix-daemon
 daemon=${GOONIX_TEST_DAEMON:-$hs}
 read -r -a daemon_options <<< "${GOONIX_TEST_DAEMON_OPTIONS:---disable-chroot --no-substitutes}"

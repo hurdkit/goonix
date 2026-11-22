@@ -75,6 +75,7 @@ EXTRA_DIST += \
   daemon/src/Goonix/Store/Database.hs daemon/src/Goonix/Store/ReadOnly.hs \
   daemon/src/Goonix/Store/Settings.hs daemon/src/Goonix/Store/Server.hs \
   daemon/src/Goonix/Store/Config.hs daemon/src/Goonix/Store/Socket.hs \
+  daemon/src/Goonix/Store/GuixProgram.hs \
   daemon/src/Goonix/Store/Substitute.hs daemon/src/Goonix/Store/Archive.hs daemon/src/Goonix/Build/Engine.hs daemon/src/Goonix/Build/Offload.hs daemon/src/Goonix/Build/Scheduler.hs daemon/cbits/sockets.c daemon/cbits/files.c \
   daemon/src/Goonix/Store/Path.hs daemon/src/Goonix/Store/Derivation.hs \
   daemon/src/Goonix/Store/Nar.hs daemon/src/Goonix/Store/References.hs \
@@ -94,6 +95,10 @@ EXTRA_DIST += \
   daemon/test/differential/prepare-readonly-fixture.sh \
   daemon/test/differential/read-only.sh daemon/test/differential/transports.sh \
   daemon/test/differential/guix-readonly.sh \
+  daemon/test/differential/socket-startup.sh \
+  daemon/test/differential/stale-socket.c daemon/test/differential/socket-connect.c \
+  daemon/test/differential/socket-query.c \
+  daemon/test/differential/builtin-ci.sh daemon/test/differential/builtin-ci.scm \
   daemon/sandbox/README.md daemon/sandbox/guix-sandbox.cc \
   daemon/sandbox/Makefile daemon/test/lib.sh daemon/test/seed-restore.scm \
   daemon/test/sandbox-helper-cleanup.sh daemon/test/sandbox-helper-cleanup.scm \

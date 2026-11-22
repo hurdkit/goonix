@@ -14,6 +14,7 @@ activation=${ACTIVATION_PROBE:-$root/daemon/dist-newstyle/build/x86_64-linux/ghc
 export NIX_STORE_DIR="$fixture/store"
 export GUIX_DATABASE_PATH="$fixture/db/db.sqlite"
 export GUIX_STATE_DIRECTORY="$fixture/var"
+export GUIX_LOG_DIRECTORY="$fixture/var/log/guix"
 export GUIX_DAEMON_SOCKET=guix://localhost:45678
 "$daemon" --disable-chroot --listen=localhost:45678 \
   --substitute-urls=file:///tmp/goonix-substitute > "$out/tcp.log" 2>&1 &

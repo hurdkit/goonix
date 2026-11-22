@@ -6,6 +6,8 @@ module Goonix.Store.Config
   , defaultConfig
   ) where
 import Data.ByteString (ByteString)
+import qualified Data.ByteString.Char8 as C
+import qualified Goonix.Config as Config
 import Goonix.Store.Settings (Settings, defaultSettings)
 import Goonix.Build.Users (UserPool, loadUserPool)
 import Goonix.Build.Shared (Shared)
@@ -26,4 +28,4 @@ data ServerConfig = ServerConfig
 
 defaultConfig :: ServerConfig
 defaultConfig = ServerConfig "/gnu/store" "/var/guix/db/db.sqlite"
-  (defaultSettings True False) False True Nothing "guix" Nothing Nothing
+  (defaultSettings True False) False True Nothing (C.pack (Config.binaryDirectory ++ "/guix")) Nothing Nothing

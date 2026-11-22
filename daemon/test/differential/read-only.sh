@@ -31,6 +31,7 @@ run_daemon() {
   fixture=$3
   export NIX_STORE_DIR="$fixture/store"
   export GUIX_STATE_DIRECTORY="$fixture/var"
+  export GUIX_LOG_DIRECTORY="$fixture/var/log/guix"
   export GUIX_DATABASE_PATH="$fixture/db/db.sqlite"
   export GUIX_DATABASE_DIRECTORY="$fixture/db"
   export GUIX_DAEMON_SOCKET="$fixture/var/socket"
