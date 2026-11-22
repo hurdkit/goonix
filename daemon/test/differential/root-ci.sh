@@ -47,7 +47,7 @@ timeout 300 unshare --user \
     set -uo pipefail
     work="'"$work"'"; root="'"$root"'"; daemon="'"$daemon"'"; mode="'"$mode"'"
     gitrev="'"$gitrev"'"; payload_hash="'"$payload_hash"'"; git_hash="'"$git_hash"'"
-    dev_glp="'"$dev_glp"'"; dev_glcp="'"$dev_glcp"'"
+    dev_glp="'"$dev_glp"'"; dev_glcp="'"$dev_glcp"'"; ROOT_CI_CLIENT="'"${ROOT_CI_CLIENT:-}"'"
     mount --bind "$work/etc/passwd" /etc/passwd
     mount --bind "$work/etc/group" /etc/group
     mount --bind "$work/etc/nsswitch.conf" /etc/nsswitch.conf
@@ -99,9 +99,12 @@ timeout 300 unshare --user \
       echo "DAEMON DID NOT START"; head -20 "$work/daemon.log"; kill $dpid 2>/dev/null; exit 2
     fi
     # Client WITHOUT GUIX_LOG_DIRECTORY (GUILE_LOAD_PATH only locates modules).
+    # ROOT_CI_CLIENT overrides the client script (default: the 6-case CI gate);
+    # the killUser reproduction client takes WORK-DIR and ignores the rest.
+    client=${ROOT_CI_CLIENT:-$root/daemon/test/differential/root-ci-client.scm}
     env -i LC_ALL=C.UTF-8 PATH=/nonexistent \
       GUILE_LOAD_PATH="$root:$dev_glp" GUILE_LOAD_COMPILED_PATH="$root:$dev_glcp" GUIX_UNINSTALLED=1 \
-      "$root/guile" --no-auto-compile "$root/daemon/test/differential/root-ci-client.scm" \
+      "$root/guile" --no-auto-compile "$client" \
       "$work" "$gitrev" "$payload_hash" "$git_hash"
     rc=$?
     kill $dpid $http_pid $gitd_pid 2>/dev/null; wait $dpid 2>/dev/null

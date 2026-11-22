@@ -34,7 +34,7 @@ import Goonix.Store.Base32 (decodeBase16, decodeBase32, encodeBase32)
 import Goonix.Store.Derivation
 import Goonix.Store.Files
 import Goonix.Store.Hash
-import Goonix.Store.Nar (dumpNar, hashNar)
+import Goonix.Store.Nar (dumpNar, hashNar, narSize)
 import Goonix.Store.Archive (rewriteNarPaths)
 import Goonix.Store.Path (storePathToName)
 import Goonix.Store.ReadOnly
@@ -52,14 +52,15 @@ import System.Exit (ExitCode (ExitSuccess, ExitFailure))
 import System.IO (Handle, hClose, hPutStrLn, stderr)
 import System.Process (CreateProcess (..), CmdSpec (..), StdStream (..), createProcess, getPid, proc, waitForProcess)
 import System.IO.Unsafe (unsafePerformIO)
-import System.Posix.Files (fileOwner, fileGroup)
+import System.Posix.Files (fileOwner, fileGroup, stdFileMode)
 import System.Posix.Process (getProcessID, getProcessStatus, ProcessStatus (Exited, Terminated, Stopped))
 import System.Posix.Signals (sigKILL, signalProcessGroup)
-import System.Posix.IO.ByteString (createPipe, fdToHandle)
+import System.Posix.IO.ByteString (createPipe, fdToHandle, closeFd, openFd, fdRead, fdWrite, OpenMode (ReadOnly, WriteOnly), defaultFileFlags, OpenFileFlags (trunc, creat))
 import System.Posix.User (getEffectiveGroupID, getEffectiveUserID)
 import System.FilePath (takeDirectory)
 import System.Directory (findExecutable)
 import System.IO.Error (ioeGetErrorString, isDoesNotExistError)
+import GHC.IO.Exception (IOErrorType (EOF), ioe_type)
 import System.Posix.Types (Fd (..), CUid (..), CGid (..))
 import Foreign.C.String (CString, withCString)
 import Foreign.C.Types (CInt (..), CSize (..))
@@ -662,10 +663,27 @@ copyTree source destination = do
         Files.setOwnerAndGroup destination (fileOwner status) (fileGroup status)
         Files.setFileMode destination (Files.fileMode status)
       else do
-        bytes <- B.readFile (C.unpack source)
-        B.writeFile (C.unpack destination) bytes
+        -- Stream the copy in bounded chunks (C++ copyFile uses a fixed buffer);
+        -- never B.readFile the whole output, which pins output-size bytes in the
+        -- heap and commits the high-water mark before registration.
+        copyFileContents source destination
         Files.setOwnerAndGroup destination (fileOwner status) (fileGroup status)
         Files.setFileMode destination (Files.fileMode status)
+
+-- | Copy a regular file's contents in 1 MiB chunks, preserving nothing but the
+-- bytes (the caller sets owner/group/mode).  Bounded working set regardless of
+-- file size.
+copyFileContents :: RawFilePath -> RawFilePath -> IO ()
+copyFileContents source destination =
+  bracket (openFd source ReadOnly defaultFileFlags) closeFd $ \src ->
+  bracket (openFd destination WriteOnly defaultFileFlags { trunc = True, creat = Just stdFileMode }) closeFd $ \dst -> do
+    let loop = do
+          result <- try (fdRead src 1048576)
+          case result of
+            Left e | ioe_type e == EOF -> pure ()
+                   | otherwise -> throwIO (e :: IOException)
+            Right chunk -> unless (B.null chunk) (fdWrite dst chunk >> loop)
+    loop
 
 spawnSandboxedBuilder :: Maybe BuildUser -> Settings -> Store -> RawFilePath -> RawFilePath -> Derivation -> CreateProcess -> [(String, String)] -> Fd -> IO (Int, IO ExitCode, Maybe RawFilePath, [RawFilePath])
 spawnSandboxedBuilder buildUser settings store work drvPath drv command env (Fd logFd) = do
@@ -1005,7 +1023,7 @@ registerBuiltOutputs store drvPath drv = forM_ (Map.elems (outputs drv)) $ \outp
   deduplicateTree (storeDirectory store) path
   (refs, hash) <- scanOutputReferences store path
   enforceReferencePolicy store drv path refs
-  size <- fromIntegral . B.length <$> dumpNar path
+  size <- narSize path
   -- C++ keeps self-references: scanForReferences searches the output's own
   -- path among the candidates (build.cc allPaths inserts drv.outputs) and
   -- registerValidPaths adds every reference, including the path itself
