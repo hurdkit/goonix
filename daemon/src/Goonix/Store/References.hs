@@ -41,8 +41,12 @@ scanChunks chunks table (initialTail, initialFound) =
     step (carry, found) chunk =
       let combined = carry <> chunk
           found' = search combined table found
-          carry' = B.drop (max 0 (B.length combined - 31)) combined
-      in (carry', found')
+          -- B.copy detaches the 31-byte tail from combined's buffer: B.drop
+          -- alone is a view that pins the whole (chunk-sized) buffer.  seq both
+          -- components so the IORef holds evaluated values, not a thunk chain
+          -- capturing every chunk (modifyIORef' forces only the pair to WHNF).
+          carry' = B.copy (B.drop (max 0 (B.length combined - 31)) combined)
+      in carry' `seq` found' `seq` (carry', found')
 
 candidateTable :: [RawFilePath] -> Map.Map ByteString [RawFilePath]
 candidateTable = Map.fromListWith (++) . concatMap candidate

@@ -6,6 +6,8 @@ module Goonix.Store.Nar
   ( dumpNar
   , dumpNarToHandle
   , hashNar
+  , hashNarSize
+  , narSize
   , hashNarWith
   , Nar (..)
   , encodeNar
@@ -152,6 +154,32 @@ hashNar path = do
   sink <- newHashSink SHA256
   dumpNarToHandle path (updateHashSink sink)
   finishHashSink sink
+
+-- | The NAR length of a path, counted in one streaming pass (C++ HashSink
+-- counts bytes alongside the hash; narSize never holds the NAR).  No caller
+-- should dumpNar a whole tree just to learn its length: that pins two copies of
+-- the output in the GHC heap, and the high-water mark stays committed, so a
+-- later fork (the build-user sweep, a builder spawn) fails with ENOMEM on a
+-- large output.
+narSize :: RawFilePath -> IO Word64
+narSize path = do
+  count <- newIORef (0 :: Word64)
+  dumpNarToHandle path (\bytes -> modifyIORef' count (+ fromIntegral (B.length bytes)))
+  readIORef count
+
+-- | The NAR hash and length together, in one streaming pass (C++ hashPath =
+-- HashSink over dumpPath, finish returns (hash, bytes)).  The counting sink
+-- beside the hash sink: each emitted chunk updates the hash and adds its length.
+hashNarSize :: RawFilePath -> IO (Hash, Word64)
+hashNarSize path = do
+  sink <- newHashSink SHA256
+  count <- newIORef (0 :: Word64)
+  dumpNarToHandle path $ \bytes -> do
+    updateHashSink sink bytes
+    modifyIORef' count (+ fromIntegral (B.length bytes))
+  hash <- finishHashSink sink
+  size <- readIORef count
+  pure (hash, size)
 
 hashNarWith :: RawFilePath -> (ByteString -> (ByteString, Set.Set RawFilePath) -> (ByteString, Set.Set RawFilePath)) -> IO (Set.Set RawFilePath, Hash)
 hashNarWith path update = do

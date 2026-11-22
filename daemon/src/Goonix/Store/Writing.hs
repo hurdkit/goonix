@@ -64,7 +64,7 @@ addNarToStore rootFd store name recursive algorithm dump = do
       registerPath store destination narHash narSize [] ""
       pure destination
   where
-    narSizeOf path = fromIntegral . B.length <$> dumpNar path
+    narSizeOf path = narSize path
 
 addTextToStore :: Fd -> Store -> ByteString -> ByteString -> [ByteString] -> IO ByteString
 addTextToStore rootFd store name contents references = do
@@ -83,8 +83,7 @@ addTextToStore rootFd store name contents references = do
       writeBytes destination contents
       _ <- canonicaliseAndHash store destination
       deduplicateTree (storeDirectory store) destination
-      hash <- hashNar destination
-      size <- fromIntegral . B.length <$> dumpNar destination
+      (hash, size) <- hashNarSize destination
       registerPath store destination hash size references ""
       pure destination
 
@@ -94,8 +93,10 @@ canonicaliseAndHash store path = do
   status <- getSymbolicLinkStatus root
   let mode = fileMode status
   setFileMode root 0o755
-  hash <- (canonicaliseTree path >> hashNar path) `finally` setFileMode root mode
-  size <- fromIntegral . B.length <$> dumpNar path
+  -- One streaming pass computes the hash and the NAR length together (C++
+  -- hashPath = HashSink over dumpPath).  Never dumpNar the whole tree just to
+  -- learn its length: that pins two copies of the output in the heap.
+  (hash, size) <- (canonicaliseTree path >> hashNarSize path) `finally` setFileMode root mode
   pure (hash, size)
 
 registerPath :: Store -> ByteString -> Hash -> Word64 -> [ByteString] -> ByteString -> IO ()

@@ -14,6 +14,7 @@ module Goonix.Build.Users
   , releaseLease
   , withBuildUser
   , withBuildUserUsing
+  , killUser
   , loadUserPool
   , userLease
   ) where
@@ -25,7 +26,9 @@ import qualified Data.ByteString.Char8 as C
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import Data.Word (Word32)
-import Foreign.C.Types (CInt (..))
+import Foreign.C.Types (CInt (..), CSize (..))
+import Foreign.C.String (CString, peekCString)
+import Foreign.Marshal.Alloc (allocaBytes)
 import Goonix.Store.Files (mkdirParents, tryFileLock)
 import Goonix.Store.ReadOnly (storeError)
 import System.Posix.Env.ByteString (getEnv)
@@ -155,14 +158,20 @@ releaseLease (UserPool _ available) (UserLease user release) = release `finally`
 userLease :: UserLease -> BuildUser
 userLease (UserLease user _) = user
 
-foreign import ccall safe "goonix_kill_user" c_kill_user :: CUid -> IO CInt
+foreign import ccall safe "goonix_kill_user" c_kill_user :: CUid -> CString -> CSize -> IO CInt
 
 killUser :: BuildUser -> IO ()
 killUser user = do
-  result <- c_kill_user (fromIntegral (buildUserUid user))
-  if result == 0
-    then pure ()
-    else throwIO (storeError ("cannot clean up processes for build user " <> C.unpack (buildUserName user)))
+  let uid = fromIntegral (buildUserUid user)
+  allocaBytes 256 $ \diag -> do
+    result <- c_kill_user uid diag 256
+    if result == 0
+      then pure ()
+      else do
+        detail <- peekCString diag
+        let suffix = if null detail then "" else ": " ++ detail
+        throwIO (storeError ("cannot kill processes for uid `" ++ show (buildUserUid user)
+          ++ "' (build user " ++ C.unpack (buildUserName user) ++ ")" ++ suffix))
 
 withBuildUser :: forall a. UserPool -> (BuildUser -> IO a) -> IO a
 withBuildUser = withBuildUserUsing killUser

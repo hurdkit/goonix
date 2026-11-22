@@ -9,17 +9,34 @@
 #include <string.h>
 #include <fcntl.h>
 #include <grp.h>
+#include <stdio.h>
 
 #include <sys/types.h>
-#include <grp.h>
 
 /* Equivalent to the C++ daemon's killUser: the short-lived child changes to
-   the leased uid so kill(-1, SIGKILL) affects only that uid, including itself. */
-int goonix_kill_user(uid_t uid)
+   the leased uid so kill(-1, SIGKILL) affects only that uid's processes.  On
+   Linux kill(-1, sig) does NOT signal the calling process (man 2 kill NOTES;
+   kernel/signal.c kill_something_info skips same_thread_group(p, current)), so
+   the child survives the sweep and _exit(0); it is not "including itself".
+   On failure, fills diag (a caller buffer of diag_len bytes) with the failing
+   step and the errno, exit status or signal, so killUser can report the cause
+   in the C++ form (nix/libutil/util.cc killUser / statusToString) instead of a
+   generic message.  The child exits 127 when setuid fails, 126 when kill fails
+   with an errno other than ESRCH/EINTR; the parent distinguishes those, a
+   signal death, a waitpid failure and a fork failure. */
+int goonix_kill_user(uid_t uid, char *diag, size_t diag_len)
 {
-  if (uid == 0) { errno = EPERM; return -1; }
+  if (diag && diag_len > 0) diag[0] = '\0';
+  if (uid == 0) {
+    if (diag) snprintf(diag, diag_len, "refusing to kill processes for uid 0");
+    errno = EPERM;
+    return -1;
+  }
   pid_t child = fork();
-  if (child < 0) return -1;
+  if (child < 0) {
+    if (diag) snprintf(diag, diag_len, "fork: %s", strerror(errno));
+    return -1;
+  }
   if (child == 0) {
     if (setuid(uid) < 0) _exit(127);
     while (kill(-1, SIGKILL) < 0) {
@@ -30,9 +47,30 @@ int goonix_kill_user(uid_t uid)
   }
   int status;
   while (waitpid(child, &status, 0) < 0) {
-    if (errno != EINTR) return -1;
+    if (errno != EINTR) {
+      if (diag) snprintf(diag, diag_len, "waitpid: %s", strerror(errno));
+      return -1;
+    }
   }
   if (WIFEXITED(status) && WEXITSTATUS(status) == 0) return 0;
+  if (diag) {
+    if (WIFEXITED(status)) {
+      int code = WEXITSTATUS(status);
+      if (code == 127)
+        snprintf(diag, diag_len, "setting uid %u: failed with exit code 127 (setuid)",
+                 (unsigned)uid);
+      else if (code == 126)
+        snprintf(diag, diag_len, "cannot kill processes for uid %u: failed with exit code 126 (kill)",
+                 (unsigned)uid);
+      else
+        snprintf(diag, diag_len, "failed with exit code %d", code);
+    } else if (WIFSIGNALED(status)) {
+      int sig = WTERMSIG(status);
+      snprintf(diag, diag_len, "failed due to signal %d (%s)", sig, strsignal(sig));
+    } else {
+      snprintf(diag, diag_len, "died abnormally");
+    }
+  }
   errno = EIO;
   return -1;
 }
