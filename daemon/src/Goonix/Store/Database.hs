@@ -70,17 +70,48 @@ schemaLock = unsafePerformIO (newMVar ())
 withSchemaLock :: IO a -> IO a
 withSchemaLock = withMVar schemaLock . const
 
-foreign import ccall unsafe "sqlite3_open_v2"
+-- The calls that can WAIT or take a lock are `ccall safe'; the pure accessors
+-- below stay `unsafe'.  The daemon is -threaded -N: an unsafe foreign call holds
+-- its GHC capability until it returns, and the next GC needs EVERY capability to
+-- stop.  Two client connections (or a connection and a build goal) each open their
+-- OWN SQLite handle, and SQLite WAL allows only one writer.  While one handle holds
+-- an uncommitted write transaction, another handle's sqlite3_step hits SQLITE_BUSY
+-- and sleeps in the busy handler (up to the 60s busy_timeout).  If that sleep were
+-- inside an unsafe call it would hold its capability, the GC would stop the thread
+-- that must run the first handle's commit, and the whole process would freeze until
+-- the timeout — then the insert fails with DatabaseBusy.  A safe call runs the sleep
+-- on its own OS thread and releases the capability, so GC proceeds, the holder
+-- commits, and the waiting step succeeds.  That is what C++ gets from running each
+-- client in its own process.
+--
+-- Which calls are safe, from the SQLite source (sqlite-src-3530300):
+--   step      vdbeapi.c: sqlite3_mutex_enter(db->mutex); sqlite3Step runs the VM,
+--             whose write/commit path invokes the busy handler (pager_wait_on_lock,
+--             walBusyLock) and can sleep.
+--   prepare_v2 prepare.c: sqlite3LockAndPrepare takes db->mutex and reads the schema
+--             (a shared lock on the database file).
+--   open_v2   main.c: openDatabase takes db->mutex and sqlite3BtreeOpen opens/locks
+--             the database file.
+--   close_v2  main.c: sqlite3Close -> sqlite3LeaveMutexAndCloseZombie can checkpoint
+--             the WAL (sqlite3WalCheckpoint's walBusyLock) before freeing the handle.
+--   reset / finalize  vdbeapi.c: both take db->mutex and call sqlite3VdbeReset, which
+--             calls sqlite3VdbeHalt when the VM is mid-run (vdbeaux.c:3598); Halt runs
+--             vdbeCommit / sqlite3VdbeCloseStatement — the commit/rollback path that
+--             can block on a lock.  So they CAN take a lock and wait; made safe too.
+-- The accessors (column_*, bind_*, clear_bindings, errmsg, busy_timeout, complete)
+-- only read or copy already-held state under the caller's per-handle lock and never
+-- wait on another connection, so they stay unsafe (no capability hand-off cost).
+foreign import ccall safe "sqlite3_open_v2"
   c_open :: CString -> Ptr (Ptr ()) -> CInt -> CString -> IO CInt
-foreign import ccall unsafe "sqlite3_close_v2"
+foreign import ccall safe "sqlite3_close_v2"
   c_close :: Ptr () -> IO CInt
 foreign import ccall unsafe "sqlite3_errmsg"
   c_errmsg :: Ptr () -> IO CString
-foreign import ccall unsafe "sqlite3_prepare_v2"
+foreign import ccall safe "sqlite3_prepare_v2"
   c_prepare :: Ptr () -> CString -> CInt -> Ptr (Ptr ()) -> Ptr CString -> IO CInt
-foreign import ccall unsafe "sqlite3_finalize"
+foreign import ccall safe "sqlite3_finalize"
   c_finalize :: Ptr () -> IO CInt
-foreign import ccall unsafe "sqlite3_reset"
+foreign import ccall safe "sqlite3_reset"
   c_reset :: Ptr () -> IO CInt
 foreign import ccall unsafe "sqlite3_clear_bindings"
   c_clear_bindings :: Ptr () -> IO CInt
@@ -90,7 +121,7 @@ foreign import ccall unsafe "sqlite3_bind_int64"
   c_bind_int64 :: Ptr () -> CInt -> CLLong -> IO CInt
 foreign import ccall unsafe "sqlite3_bind_text64"
   c_bind_text :: Ptr () -> CInt -> CString -> Word64 -> FunPtr (Ptr () -> IO ()) -> CUChar -> IO CInt
-foreign import ccall unsafe "sqlite3_step"
+foreign import ccall safe "sqlite3_step"
   c_step :: Ptr () -> IO CInt
 foreign import ccall unsafe "sqlite3_column_count"
   c_column_count :: Ptr () -> IO CInt

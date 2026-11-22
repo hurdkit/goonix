@@ -325,14 +325,14 @@ dispatch config store client settingsRef rootFd rootPath clientVersion operation
     _ <- assertStorePath store path
     settings <- readIORef settingsRef
     result <- if settingBool "build-use-substitutes" False settings
-      then substitutablePaths config settings [path] else pure []
+      then substitutablePaths config settings (stderrEmit client) [path] else pure []
     writeFrame client stderrLast
     writeSocket client (encodeBool (path `elem` result))
   30 -> do
     paths <- readStorePathsSocket client
     settings <- readIORef settingsRef
     infos <- if settingBool "build-use-substitutes" False settings
-      then substitutableInfos config settings paths else pure []
+      then substitutableInfos config settings (stderrEmit client) paths else pure []
     writeFrame client stderrLast
     writeSocket client (encodeInt (fromIntegral (length infos)) <> foldMap encodeInfo infos)
   31 -> do
@@ -344,7 +344,7 @@ dispatch config store client settingsRef rootFd rootPath clientVersion operation
     paths <- readStorePathsSocket client
     settings <- readIORef settingsRef
     result <- if settingBool "build-use-substitutes" False settings
-      then substitutablePaths config settings paths else pure []
+      then substitutablePaths config settings (stderrEmit client) paths else pure []
     writeFrame client stderrLast
     writeSocket client (encodeStrings result)
   33 -> queryOnePath $ \_ path -> encodeStrings <$> queryValidDerivers store path
@@ -359,7 +359,7 @@ dispatch config store client settingsRef rootFd rootPath clientVersion operation
     settings <- readIORef settingsRef
     when (repair && not (trusted settings)) (throwIO (storeError "you are not privileged to repair paths"))
     paths <- queryAllValidPaths store
-    errors <- Collector.verifyStorePaths checkContents repair (repairStorePath config rootFd store settings) store paths
+    errors <- Collector.verifyStorePaths checkContents repair (repairStorePath config rootFd store settings (stderrEmit client)) store paths
     writeFrame client stderrLast
     writeSocket client (encodeBool errors)
   80 -> do
@@ -406,33 +406,42 @@ buildTrace settings client = BuildTrace
     -- header and its pid token parses as #f (guix-pack.sh crash).
     emit message = when (printBuildTrace settings) $ writeSocket client (encodeInt stderrNext <> encodeString (message <> "\n"))
 
-repairStorePath :: ServerConfig -> Fd -> Store -> Settings -> ByteString -> IO Bool
-repairStorePath config rootFd store settings path = do
-  substituted <- trySubstituteForRepair config rootFd store settings path
+-- | Forward a helper's diagnostics to the client as STDERR_NEXT frames, the way
+-- the C++ daemon tunnels writeToStderr (nix-daemon.cc tunnelStderr).  Used for
+-- the substituter's log pipe, which receiveLine drains in its select loop while
+-- reading the reply.  Unlike the build trace this is not gated on
+-- print-build-trace: C++ forwards substituter diagnostics unconditionally
+-- (getLineFromSubstituter).
+stderrEmit :: Socket -> ByteString -> IO ()
+stderrEmit client bytes = writeSocket client (encodeInt stderrNext <> encodeString bytes)
+
+repairStorePath :: ServerConfig -> Fd -> Store -> Settings -> (ByteString -> IO ()) -> ByteString -> IO Bool
+repairStorePath config rootFd store settings emit path = do
+  substituted <- trySubstituteForRepair config rootFd store settings emit path
   if substituted then pure True else do
     deriver <- queryDeriver store path
     valid <- if B.null deriver then pure False else isValidPath store deriver
     if valid
       then do
         -- registerPath updates the existing valid entry after repair.
-        buildThingsWithConfig config rootFd store settings (BuildTrace (\_ _ _ _ -> pure ()) (\_ -> pure ()) (\_ _ -> pure ()) (\_ -> pure ())) [deriver] Repair
+        buildThingsWithConfig config rootFd store settings (BuildTrace (\_ _ _ _ -> pure ()) (\_ -> pure ()) (\_ _ -> pure ()) emit) [deriver] Repair
         exists <- (Files.getSymbolicLinkStatus path >> pure True) `catchMissing` pure False
         registered <- isValidPath store path
         pure (exists && registered)
       else throwIO (storeError ("cannot repair path `" ++ C.unpack path ++ "'"))
   where
-    trySubstituteForRepair config rootFd store settings path = do
+    trySubstituteForRepair config rootFd store settings emit path = do
       -- Repair must not use the ordinary valid-path shortcut: the object may
       -- be registered but absent or modified.  Re-fetch and register it.
       if not (settingBool "build-use-substitutes" False settings) then pure False else do
-        infos <- substitutableInfos config settings [path]
+        infos <- substitutableInfos config settings emit [path]
         case infos of
           [] -> pure False
           ((_, deriver, references, _, _):_) -> do
             present <- mapM (isValidPath store) references
             if not (and present) then pure False else do
               appendTempRoot rootFd path
-              result <- substitutePath config settings path path
+              result <- substitutePath config settings emit path path
               case result of
                 Left _ -> pure False
                 Right (printedHash, size) -> do

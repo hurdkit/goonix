@@ -451,7 +451,7 @@ trySubstitute :: ServerConfig -> Fd -> Store -> Settings -> BuildTrace -> ByteSt
 trySubstitute config rootFd store settings trace path = do
   valid <- isValidPath store path
   if valid then pure True else do
-    infos <- substitutableInfos config settings [path]
+    infos <- substitutableInfos config settings (traceOutput trace) [path]
     case infos of
       [] -> pure False
       ((_, deriver, references, _, _):_) -> do
@@ -463,7 +463,7 @@ trySubstitute config rootFd store settings trace path = do
           if validNow then pure True else do
             deleteTree path
             traceOutput trace ("@ substituter-started " <> path <> " substitute\n")
-            result <- substitutePath config settings path path
+            result <- substitutePath config settings (traceOutput trace) path path
             case result of
               Left message -> do
                 when ("hash-mismatch" `B.isPrefixOf` message) $

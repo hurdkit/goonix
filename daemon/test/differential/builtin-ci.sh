@@ -72,10 +72,13 @@ status=0
 run_one cxx "$cxx" || status=1
 run_one hs "$hs" || status=1
 # The configured-bindir fallback (no NIX_BIN_DIR) is the path the CI runner
-# takes.  Run it only when the daemon under test is an INSTALLED package (in the
-# nix store) whose own bindir holds guix; a worktree build's configured bindir
-# (/bin) has no guix on this host, so skip it there, saying so.  A worktree root
-# may hold a ./guix script, but that is not the daemon's configured bindir.
+# takes.  For an INSTALLED package (in the nix store) whose own bindir holds guix,
+# run it directly.  A worktree build's configured bindir (/bin) has no guix on this
+# host; to exercise the fallback for it, pass an installed package built from the
+# tree via GOONIX_INSTALLED_PKG (its bin must hold guix + guix-daemon) and the
+# fallback runs against THAT daemon.  Without it the fallback is skipped, saying
+# so.  A daemon that searches PATH (the 9a3d3c08528 calibration, literal "guix")
+# fails this; the configured-bindir resolution passes.
 bindir_fallback() {
   label=$1 daemon=$2
   dbin=$(dirname "$daemon")
@@ -85,9 +88,19 @@ bindir_fallback() {
   esac
   if test "$installed" = 1 && test -x "$dbin/guix"; then
     run_one "$label-bindir" "$daemon" bindir || status=1
-  else
-    echo "SKIP: $label-bindir: not an installed package with guix in its bindir (worktree build; configured-bindir fallback needs an installed package whose bindir holds guix)"
+    return
   fi
+  # Worktree build: an installed package supplied via GOONIX_INSTALLED_PKG lets
+  # the configured-bindir fallback run without a heavy in-test package build.
+  # Only the Haskell daemon is installed from this tree; the C++ reference is a
+  # worktree build with no installed package, so its fallback stays skipped.
+  if test "$label" = hs && test -n "${GOONIX_INSTALLED_PKG:-}" \
+     && test -x "$GOONIX_INSTALLED_PKG/bin/guix" \
+     && test -x "$GOONIX_INSTALLED_PKG/bin/guix-daemon"; then
+    run_one "$label-bindir" "$GOONIX_INSTALLED_PKG/bin/guix-daemon" bindir || status=1
+    return
+  fi
+  echo "SKIP: $label-bindir: no installed package with guix in its bindir (set GOONIX_INSTALLED_PKG to a package built from the tree to exercise the configured-bindir fallback for a worktree build)"
 }
 bindir_fallback cxx "$cxx"
 bindir_fallback hs "$hs"

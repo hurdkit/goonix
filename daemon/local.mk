@@ -23,7 +23,7 @@ guix-sandbox: $(top_srcdir)/daemon/sandbox/guix-sandbox.cc
 	  mv $@.tmp $@
 # Keep the direct build independent of Cabal's package database and of Hackage.
 DAEMON_GHC_FLAGS = -O2 -Wall -Wcompat -Widentities -Wredundant-constraints \
-  -threaded -with-rtsopts=-N \
+  -threaded -rtsopts -with-rtsopts=-N \
   -XGHC2024 -XStrictData -package process -package directory \
   -i$(top_srcdir)/daemon/src \
   -i$(top_builddir)/daemon/src $(LIBGCRYPT_CPPFLAGS) \
@@ -76,7 +76,7 @@ EXTRA_DIST += \
   daemon/src/Goonix/Store/Settings.hs daemon/src/Goonix/Store/Server.hs \
   daemon/src/Goonix/Store/Config.hs daemon/src/Goonix/Store/Socket.hs \
   daemon/src/Goonix/Store/GuixProgram.hs \
-  daemon/src/Goonix/Store/Substitute.hs daemon/src/Goonix/Store/Archive.hs daemon/src/Goonix/Build/Engine.hs daemon/src/Goonix/Build/Offload.hs daemon/src/Goonix/Build/Scheduler.hs daemon/cbits/sockets.c daemon/cbits/files.c \
+  daemon/src/Goonix/Store/Substitute.hs daemon/src/Goonix/Store/Archive.hs daemon/src/Goonix/Build/Engine.hs daemon/src/Goonix/Build/Offload.hs daemon/src/Goonix/Build/Scheduler.hs daemon/src/Goonix/Build/Shared.hs daemon/cbits/sockets.c daemon/cbits/files.c \
   daemon/src/Goonix/Store/Path.hs daemon/src/Goonix/Store/Derivation.hs \
   daemon/src/Goonix/Store/Nar.hs daemon/src/Goonix/Store/References.hs \
   daemon/proxy/Main.hs \
@@ -96,6 +96,20 @@ EXTRA_DIST += \
   daemon/test/differential/stale-socket.c daemon/test/differential/socket-connect.c \
   daemon/test/differential/socket-query.c \
   daemon/test/differential/builtin-ci.sh daemon/test/differential/builtin-ci.scm \
+  daemon/test/differential/regressions.sh \
+  daemon/test/differential/cabal-modules.sh \
+  daemon/test/differential/dedup-overflow.sh daemon/test/differential/dedup-overflow-test.c \
+  daemon/test/differential/dedup-linkcount-test.c \
+  daemon/test/differential/sqlite-contention.sh daemon/test/differential/sqlite-contention.hs \
+  daemon/test/differential/export-memory.sh daemon/test/differential/export-memory.scm \
+  daemon/test/differential/nar-memory.sh daemon/test/differential/nar-memory.scm \
+  daemon/test/differential/substitute-log-flood.sh daemon/test/differential/substitute-log-flood.scm \
+  daemon/test/differential/substitute-log-flood-helper.sh \
+  daemon/test/differential/substitute-silent.sh daemon/test/differential/substitute-silent.scm \
+  daemon/test/differential/substitute-silent-helper.sh \
+  daemon/test/differential/root-ci.sh daemon/test/differential/root-ci-setup.sh \
+  daemon/test/differential/root-ci-client.scm daemon/test/differential/root-ci-http.sh \
+  daemon/test/differential/root-ci-killuser.scm daemon/test/differential/root-ci-substitute.sh \
   daemon/sandbox/README.md daemon/sandbox/guix-sandbox.cc \
   daemon/sandbox/Makefile daemon/test/lib.sh daemon/test/seed-restore.scm \
   daemon/test/sandbox-helper-cleanup.sh daemon/test/sandbox-helper-cleanup.scm \
