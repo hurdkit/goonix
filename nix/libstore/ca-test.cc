@@ -998,5 +998,42 @@ int main(int argc, char ** argv)
             "both hard-linked twins end with the same mode");
     }
 
+    /* goonix: the same property across SEVERAL rewrite passes over one tree.
+       A multi-output derivation rewrites the tree once per sibling output and
+       then once for its own token (finaliseContentOutput), so an executable
+       must survive every pass, not just the first.
+
+       This is a PROPERTY test, not the regression test for the chmod fix:
+       measured, it passes on 460360f28bb as well, because that commit's
+       per-pass capture already restored 0555 before the next pass stat'ed.
+       It is kept because the property is worth pinning now that the capture
+       map is gone and the mode comes straight from the inode. */
+    {
+        Path root = createTempDir("", "goonix-hardlink-passes");
+        AutoDelete delRoot(root, true);
+        std::string sibling(32, 's'), siblingTo(32, 'v');
+        std::string self(32, 't'), selfTo(32, 'u');
+        createDirs(root + "/bin");
+        createDirs(root + "/triplet/bin");
+        Path first = root + "/bin/ld", second = root + "/triplet/bin/ld";
+        writeFile(first, "/gnu/store/" + sibling + "-gcc/lib /gnu/store/"
+                  + self + "-gcc/bin\n");
+        chmod(first.c_str(), 0555);
+        if (link(first.c_str(), second.c_str()))
+            throw SysError("linking the test twin");
+
+        /* Two passes, as a two-output derivation does. */
+        rewriteTreeForTest(root, sibling, siblingTo);
+        rewriteTreeForTest(root, self, selfTo);
+
+        struct stat a, b;
+        lstat(first.c_str(), &a);
+        lstat(second.c_str(), &b);
+        check((a.st_mode & S_IXUSR) != 0,
+            "an executable stays executable across two rewrite passes");
+        check((b.st_mode & S_IXUSR) != 0,
+            "its hard-linked twin stays executable across two rewrite passes");
+    }
+
     return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
