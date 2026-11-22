@@ -65,6 +65,21 @@
 ;; once per lowering even with the cache in place).  The socket is the
 ;; connection's stable identity, as upstream's own eq? test there uses.
 ;; Weak keys let a closed connection's tables be collected.
+;;
+;; The adopt cache keeps upstream's derivation OBJECTS alive, and the callers
+;; compare cached results with eq?: (eq? adopt d) in guix/ca/policy.scm decides
+;; whether to re-lower from source, and (eq? origin adopted) here decides
+;; whether a reference changed.  That stays correct across calls because
+;; upstream's derivation and read-derivation-from-file return the object held
+;; in %derivation-cache (guix/derivations.scm, "Preserve pointer equality"),
+;; so the same .drv always yields the same object while this cache holds it.
+;;
+;; The key includes the SYSTEM and the GUILE derivation's file name as well as
+;; the adopted derivation's: the graft derivation returned is BUILT with those
+;; two (graft-derivation/shallow* ... #:guile guile #:system system), so keying
+;; on the derivation alone would let the first caller's guile and system win
+;; for every later caller.  A per-call cache could not show this; a cache that
+;; outlives the call can.
 (define %adopt-caches (make-weak-key-hash-table))
 (define %scan-caches (make-weak-key-hash-table))
 
@@ -134,7 +149,12 @@ rescan the whole closure once per package.  The scan reports are memoised
 separately in item-flagged?."
   (define cache (connection-cache %adopt-caches store))
   (define (adopt drv)
-    (let ((key (derivation-file-name drv)))
+    ;; The key carries the system and the guile derivation as well as DRV:
+    ;; the graft returned is built with them, so a key of DRV alone would
+    ;; serve the first caller's guile and system to every later caller.
+    (let ((key (list system
+                     (and (derivation? guile) (derivation-file-name guile))
+                     (derivation-file-name drv))))
       (or (hash-ref cache key)
           (let ((result (adopt* drv)))
             (hash-set! cache key result)

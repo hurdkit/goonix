@@ -140,5 +140,30 @@
     (test-assert "a flagged item is not adopted (returned unchanged)"
       (eq? drv (adopt-derivation store drv #:guile guile-drv)))))
 
+(test-group "the adopt cache distinguishes the guile and system it builds with"
+  ;; adopt-derivation returns a GRAFT derivation built with its #:guile and
+  ;; #:system.  A cache keyed only on the adopted derivation's file name lets
+  ;; the first caller's guile win for every later caller on the same
+  ;; connection.  Graft derivations are only created here, not built, so no
+  ;; second working guile is needed.
+  (let* ((leaf (ia-plain (fresh-name "adopt-key-leaf") "LEAF"))
+         (_    (build-derivations store (list leaf)))
+         (top  (ia-ref (fresh-name "adopt-key-top") leaf "TOP"))
+         (_    (build-derivations store (list top)))
+         (other-guile (ia-plain (fresh-name "adopt-key-guile") "OTHER-GUILE"))
+         (first  (adopt-derivation store top #:guile guile-drv))
+         (second (adopt-derivation store top #:guile other-guile)))
+    (define (input-drv-files drv)
+      (map derivation-input-path (derivation-inputs drv)))
+    (test-assert "adopting with a second guile yields a different derivation"
+      (not (string=? (derivation-file-name first)
+                     (derivation-file-name second))))
+    (test-assert "the second result's inputs include the second guile"
+      (member (derivation-file-name other-guile)
+              (input-drv-files second)))
+    (test-assert "the second result does not use the first guile"
+      (not (member (derivation-file-name guile-drv)
+                   (input-drv-files second))))))
+
 (close-connection store)
 (test-end "ca-adopt")
