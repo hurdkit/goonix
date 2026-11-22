@@ -152,7 +152,8 @@ sendLine agent line = do
 -- pipe.
 --
 -- The wait goes through the GHC IO manager (threadWaitReadSTM on both pipes,
--- atomically (reply `orElse` log)), NOT an `unsafe' foreign select().  The daemon
+-- atomically (log `orElse` reply), log first as C++ drains stderr before stdout),
+-- NOT an `unsafe' foreign select().  The daemon
 -- is -threaded -N: an unsafe blocking call holds its capability until it returns,
 -- and the next GC needs every capability to stop, so a silent helper would freeze
 -- every other client and build in the process at its next GC; an unsafe call also
@@ -166,17 +167,19 @@ receiveLine agent = go [] False
   where
     replyFd = agentReplyFd agent
     logFd = agentLogFd agent
-    -- Wait until the reply pipe is readable, or (when still open) the log pipe.
-    -- Returns True for reply, False for log.  orElse tries the reply first; if it
-    -- is not ready it tries the log.  Both registrations are torn down even if
-    -- the wait is interrupted (async exception) or throws.
+    -- Wait until the log pipe is readable, or (when still open) the reply pipe.
+    -- Returns True for reply, False for log.  orElse tries the LOG first, as the
+    -- C++ getLineFromSubstituter drains stderr before dealing with stdout
+    -- (local-store.cc:811-829); if the log is not ready it tries the reply.  Both
+    -- registrations are torn down even if the wait is interrupted (async
+    -- exception) or throws.
     waitReplyOrLog logDone = do
       (waitReply, unregisterReply) <- threadWaitReadSTM replyFd
       if logDone
         then (atomically waitReply >> pure True) `finally` unregisterReply
         else do
           (waitLog, unregisterLog) <- threadWaitReadSTM logFd
-          let wait = atomically ((waitReply >> pure True) `orElse` (waitLog >> pure False))
+          let wait = atomically ((waitLog >> pure False) `orElse` (waitReply >> pure True))
           wait `finally` (unregisterReply >> unregisterLog)
     -- logDone: the log pipe reached EOF (helper exited).  Stop waiting on it so a
     -- ready reply is read first; a helper that replies then exits must not be
