@@ -851,6 +851,23 @@ NarSize: 1234\nNarHash: sha256:~a\nReferences: \nSystem: ~a\nDeriver: ~a\n"
         (test-equal "an 'input request over adopted inputs becomes content"
           "content" outcome)
         ;; The no-override case must NOT be swept up by the correction.
+        ;;
+        ;; Call gexp-addressing DIRECTLY with requested #f AND an input list
+        ;; holding the adopted (content-addressed) leaf.  Lowering a gexp with
+        ;; #:addressing #f and NO inputs cannot fail this: with no inputs the
+        ;; input-based correction leaves the request alone even if #f were
+        ;; matched alongside 'input, so such an assertion is vacuous.
+        (let ((adopted-input (derivation-input adopted-leaf)))
+          (test-equal "gexp-addressing keeps #f over adopted inputs"
+            #f
+            (gexp-addressing #f adopted-input (list adopted-input) #f #f #f))
+          ;; The same inputs DO correct a genuine 'input request: this is what
+          ;; makes the assertion above meaningful rather than trivially true.
+          (test-equal "gexp-addressing corrects 'input over the same inputs"
+            'content
+            (gexp-addressing 'input adopted-input (list adopted-input)
+                             #f #f #f)))
+        ;; And end to end, the no-override gexp still lowers input-addressed.
         (test-equal "#:addressing #f still stays input-addressed under adopted"
           #f
           (addressing
