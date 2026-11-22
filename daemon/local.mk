@@ -102,6 +102,8 @@ EXTRA_DIST += \
   daemon/test/differential/dedup-linkcount-test.c \
   daemon/test/differential/export-memory.sh daemon/test/differential/export-memory.scm \
   daemon/test/differential/nar-memory.sh daemon/test/differential/nar-memory.scm \
+  daemon/test/differential/substitute-log-flood.sh daemon/test/differential/substitute-log-flood.scm \
+  daemon/test/differential/substitute-log-flood-helper.sh \
   daemon/sandbox/README.md daemon/sandbox/guix-sandbox.cc \
   daemon/sandbox/Makefile daemon/test/lib.sh daemon/test/seed-restore.scm \
   daemon/test/sandbox-helper-cleanup.sh daemon/test/sandbox-helper-cleanup.scm \
