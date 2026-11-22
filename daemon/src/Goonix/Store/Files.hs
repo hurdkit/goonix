@@ -49,8 +49,10 @@ import qualified Data.ByteString as B
 import Foreign.Marshal.Alloc (allocaBytes)
 import Foreign.C.Error (Errno (..), eAGAIN, eACCES, eNOENT, getErrno)
 import Foreign.C.String (CString)
-import Foreign.C.Types (CInt (..), CUInt (..))
-import Data.Word (Word64)
+import Foreign.C.Types (CInt (..), CUInt (..), CSize (..))
+import Data.Word (Word64, Word8)
+import Foreign.Marshal.Utils (copyBytes)
+import Foreign.Storable (pokeByteOff)
 import Foreign.Ptr (Ptr, castPtr, nullPtr)
 import Data.Bits ((.&.), (.|.))
 import Goonix.Store.Nar (Nar (..), hashNar)
@@ -77,7 +79,7 @@ foreign import ccall safe "goonix_lock_shared" c_lock_shared :: CString -> CInt 
 foreign import ccall safe "goonix_lock_upgrade" c_lock_upgrade :: CInt -> CInt -> IO CInt
 foreign import ccall unsafe "goonix_lock_nonblocking" c_lock_nonblocking :: CInt -> CInt -> IO CInt
 foreign import ccall unsafe "goonix_write_at_end" c_write_at_end :: CInt -> Ptr () -> Word64 -> IO CInt
-foreign import ccall unsafe "goonix_dedup_link" c_dedup_link :: CString -> CString -> CString -> IO CInt
+foreign import ccall unsafe "goonix_dedup_link" c_dedup_link :: CString -> CString -> CString -> CSize -> IO CInt
 
 restoreNar :: RawFilePath -> Nar -> IO ()
 restoreNar path = restore path
@@ -560,7 +562,18 @@ deduplicateTree store path = do
           digest <- hashFileNar p
           let linkPath = store <> "/.links/" <> digest
               temporary = store <> "/.tmp-goonix-dedup"
-          result <- withCStringBytes p $ \p' -> withCStringBytes linkPath $ \link' -> withCStringBytes temporary $ \temp' -> c_dedup_link p' link' temp'
+              -- The C shim appends a "-<pid>-<attempt>" suffix to the temp path.
+              -- Reserve room for it: a CString buffer sized only strlen+1 (as
+              -- B.useAsCString allocates) would be overflowed by the suffix,
+              -- corrupting adjacent heap (the CI evacuate segfault).  Allocate
+              -- the prefix plus 32 bytes for the suffix and pass the capacity.
+              tempCap = B.length temporary + 32
+          result <- withCStringBytes p $ \p' -> withCStringBytes linkPath $ \link' ->
+            allocaBytes tempCap $ \temp' -> do
+              B.useAsCStringLen temporary $ \(src, len) ->
+                copyBytes temp' (castPtr src) len
+              pokeByteOff temp' (B.length temporary) (0 :: Word8)
+              c_dedup_link p' link' temp' (fromIntegral tempCap)
           when (result < 0) (errnoIO "cannot deduplicate store file")
     hashFileNar p = do
       hash <- hashNar p

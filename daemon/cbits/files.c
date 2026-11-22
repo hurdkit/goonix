@@ -156,7 +156,8 @@ int goonix_write_at_end(int fd, const unsigned char *bytes, uint64_t length) {
   return 0;
 }
 
-int goonix_dedup_link(const char *path, const char *link_path, const char *temp_path) {
+int goonix_dedup_link(const char *path, const char *link_path,
+                      char *temp_path, size_t temp_cap) {
   const char *slash = strrchr(path, '/');
   char parent[4096];
   if (!slash || (size_t)(slash - path) >= sizeof parent) { errno = ENAMETOOLONG; return -1; }
@@ -183,9 +184,16 @@ int goonix_dedup_link(const char *path, const char *link_path, const char *temp_
     break;
   }
   if (result == 0) {
+    size_t length = strlen(temp_path);
     for (unsigned int attempt = 0; attempt < 100; ++attempt) {
-      size_t length = strlen(temp_path);
-      if (snprintf((char *)temp_path + length, 32, "-%ld-%u", (long)getpid(), attempt) >= 32) {
+      /* Append the pid/attempt suffix INSIDE the caller's buffer.  temp_cap is
+         the full allocation size (the caller reserves room for the suffix);
+         bounding snprintf to the remaining capacity prevents the heap overflow
+         that wrote the suffix past a strlen+1 CString buffer. */
+      if (length >= temp_cap) { result = -1; errno = ENAMETOOLONG; break; }
+      int written = snprintf(temp_path + length, temp_cap - length,
+                             "-%ld-%u", (long)getpid(), attempt);
+      if (written < 0 || (size_t)written >= temp_cap - length) {
         result = -1;
         errno = ENAMETOOLONG;
         break;
