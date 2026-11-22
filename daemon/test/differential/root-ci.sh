@@ -48,6 +48,29 @@ timeout 300 unshare --user \
     work="'"$work"'"; root="'"$root"'"; daemon="'"$daemon"'"; mode="'"$mode"'"
     gitrev="'"$gitrev"'"; payload_hash="'"$payload_hash"'"; git_hash="'"$git_hash"'"
     dev_glp="'"$dev_glp"'"; dev_glcp="'"$dev_glcp"'"; ROOT_CI_CLIENT="'"${ROOT_CI_CLIENT:-}"'"
+    # Fail fast if a server port is already taken: a busy port must not turn into
+    # a FAIL of a download check (the daemon would talk to the wrong server).
+    # Loopback is shared with the host, so ss sees host listeners here too.
+    for port in 18080 19418; do
+      if ss -ltn 2>/dev/null | grep -qE "[:.]$port[[:space:]]"; then
+        echo "port $port is in use; stop the listener before running root-ci" >&2
+        exit 3
+      fi
+    done
+    # Cleanup on EVERY exit (normal, early exit, or a caught signal): stop the
+    # daemon, socat and git-daemon.  git daemon forks a git-daemon child that
+    # outlives its parent, so kill any child matching the base-path of this run.
+    dpid=; http_pid=; gitd_pid=
+    cleanup() {
+      trap - EXIT INT TERM
+      kill $dpid $http_pid $gitd_pid 2>/dev/null
+      pkill -f "git-daemon --base-path=$work/gitrepo" 2>/dev/null
+      pkill -f "git daemon --base-path=$work/gitrepo" 2>/dev/null
+      wait $dpid $http_pid $gitd_pid 2>/dev/null
+    }
+    trap cleanup EXIT
+    trap "exit 130" INT
+    trap "exit 143" TERM
     mount --bind "$work/etc/passwd" /etc/passwd
     mount --bind "$work/etc/group" /etc/group
     mount --bind "$work/etc/nsswitch.conf" /etc/nsswitch.conf
@@ -107,8 +130,7 @@ timeout 300 unshare --user \
       "$root/guile" --no-auto-compile "$client" \
       "$work" "$gitrev" "$payload_hash" "$git_hash"
     rc=$?
-    kill $dpid $http_pid $gitd_pid 2>/dev/null; wait $dpid 2>/dev/null
-    exit $rc
+    exit $rc   # the EXIT trap stops the daemon, socat and git-daemon
   '
 rc=$?
 echo "root-ci[$label] rc=$rc"
