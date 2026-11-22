@@ -178,9 +178,7 @@ verifyStorePaths checkContents repair repairPath store paths = do
     else pure False
   pure (verifyErrors state || contentErrors)
   where
-    rootLockPath store' = case storeStateDirectory store' of
-      Just state -> state <> "/gc.lock"
-      Nothing -> storeDirectory store' <> "/.gc.lock"
+    rootLockPath store' = storeStateDirectory store' <> "/gc.lock"
 
     verifyExistence state path
       | Set.member path (verifyDone state) = pure state

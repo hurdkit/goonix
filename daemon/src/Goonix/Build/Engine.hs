@@ -356,14 +356,12 @@ daemonOwnedBuild config userPool settings trace hook mode wanted drvPath = case 
         gcPath = storeGcLockPathOf (configStore serverConfig) (configStateDirectory serverConfig)
         tolerant = tolerantTrace trace
     withTempRootFile rootPath gcPath $ \goalRootFd ->
-      bracket (openStore (configStore serverConfig) (configDatabase serverConfig)) closeStore $ \goalStore ->
-        buildDerivationNow userPool config goalRootFd goalStore { storeStateDirectory = configStateDirectory serverConfig } settings tolerant hook mode wanted drvPath
+      bracket (openStore (configStore serverConfig) (configDatabase serverConfig) (configStateDirectory serverConfig)) closeStore $ \goalStore ->
+        buildDerivationNow userPool config goalRootFd goalStore settings tolerant hook mode wanted drvPath
 
 -- | The temporary-roots directory of a store, as the server uses it.
 tempRootsDir :: ServerConfig -> ByteString
-tempRootsDir config = case configStateDirectory config of
-  Just state -> state <> "/temproots"
-  Nothing -> "/tmp/goonix-temproots"
+tempRootsDir config = configStateDirectory config <> "/temproots"
 
 -- | A trace that tolerates a gone client: the daemon-owned goal may outlive the
 -- client that started it, whose socket is then closed.  A write to that socket
@@ -1007,7 +1005,7 @@ spawnDirectBuilder buildUser executable arguments environment work (Fd logFd) = 
 
 makeSandboxRoot :: Store -> IO RawFilePath
 makeSandboxRoot store = do
-  let parent = maybe "/tmp" (<> "/build") (storeStateDirectory store)
+  let parent = storeStateDirectory store <> "/build"
   mkdirParents parent
   pid <- getProcessID
   stamp <- getPOSIXTime
@@ -1381,7 +1379,7 @@ enforceReferencePolicy store drv path references = do
 
 makeBuildDirectory :: Store -> IO RawFilePath
 makeBuildDirectory store = do
-  let parent = maybe "/tmp" (<> "/build") (storeStateDirectory store)
+  let parent = storeStateDirectory store <> "/build"
   mkdirParents parent
   pid <- getProcessID
   stamp <- getPOSIXTime

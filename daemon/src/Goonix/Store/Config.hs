@@ -18,7 +18,7 @@ data ServerConfig = ServerConfig
   , configDefaultSettings :: !Settings
   , configLogConnections :: !Bool
   , configReadOnly :: !Bool
-  , configStateDirectory :: !(Maybe ByteString)
+  , configStateDirectory :: !ByteString
   , configGuixProgram :: !ByteString
   , configBuildUsers :: !(Maybe UserPool)
   , configSharedScheduler :: !(Maybe Shared)
@@ -28,4 +28,4 @@ data ServerConfig = ServerConfig
 
 defaultConfig :: ServerConfig
 defaultConfig = ServerConfig "/gnu/store" "/var/guix/db/db.sqlite"
-  (defaultSettings True False) False True Nothing (C.pack (Config.binaryDirectory ++ "/guix")) Nothing Nothing
+  (defaultSettings True False) False True (C.pack Config.stateDirectory) (C.pack (Config.binaryDirectory ++ "/guix")) Nothing Nothing

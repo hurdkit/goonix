@@ -26,7 +26,8 @@ import Goonix.Store.ReadOnly
 import Goonix.Store.Wire
 import Goonix.Store.Writing
 import Goonix.Store.Files (deleteTree, restoreNar, deduplicateTree)
-import Goonix.Store.GuixProgram (guixProgram)
+import Goonix.Store.GuixProgram (guixProgram, canonPath)
+import qualified Goonix.Config as Config
 import System.Posix.ByteString (RawFilePath)
 import System.IO (Handle, hPutStrLn, hFlush)
 import System.Process (CreateProcess (..), StdStream (..), createProcess, proc, waitForProcess)
@@ -280,8 +281,9 @@ contentAddressed store path narBytes nar references =
 
 signHash :: ByteString -> IO ByteString
 signHash hash = do
-  directory <- maybe "/etc/guix" id <$> getEnv "GUIX_CONFIGURATION_DIRECTORY"
-  let key = directory ++ "/signing-key.sec"
+  configured <- getEnv "GUIX_CONFIGURATION_DIRECTORY"
+  let directory = canonPath (maybe (C.pack Config.configurationDirectory) C.pack configured)
+      key = C.unpack directory ++ "/signing-key.sec"
       hexHash = encodeBase16 hash
   status <- getFileStatus key
   when (fileMode status .&. 0o077 /= 0) (throwIO (storeError "signing key is accessible to others"))
