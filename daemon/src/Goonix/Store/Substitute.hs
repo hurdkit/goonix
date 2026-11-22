@@ -11,8 +11,9 @@ module Goonix.Store.Substitute
   , packSettings
   ) where
 
-import Control.Exception (SomeException, bracket, catch, throwIO)
-import Data.Bits ((.&.))
+import Control.Exception (SomeException, bracket, catch, throwIO, finally)
+import Control.Concurrent.STM (atomically, orElse)
+import GHC.Conc (threadWaitReadSTM)
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as C
 import Data.ByteString (ByteString)
@@ -50,11 +51,6 @@ data Agent = Agent
 
 foreign import ccall unsafe "goonix_spawn_helper"
   c_spawn_helper :: CString -> CString -> CInt -> CInt -> CInt -> CString -> Ptr CInt -> IO CInt
-
--- | Wait until either descriptor is readable (C++ select over the reply and log
--- pipes, local-store.cc:799-809).  Bit 0 = reply ready, bit 1 = log ready.
-foreign import ccall unsafe "goonix_select_two"
-  c_select_two :: CInt -> CInt -> IO CInt
 
 withAgent :: ServerConfig -> Settings -> ByteString -> (ByteString -> IO ()) -> (Agent -> IO a) -> IO a
 withAgent config settings argument emit action = bracket start stop action
@@ -144,46 +140,62 @@ sendLine agent line = do
   hFlush (agentInput agent)
 
 -- | Read one reply line from the reply pipe (fd 4) while draining the log pipe,
--- exactly as the C++ getLineFromSubstituter (local-store.cc:792-842): select on
--- both descriptors, completely drain the log (forwarding each chunk to the
--- client as C++ writeToStderr does) before dealing with the reply, then read
--- reply bytes until a newline.  Draining the log in the same loop is what keeps
--- a helper that writes more than the pipe buffer of diagnostics before its
--- reply from deadlocking: the log never fills, so the helper never blocks in
--- write(), so the reply arrives.  Doing it in ONE thread (not a concurrent
--- drainer) paces the client forwarding with the reply read, so the diagnostic
--- stream cannot fill the client socket faster than the client reads it and
--- back-pressure the helper through the log pipe.
+-- as the C++ getLineFromSubstituter (local-store.cc:792-842): wait for either
+-- descriptor, drain the log (forwarding each chunk to the client as C++
+-- writeToStderr does) before dealing with the reply, then read reply bytes until
+-- a newline.  Draining the log in the same loop is what keeps a helper that writes
+-- more than the pipe buffer of diagnostics before its reply from deadlocking: the
+-- log never fills, so the helper never blocks in write(), so the reply arrives.
+-- Doing it in ONE thread (not a concurrent drainer) paces the client forwarding
+-- with the reply read, so the diagnostic stream cannot fill the client socket
+-- faster than the client reads it and back-pressure the helper through the log
+-- pipe.
+--
+-- The wait goes through the GHC IO manager (threadWaitReadSTM on both pipes,
+-- atomically (reply `orElse` log)), NOT an `unsafe' foreign select().  The daemon
+-- is -threaded -N: an unsafe blocking call holds its capability until it returns,
+-- and the next GC needs every capability to stop, so a silent helper would freeze
+-- every other client and build in the process at its next GC; an unsafe call also
+-- cannot take an asynchronous exception (client disconnect, timeout).  The IO
+-- manager releases the capability while parked and is interruptible.  Both
+-- unregister actions run afterwards even on an exception, so no registration
+-- leaks.  This is the one place C++ differs structurally: there each client is its
+-- own process, so a blocking select() in one cannot stall the others.
 receiveLine :: Agent -> IO ByteString
 receiveLine agent = go [] False
   where
     replyFd = agentReplyFd agent
     logFd = agentLogFd agent
-    -- logDone: the log pipe reached EOF (helper exited).  Stop selecting on it
-    -- so a ready reply is read first; a helper that replies then exits must not
-    -- be reported as "died unexpectedly" just because its log closed first.
-    go acc logDone = do
-      mask <- c_select_two (fdNumber replyFd) (if logDone then fdNumber replyFd else fdNumber logFd)
-      if mask < 0
-        then throwIO (storeError "waiting for input from the substituter")
+    -- Wait until the reply pipe is readable, or (when still open) the log pipe.
+    -- Returns True for reply, False for log.  orElse tries the reply first; if it
+    -- is not ready it tries the log.  Both registrations are torn down even if
+    -- the wait is interrupted (async exception) or throws.
+    waitReplyOrLog logDone = do
+      (waitReply, unregisterReply) <- threadWaitReadSTM replyFd
+      if logDone
+        then (atomically waitReply >> pure True) `finally` unregisterReply
         else do
-          let logReady = not logDone && mask .&. 2 /= 0
-              replyReady = mask .&. 1 /= 0
-          if logReady && not replyReady
-            then do
-              bytes <- fdRead logFd 4096
-              if B.null bytes
-                then go acc True
-                else agentEmit agent bytes >> go acc False
-            else if replyReady
-              then do
-                byte <- fdRead replyFd 1
-                if B.null byte
-                  then throwIO (storeError "`guix substitute' died unexpectedly")
-                  else case C.head byte of
-                    '\n' -> pure (B.concat (reverse acc))
-                    _ -> go (byte : acc) logDone
-              else go acc logDone
+          (waitLog, unregisterLog) <- threadWaitReadSTM logFd
+          let wait = atomically ((waitReply >> pure True) `orElse` (waitLog >> pure False))
+          wait `finally` (unregisterReply >> unregisterLog)
+    -- logDone: the log pipe reached EOF (helper exited).  Stop waiting on it so a
+    -- ready reply is read first; a helper that replies then exits must not be
+    -- reported as "died unexpectedly" just because its log closed first.
+    go acc logDone = do
+      replyReady <- waitReplyOrLog logDone
+      if not replyReady
+        then do
+          bytes <- fdRead logFd 4096
+          if B.null bytes
+            then go acc True
+            else agentEmit agent bytes >> go acc False
+        else do
+          byte <- fdRead replyFd 1
+          if B.null byte
+            then throwIO (storeError "`guix substitute' died unexpectedly")
+            else case C.head byte of
+              '\n' -> pure (B.concat (reverse acc))
+              _ -> go (byte : acc) logDone
 
 readCount :: Agent -> IO Int
 readCount agent = do

@@ -10,7 +10,6 @@
 #include <stdio.h>
 
 #include <sys/types.h>
-#include <sys/select.h>
 #include <grp.h>
 
 /* Equivalent to the C++ daemon's killUser: the short-lived child changes to
@@ -238,31 +237,4 @@ int goonix_spawn_builtin(const char *program, char *const argv[],
   }
   *pid_out = (int)pid;
   return 0;
-}
-
-/* goonix: wait until either of two descriptors is readable, as the C++
-   getLineFromSubstituter does with select() over the substituter's reply and
-   log pipes (local-store.cc:799-809).  Returns a bitmask: bit 0 = fd_a ready,
-   bit 1 = fd_b ready; both may be set.  Returns -1 on error (errno set), and
-   retries on EINTR.  A blocking select here is interruptible by the GHC RTS
-   only via a signal; the caller uses this in a loop that also checks for the
-   helper's exit, so a hung helper is bounded by the caller's timeout. */
-int goonix_select_two(int fd_a, int fd_b)
-{
-  for (;;) {
-    fd_set fds;
-    FD_ZERO(&fds);
-    FD_SET(fd_a, &fds);
-    FD_SET(fd_b, &fds);
-    int maxfd = (fd_a > fd_b ? fd_a : fd_b) + 1;
-    int result = select(maxfd, &fds, NULL, NULL, NULL);
-    if (result < 0) {
-      if (errno == EINTR) continue;
-      return -1;
-    }
-    int mask = 0;
-    if (FD_ISSET(fd_a, &fds)) mask |= 1;
-    if (FD_ISSET(fd_b, &fds)) mask |= 2;
-    return mask;
-  }
 }

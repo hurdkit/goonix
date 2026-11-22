@@ -23,7 +23,7 @@ guix-sandbox: $(top_srcdir)/daemon/sandbox/guix-sandbox.cc
 	  mv $@.tmp $@
 # Keep the direct build independent of Cabal's package database and of Hackage.
 DAEMON_GHC_FLAGS = -O2 -Wall -Wcompat -Widentities -Wredundant-constraints \
-  -threaded -with-rtsopts=-N \
+  -threaded -rtsopts -with-rtsopts=-N \
   -XGHC2024 -XStrictData -package process -package directory \
   -i$(top_srcdir)/daemon/src \
   -i$(top_builddir)/daemon/src $(LIBGCRYPT_CPPFLAGS) \
@@ -104,6 +104,8 @@ EXTRA_DIST += \
   daemon/test/differential/nar-memory.sh daemon/test/differential/nar-memory.scm \
   daemon/test/differential/substitute-log-flood.sh daemon/test/differential/substitute-log-flood.scm \
   daemon/test/differential/substitute-log-flood-helper.sh \
+  daemon/test/differential/substitute-silent.sh daemon/test/differential/substitute-silent.scm \
+  daemon/test/differential/substitute-silent-helper.sh \
   daemon/sandbox/README.md daemon/sandbox/guix-sandbox.cc \
   daemon/sandbox/Makefile daemon/test/lib.sh daemon/test/seed-restore.scm \
   daemon/test/sandbox-helper-cleanup.sh daemon/test/sandbox-helper-cleanup.scm \
