@@ -441,6 +441,60 @@ static void checkSiblingOutputReferences(const Path & root)
         "sibling output is registered as a reference");
 }
 
+/* goonix: a tree that already carries a sibling's FINAL path, not its token.
+
+   Measured on CA-6's gcc-14.3.0: bin/gcc-ar holds
+   sans3lascpwwjmmml8p7y4x8rh34hgrz (the REALISED lib output) while the
+   derivation declares that sibling as the token
+   teuttuuueeuttoototeeeutooeeeuout.  A graft writes the replacement's realised
+   path through (guix/ca/build/graft.scm stands in only own-outputs).
+
+   The forward sibling loop in finaliseContentOutput rewrites sibling TOKENS to
+   finals; an occurrence that is already final is untouched and enters `built`
+   as a final.  inverseTree then maps every sibling final back to its token,
+   including that one, so the inverse disagrees with `built`.
+
+   The control above writes the sibling TOKEN, so both sides see the same
+   token-to-final change and agree. */
+static void checkSiblingAlreadyFinal(const Path & root)
+{
+    configureIsolatedStore(root);
+    LocalStore store(false);
+    createDirs(settings.nixStore);
+    Path libToken = tokenPath("lib", "sibfinal-lib");
+    createDirs(libToken);
+    writeFile(libToken + "/payload", "library");
+    PathSet references;
+    Hash narHash;
+    uint64_t narSize = 0;
+    Path libFinal = finaliseContentOutput(store, libToken, "lib", "sibfinal-lib",
+        PathSet{libToken}, references, narHash, narSize);
+    Path outToken = tokenPath("out", "sibfinal-out");
+    createDirs(outToken);
+    /* The sibling's FINAL path, plus this output's own token. */
+    writeFile(outToken + "/driver", libFinal + " " + outToken);
+    references.clear();
+    bool refused = false;
+    std::string message;
+    Path outFinal;
+    try {
+        outFinal = finaliseContentOutput(store, outToken, "out", "sibfinal-out",
+            PathSet{outToken, libToken, libFinal}, references, narHash, narSize,
+            std::map<Path, Path>{{libToken, libFinal}});
+    } catch (const Error & e) {
+        refused = true;
+        message = e.what();
+    }
+    /* Name the refusal, so a future failure cannot be mistaken for a fixture
+       problem: this test's whole point is that finalisation must not refuse. */
+    std::cout << "sibfinal: refused=" << refused << " message=" << message << '\n';
+    check(!refused,
+        "a tree carrying a sibling's final path is finalised, not refused");
+    if (!refused)
+        check(readFile(outFinal + "/driver") == libFinal + " " + outFinal,
+            "the sibling's final path and the self reference are both correct");
+}
+
 static void checkFinalRootBeforeExistence(const Path & root)
 {
     configureIsolatedStore(root);
@@ -888,6 +942,10 @@ int main(int argc, char ** argv)
     }
     if (argc == 3 && string(argv[1]) == "--siblings") {
         checkSiblingOutputReferences(argv[2]);
+        return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+    if (argc == 3 && string(argv[1]) == "--sibling-already-final") {
+        checkSiblingAlreadyFinal(argv[2]);
         return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }
     if (argc == 3 && string(argv[1]) == "--existing-item") {

@@ -764,6 +764,35 @@ Path finaliseContentOutput(LocalStore & store, const Path & token,
     for (auto & sibling : finalOutputs)
         referencePaths.insert(sibling.second);
     checkReservedTree(physical, 0, baseNameOf(token));
+    /* goonix: only the siblings whose TOKEN is actually present get rewritten
+       here, and only those may be reversed by the inverse check.
+
+       The sibling loop below turns sibling tokens into their final paths
+       BEFORE `built = treeHash(physical)`, so `built` contains finals for
+       those.  inverseTree reverses sibling final -> token to undo exactly that
+       (added in 22142502179 with the loop).  A sibling path that is ALREADY
+       final in the tree — as in a graft output, whose builder writes the
+       replacement's realised path — is untouched by the loop and enters
+       `built` as a final; reversing it too made the inverse disagree and
+       finalisation was refused.  Measured on CA-6's gcc-14.3.0 (bin/gcc-ar
+       holds the realised lib path) and reproduced by
+       ca-test --sibling-already-final.
+
+       So record which sibling tokens the scan finds before rewriting, and
+       pass only those to sameContent. */
+    std::map<Path, Path> rewrittenSiblings;
+    {
+        PathSet siblingTokens;
+        for (auto & sibling : finalOutputs)
+            if (sibling.first != token) siblingTokens.insert(sibling.first);
+        if (!siblingTokens.empty()) {
+            HashResult ignored;
+            PathSet present = scanForReferences(physical, siblingTokens, ignored);
+            for (auto & sibling : finalOutputs)
+                if (sibling.first != token && present.count(sibling.first))
+                    rewrittenSiblings.insert(sibling);
+        }
+    }
     for (auto & sibling : finalOutputs)
         if (sibling.first != token)
             rewriteTree(physical, baseNameOf(sibling.first).substr(0, 32),
@@ -804,7 +833,7 @@ Path finaliseContentOutput(LocalStore & store, const Path & token,
         if (pathExists(final) && stagedSibling && !store.isValidPath(final)) {
             /* A previous output of this build already produced this path.
                Verify it and leave registration to the output-set commit. */
-            bool same = sameContent(final, final, token, built, finalOutputs);
+            bool same = sameContent(final, final, token, built, rewrittenSiblings);
             if (!same)
                 throw BuildError(std::format(
                     "CA content address collision at `{0}': existing item differs", final));
@@ -817,7 +846,7 @@ Path finaliseContentOutput(LocalStore & store, const Path & token,
             return final;
         }
         if (pathExists(final)) {
-            bool same = sameContent(final, final, token, built, finalOutputs);
+            bool same = sameContent(final, final, token, built, rewrittenSiblings);
             if (!same)
                 throw BuildError(std::format(
                     "CA content address collision at `{0}': existing item differs", final));
@@ -838,7 +867,7 @@ Path finaliseContentOutput(LocalStore & store, const Path & token,
         throw SysError(std::format("moving CA output `{}' to `{}'", physical, final));
     if (created) *created = true;
     /* goonix: the inverse mapping is verified without touching the final tree. */
-    bool good = sameContent(final, final, token, built, finalOutputs);
+    bool good = sameContent(final, final, token, built, rewrittenSiblings);
     if (!good) {
         deletePath(final);
         throw BuildError(std::format("CA inverse mapping failed for `{}'", final));
