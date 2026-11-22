@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# PR #6 CI-like regression (reviewer mail m21bc93f58d74404f, item 3).
+# PR #6 CI-like regression setup.
 # Run a daemon as ROOT inside a user namespace with real build users, chroot ON,
 # env -i (no GUIX/NIX_BIN_DIR/GUIX_LOG_DIRECTORY), then:
 #   - build a builtin:download and a builtin:git-download;
@@ -8,13 +8,13 @@
 #     with `guix build --log-file`.
 # Both daemons must pass; the f65f695 Haskell daemon must FAIL (calibration).
 #
-# No sudo.  util-linux unshare maps wrath(1000)->ns root(0) and the subordinate
-# range 100000:65536 -> 1:65536.  The NixOS setuid WRAPPER newuidmap/newgidmap
-# (/run/wrappers/bin) must be FIRST in PATH (the store binary is not setuid ->
-# "write to uid_map failed: Operation not permitted").  nscd is masked so NSS
-# reads the bind-mounted passwd/group.  /gnu/store, /var/guix, /var/log/guix,
-# /etc/{passwd,group,nsswitch.conf}, /bin/guix are bind-mounted scratch paths so
-# the daemon (Config.storeDirectory=/gnu/store, Config.logDirectory=/var/log/guix)
+# No sudo.  util-linux unshare maps the caller's uid->ns root(0) and the
+# subordinate range 100000:65536 -> 1:65536.  The NixOS setuid WRAPPER
+# newuidmap/newgidmap (/run/wrappers/bin) must be FIRST in PATH (the store binary
+# is not setuid -> "write to uid_map failed: Operation not permitted").  nscd is
+# masked so NSS reads the bind-mounted passwd/group.  /gnu/store, /var/guix,
+# /var/log/guix, /etc/{passwd,group,nsswitch.conf} are bind-mounted scratch paths
+# so the daemon (Config.storeDirectory=/gnu/store, Config.logDirectory=/var/log/guix)
 # and the build-tree client (config.scm %storedir=/gnu/store, %localstatedir=/var)
 # agree without any GUIX_* environment.
 #
@@ -49,9 +49,11 @@ printf 7 > "$work/var-guix/db/schema"
 
 # --- the guix client the daemon resolves via the configured bindir (/bin/guix) ---
 # Bind-mount a scratch /bin holding guix + sh (the host /bin has sh but no guix).
+# Only the worktree mode bind-mounts this /bin; the installed (CI-like) package
+# resolves its own helpers.  sh comes from the caller's PATH, not a store path.
 cp "$root/scripts/guix" "$work/bin/guix"
 chmod +x "$work/bin/guix"
-ln -sf /nix/store/2ndah67h0z5m31v2wkdmg2md4380ggr5-bash-interactive-5.3p15/bin/sh "$work/bin/sh"
+ln -sf "$(command -v sh)" "$work/bin/sh"
 
 # --- a local git repo for builtin:git-download ---
 git init -q "$work/gitrepo"
