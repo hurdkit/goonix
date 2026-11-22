@@ -16,7 +16,7 @@ import Foreign.Ptr (Ptr)
 import Foreign.Storable (peek)
 import qualified Goonix.Config as Config
 import Goonix.Store.Config
-import Goonix.Store.GuixProgram (guixProgram)
+import Goonix.Store.GuixProgram (guixProgram, stateDirectory)
 import Goonix.Store.Server
 import Goonix.Store.Settings
 import Goonix.Store.Socket (Socket)
@@ -65,8 +65,8 @@ main = do
             then putStr usage
             else do
                 store <- storeDirectory args
-                database <- databasePath
-                state <- getEnv "GUIX_STATE_DIRECTORY"
+                state <- stateDirectory
+                database <- databasePath state
                 guix <- guixProgram
                 case parseDaemonOptions args of
                     Left message -> hPutStrLn stderr message >> exitFailure
@@ -137,12 +137,16 @@ storeDirectory args = do
     nixStore <- getEnv "NIX_STORE"
     pure (optionValue "--store=" args `orElse` env `orElse` nixStore `orElse` Just (C.pack Config.storeDirectory) `withDefault` C.pack Config.storeDirectory)
 
-databasePath :: IO FilePath
-databasePath = do
+-- | C++ globals.cc:65: nixDBPath = getEnv("GUIX_DATABASE_DIRECTORY",
+-- nixStateDir + "/db"), then the db.sqlite file inside it.  GUIX_DATABASE_PATH
+-- is an extra explicit override.  The state directory is already resolved
+-- (GUIX_STATE_DIRECTORY else configure-time), so no NIX_STATE_DIR re-read.
+databasePath :: B.ByteString -> IO FilePath
+databasePath state = do
     explicit <- getEnv "GUIX_DATABASE_PATH"
     directory <- getEnv "GUIX_DATABASE_DIRECTORY"
-    state <- getEnv "NIX_STATE_DIR"
-    pure (C.unpack (explicit `orElse` fmap (<> "/db.sqlite") directory `orElse` fmap (<> "/db/db.sqlite") state `orElse` Just (C.pack (Config.stateDirectory ++ "/db/db.sqlite")) `withDefault` C.pack (Config.stateDirectory ++ "/db/db.sqlite")))
+    let dbDir = directory `orElse` Just (state <> "/db")
+    pure (C.unpack (explicit `orElse` fmap (<> "/db.sqlite") dbDir `withDefault` C.pack (Config.stateDirectory ++ "/db/db.sqlite")))
 
 optionValue :: B.ByteString -> [B.ByteString] -> Maybe B.ByteString
 optionValue _ [] = Nothing

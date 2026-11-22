@@ -51,7 +51,7 @@ import Goonix.Store.Hash
 data Store = Store
   { storeDirectory :: !ByteString
   , storeDatabasePath :: !FilePath
-  , storeStateDirectory :: !(Maybe ByteString)
+  , storeStateDirectory :: !ByteString
   , database :: !Database
   , statementValidPath :: !Statement
   , statementAllPaths :: !Statement
@@ -85,13 +85,13 @@ storeError message = StoreError (C.pack message) 1
 assertStorePath :: Store -> ByteString -> IO ByteString
 assertStorePath store path = either (throwIO . storeError) pure (storePath store path)
 
-openStore :: ByteString -> FilePath -> IO Store
-openStore directory databasePath = withSchemaLock $ do
+openStore :: ByteString -> FilePath -> ByteString -> IO Store
+openStore directory databasePath state = withSchemaLock $ do
   mkdirParents (C.pack (takeDirectory databasePath))
   bracketOnError (openReadWrite databasePath) closeDatabase $ \db -> do
     initializeSchemaSql db (C.pack Config.schemaSql)
     let prepare' = prepare db
-    Store directory databasePath Nothing db
+    Store directory databasePath state db
       <$> prepare' "select id, hash, registrationTime, deriver, narSize from ValidPaths where path = ?;"
       <*> prepare' "select path from ValidPaths"
       <*> prepare' "select path from Refs join ValidPaths on reference = id where referrer = ?;"
@@ -110,12 +110,11 @@ closeStore store = do
   closeDatabase (database store)
 
 findRoots :: Store -> IO [(ByteString, ByteString)]
-findRoots store = case storeStateDirectory store of
-  Nothing -> pure []
-  Just state -> do
-    roots <- foldM (scanRootDirectory store) Map.empty
-      [state <> "/gcroots", state <> "/manifests", state <> "/profiles"]
-    pure (Map.toAscList roots)
+findRoots store = do
+  let state = storeStateDirectory store
+  roots <- foldM (scanRootDirectory store) Map.empty
+    [state <> "/gcroots", state <> "/manifests", state <> "/profiles"]
+  pure (Map.toAscList roots)
 
 scanRootDirectory :: Store -> Map.Map ByteString ByteString -> RawFilePath
   -> IO (Map.Map ByteString ByteString)
