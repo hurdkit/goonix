@@ -185,14 +185,19 @@ source instead."
 (define (strip-keyword arguments keyword)
   "Return ARGUMENTS without KEYWORD and its value."
   ;; goonix: walk keyword/value PAIRS, as keyword-argument does.  Stepping one
-  ;; element at a time removed a keyword occurring in a VALUE position and
-  ;; then took its neighbour as a value, corrupting the argument list.
+  ;; element at a time looked at value positions: with (#:local-build?
+  ;; #:addressing #:env-vars (...)) it kept #:local-build?, then saw the decoy
+  ;; #:addressing as a keyword and dropped it together with #:env-vars, so the
+  ;; lowerer never received the environment variables.  A trailing odd
+  ;; element is kept unchanged.
   (let loop ((rest arguments) (result '()))
     (cond ((null? rest) (reverse result))
-          ((or (not (pair? (cdr rest)))
-               (not (eq? (car rest) keyword)))
-           (loop (cdr rest) (cons (car rest) result)))
-          (else (loop (cddr rest) result)))))
+          ((not (pair? (cdr rest)))
+           (loop '() (cons (car rest) result)))
+          ((eq? (car rest) keyword)
+           (loop (cddr rest) result))
+          (else
+           (loop (cddr rest) (cons (cadr rest) (cons (car rest) result)))))))
 
 (define (gexp-with-addressing lower name exp . arguments)
   "Apply LOWER with the requested kind for this derivation only.  An explicit

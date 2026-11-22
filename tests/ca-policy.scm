@@ -588,6 +588,15 @@ NarSize: 1234\nNarHash: sha256:~a\nReferences: \nSystem: ~a\nDeriver: ~a\n"
        (run-with-store store
          (gexp->derivation "ca-policy-addr-false" #~(mkdir #$output)
                            #:addressing #f)))))
+  ;; test-group puts its body in a lambda, so every internal define must come
+  ;; before the first expression.
+  (define (lower-with-decoy policy)
+    (parameterize ((%package-addressing-policy policy))
+      (addressing
+       (run-with-store store
+         (gexp->derivation "ca-policy-addr-mid-decoy" #~(mkdir #$output)
+                           #:local-build? #:addressing
+                           #:system (%current-system))))))
   (test-equal "under content, #:addressing #f is still content-addressed"
     "content" (addressing-with-false 'content))
   (test-equal "under full, #:addressing #f is still content-addressed"
@@ -598,15 +607,57 @@ NarSize: 1234\nNarHash: sha256:~a\nReferences: \nSystem: ~a\nDeriver: ~a\n"
     #f (addressing-with-false 'mixed))
   ;; A keyword in a VALUE position is not an #:addressing argument.  The
   ;; decoy is a TOP-LEVEL value, so a plain memq over the argument list finds
-  ;; it: (#:env-vars #:addressing) has #:addressing at an odd index.  A walk
-  ;; over keyword/value pairs does not.
+  ;; it: (#:local-build? #:addressing) has #:addressing at an odd index.  A
+  ;; walk over keyword/value pairs does not.
   (test-equal "a keyword in a value position is not an addressing override"
     "content"
     (parameterize ((%package-addressing-policy 'adopted))
       (addressing
        (run-with-store store
          (gexp->derivation "ca-policy-addr-decoy" #~(mkdir #$output)
-                           #:local-build? #:addressing))))))
+                           #:local-build? #:addressing)))))
+  ;; Reviewer, 2026-11-22, on 57c18c13496: the decoy above puts the
+  ;; value-position keyword at the END of the list, where (pair? (cdr rest))
+  ;; is false, so it survives a strip-keyword that still steps one element at
+  ;; a time.  With another pair AFTER it the corruption shows: strip-keyword
+  ;; keeps #:local-build?, then sees #:addressing (its VALUE) as a keyword,
+  ;; drops it together with #:system, and returns
+  ;; (#:local-build? "x86_64-linux").  Measured on the committed definition:
+  ;;   mid (#:local-build? #:addressing #:system "x86_64-linux")
+  ;;     -> (#:local-build? "x86_64-linux")   WRONG
+  ;;   end (#:local-build? #:addressing) -> unchanged (the weak case)
+  ;;
+  ;; Exercised through gexp-with-addressing, the exported entry point: the
+  ;; three helpers are private and Guile INLINES them, so they are not bound
+  ;; in the module at runtime and @@ cannot reach them (measured:
+  ;; strip-keyword, keyword-argument and addressing-keyword-present? all
+  ;; report bound? #f).  A decoy keyword followed by a real pair is what
+  ;; distinguishes a pair walk from an element walk: the surviving #:system
+  ;; argument must still reach the lowerer, and the addressing must be the
+  ;; policy's own, not an override read out of a value position.
+  (test-equal "a mid-list value-position keyword does not become an override"
+    "content" (lower-with-decoy 'adopted))
+  ;; The DISCRIMINATING case, found by measurement (the two decoy cases above
+  ;; pass either way, because keyword-argument already walks pairs and makes
+  ;; the addressing decision before strip-keyword runs).  What strip-keyword
+  ;; corrupts is the argument list that reaches the LOWERER.  With a decoy in
+  ;; #:local-build?'s value followed by a real #:env-vars pair, the element
+  ;; walk drops the decoy together with #:env-vars and hands the lowerer
+  ;; (#:local-build? (("goonixProbe" . "yes"))), so the environment variable
+  ;; is LOST.  The pair walk keeps both pairs and the variable survives.
+  ;; Measured on the committed definition:
+  ;;   bad  -> (#:local-build? (("goonixProbe" . "yes")))
+  ;;   good -> (#:local-build? #:addressing #:env-vars (("goonixProbe" . "yes")))
+  (test-equal "an argument after a value-position decoy still reaches the builder"
+    "yes"
+    (assoc-ref
+     (derivation-builder-environment-vars
+      (parameterize ((%package-addressing-policy 'adopted))
+        (run-with-store store
+          (gexp->derivation "ca-policy-addr-decoy-env" #~(mkdir #$output)
+                            #:local-build? #:addressing
+                            #:env-vars '(("goonixProbe" . "yes"))))))
+     "goonixProbe")))
 
 (close-connection store)
 (test-end)
