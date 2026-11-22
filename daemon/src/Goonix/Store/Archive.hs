@@ -3,7 +3,7 @@
 {-# LANGUAGE StrictData #-}
 
 module Goonix.Store.Archive
-  ( exportPath
+  ( exportPathTo
   , importPaths
   , importPathsFrom
   , rewriteNarPaths
@@ -36,21 +36,56 @@ import Data.Bits ((.&.))
 exportMagic :: Word32
 exportMagic = 0x4558494e
 
-exportPath :: Store -> ByteString -> Bool -> IO ByteString
-exportPath store path sign = do
+-- | Stream an export archive to an emit callback, as C++ exportPath does with
+-- HashAndWriteSink over a TunnelSink: the NAR is dumped once through a hash
+-- sink (which also feeds the signed-hash sink), in bounded chunks, never
+-- materialised whole.  Each chunk is wrapped in a STDERR_WRITE frame by the
+-- caller's emit (the TunnelSink write), so the working set is a few chunks
+-- regardless of output size.  The metadata (magic, path, references, deriver)
+-- and the signature follow, hashed into the same signed-hash sink.  A daemon
+-- that dumpNar's the whole output here pins ~output-size bytes (plus copies for
+-- the prefix concatenation and the frame), and the committed high-water mark
+-- can OOM-kill the daemon mid-export on a large output (the CI stage1 graft).
+exportPathTo :: Store -> ByteString -> Bool -> (ByteString -> IO ()) -> IO ()
+exportPathTo store path sign emit = do
   _ <- assertStorePath store path
   valid <- isValidPath store path
   unless valid (throwIO (storeError ("path `" ++ C.unpack path ++ "' is not valid")))
-  nar <- dumpNar path
-  let narHash = hashBytes SHA256 nar
-      stored = queryPathHash store path
-  storedHash <- stored
+  narSink <- newHashSink SHA256
+  signedSink <- newHashSink SHA256
+  -- C++ TunnelSink buffers 64 KiB before each STDERR_WRITE frame; match that
+  -- bound so a single large file does not become one output-size frame.
+  buffer <- newIORef B.empty
+  let flushBuffer = do
+        bytes <- readIORef buffer
+        unless (B.null bytes) $ do
+          writeIORef buffer B.empty
+          emit (encodeInt stderrWrite <> encodeString bytes)
+      tunnel chunk = do
+        updateHashSink narSink chunk
+        updateHashSink signedSink chunk
+        bytes <- readIORef buffer
+        let combined = bytes <> chunk
+            loop rest
+              | B.length rest >= 65536 = do
+                  let (frame, more) = B.splitAt 65536 rest
+                  emit (encodeInt stderrWrite <> encodeString frame)
+                  loop more
+              | otherwise = writeIORef buffer rest
+        loop combined
+  dumpNarToHandle path tunnel
+  flushBuffer
+  narHash <- hashDigest <$> finishHashSink narSink
+  storedHash <- queryPathHash store path
   unless (B.null storedHash || storedHash == narHash) (throwIO (storeError "path changed during export"))
   info <- queryPathInfo store path
-  let prefix = nar <> encodeInt exportMagic <> encodeString path <> encodeStrings (infoReferences info) <> encodeString (infoDeriver info)
-      signedHash = hashBytes SHA256 prefix
+  let metadata = encodeInt exportMagic <> encodeString path <> encodeStrings (infoReferences info) <> encodeString (infoDeriver info)
+  updateHashSink signedSink metadata
+  emit (encodeInt stderrWrite <> encodeString metadata)
+  signedHash <- hashDigest <$> finishHashSink signedSink
   signature <- if sign then signHash signedHash else pure B.empty
-  pure (prefix <> encodeInt (if sign then 1 else 0) <> if sign then encodeString signature else B.empty)
+  let trailer = encodeInt (if sign then 1 else 0) <> if sign then encodeString signature else B.empty
+  emit (encodeInt stderrWrite <> encodeString trailer)
 
 importPaths :: Store -> ByteString -> IO [ByteString]
 importPaths store input = do

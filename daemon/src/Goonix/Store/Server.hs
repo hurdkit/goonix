@@ -33,7 +33,7 @@ import Goonix.Store.ReadOnly
 import Goonix.Store.Settings
 import Goonix.Store.Socket
 import Goonix.Store.Substitute (substitutablePaths, substitutableInfos, substitutePath)
-import Goonix.Store.Archive (exportPath, importPathsFrom)
+import Goonix.Store.Archive (exportPathTo, importPathsFrom)
 import Goonix.Build.Engine (BuildMode (..), BuildTrace (..), buildThings, buildThingsWithConfig, buildThingsWithCancel, ensureStorePath)
 import Goonix.Build.Users (loadUserPool)
 import Goonix.Build.Shared (newShared)
@@ -254,8 +254,10 @@ dispatch config store client settingsRef rootFd rootPath clientVersion operation
   16 -> do
     path <- readStringSocket client
     sign <- readIntSocket client
-    archive <- exportPath store path (sign == 1)
-    writeSocket client (encodeInt stderrWrite <> encodeString archive)
+    -- Stream the export to the socket in bounded STDERR_WRITE frames (C++
+    -- TunnelSink), never materialising the whole NAR: a large output must not
+    -- pin output-size bytes in the daemon heap and OOM mid-export.
+    exportPathTo store path (sign == 1) (writeSocket client)
     writeFrame client stderrLast
     writeSocket client (encodeInt 1)
   27 -> do
