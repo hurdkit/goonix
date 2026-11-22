@@ -13,6 +13,9 @@
 #include <set>
 #include <functional>
 #include <vector>
+#include <fstream>
+#include <iostream>
+#include <cstdio>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -524,6 +527,11 @@ void checkRewriteForTest(const Path & path, const string & from, const string & 
     rewriteRegularFile(path, from, to, 0444);
 }
 
+/* goonix: expose the whole-tree rewrite so a test can pin the mode of every
+   entry, including hard-linked twins.  Defined after rewriteTree itself. */
+void rewriteTreeForTest(const Path & path, const string & from, const string & to);
+
+
 string encodeReservedForTest(const Hash & digest, bool token)
 {
     return encodeReserved(digest, token);
@@ -585,10 +593,54 @@ static void checkReservedTree(const Path & path, unsigned depth = 0,
     } else throw BuildError(std::format("unsupported CA output file `{}'", path));
 }
 
+/* goonix: the executable bit of every regular file, recorded BEFORE any
+   rewriting begins.
+
+   rewriteRegularFile makes its file writable with chmod(path, 0600), and
+   chmod changes the mode of the INODE: every hard link of that file loses
+   S_IXUSR at the same moment.  rewriteTree used to stat each entry as it
+   reached it, so a hard-linked twin visited after its sibling read the
+   already-cleared mode and was installed 0444 instead of 0555.  The tree hash
+   covers the executable bit, so the inverse mapping then failed and
+   finalisation was refused.  Measured on CA-8's binutils-mesboot0 (8 tools
+   hard-linked between bin/ and <triplet>/bin/) and CA-6's gcc.
+
+   Keyed by device and inode, so every link of one file shares the mode
+   recorded before the first chmod.  Captured for the whole output tree in one
+   pass, because a link may cross directories. */
+static std::map<std::pair<dev_t, ino_t>, mode_t> captureExecModes(
+    const Path & path, unsigned depth = 0)
+{
+    std::map<std::pair<dev_t, ino_t>, mode_t> modes;
+    std::function<void(const Path &, unsigned)> walk =
+        [&](const Path & p, unsigned d)
+    {
+        if (d > 1024) throw BuildError("CA tree nesting exceeds limit");
+        struct stat st;
+        if (lstat(p.c_str(), &st))
+            throw SysError(std::format("reading `{}' for CA modes", p));
+        if (S_ISREG(st.st_mode))
+            modes.emplace(std::make_pair(st.st_dev, st.st_ino), st.st_mode);
+        else if (S_ISDIR(st.st_mode))
+            for (auto & entry : readDirectory(p))
+                walk(p + "/" + entry.name, d + 1);
+    };
+    walk(path, depth);
+    return modes;
+}
+
 static void rewriteTree(const Path & path, const string & from, const string & to,
-    unsigned depth = 0, bool outputRoot = true)
+    unsigned depth = 0, bool outputRoot = true,
+    const std::map<std::pair<dev_t, ino_t>, mode_t> * modes = nullptr)
 {
     if (depth > 1024) throw BuildError("CA tree nesting exceeds limit");
+    /* goonix: the root call records every file's mode before anything is
+       rewritten; recursive calls carry that map down. */
+    std::map<std::pair<dev_t, ino_t>, mode_t> captured;
+    if (outputRoot && !modes) {
+        captured = captureExecModes(path);
+        modes = &captured;
+    }
     struct stat st;
     if (lstat(path.c_str(), &st)) throw SysError(std::format("reading `{}' for CA rewrite", path));
     if (S_ISDIR(st.st_mode)) {
@@ -598,7 +650,7 @@ static void rewriteTree(const Path & path, const string & from, const string & t
         try {
             auto entries = readDirectory(path);
             for (auto & entry : entries)
-                rewriteTree(path + "/" + entry.name, from, to, depth + 1, false);
+                rewriteTree(path + "/" + entry.name, from, to, depth + 1, false, modes);
             for (auto & entry : entries) {
                 auto name = replaceWhole(entry.name, from, to, path + "/" + entry.name);
                 if (name != entry.name) {
@@ -619,8 +671,16 @@ static void rewriteTree(const Path & path, const string & from, const string & t
         }
         /* The parent may need renaming after its contents, not before. */
     } else if (S_ISREG(st.st_mode)) {
+        /* goonix: use the mode recorded BEFORE the rewrite, not the one on
+           disk now: a hard-linked sibling already rewritten has cleared
+           S_IXUSR on this inode. */
+        mode_t original = st.st_mode;
+        if (modes) {
+            auto it = modes->find(std::make_pair(st.st_dev, st.st_ino));
+            if (it != modes->end()) original = it->second;
+        }
         rewriteRegularFile(path, from, to,
-            (st.st_mode & S_IFMT) | ((st.st_mode & S_IXUSR) ? 0555 : 0444));
+            (st.st_mode & S_IFMT) | ((original & S_IXUSR) ? 0555 : 0444));
     } else if (S_ISLNK(st.st_mode)) {
         string target = replaceWhole(readLink(path), from, to, path);
         if (target != readLink(path)) {
@@ -652,6 +712,11 @@ static void rewriteTree(const Path & path, const string & from, const string & t
             }
         }
     } else throw BuildError(std::format("unsupported CA output file `{}'", path));
+}
+
+void rewriteTreeForTest(const Path & path, const string & from, const string & to)
+{
+    rewriteTree(path, from, to);
 }
 
 static string inverseTree(const Path & path, const string & final,

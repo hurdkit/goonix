@@ -19,6 +19,7 @@
 using namespace nix;
 namespace nix {
 void checkRewriteForTest(const Path & path, const string & from, const string & to);
+void rewriteTreeForTest(const Path & path, const string & from, const string & to);
 string encodeReservedForTest(const Hash & digest, bool token);
 }
 
@@ -952,6 +953,49 @@ int main(int argc, char ** argv)
         check(isPlaceholderPath(settings.nixStore + "/" + marker.substr(0, 31)
                                 + "o-hello"),
             "the bumped e...eo encoding is still a placeholder");
+    }
+
+    /* goonix: a hard-linked executable keeps its executable bit through the
+       rewrite.  Measured on CA-8's binutils-mesboot0 and CA-6's gcc: the
+       inverse mapping failed, and the kept trees showed 8 files in
+       i686-unknown-linux-gnu/bin/ at 0444 whose twins in bin/ were 0555, with
+       identical bytes.  Cause: rewriteRegularFile starts with
+       chmod(path, 0600), and chmod changes the mode of the INODE, so every
+       hard link of that file loses S_IXUSR at once.  rewriteTree stats each
+       entry as it reaches it, so the twin visited later computes
+       (st_mode & S_IXUSR) ? 0555 : 0444 from the already-cleared mode and is
+       installed non-executable.  The tree hash covers the executable bit, so
+       the inverse no longer matches and finalisation is refused.
+       Proven separately with a two-link file: chmod(a, 0600) leaves b at 0600
+       with S_IXUSR=0. */
+    {
+        Path root = createTempDir("", "goonix-hardlink-mode");
+        AutoDelete delRoot(root, true);
+        std::string token(32, 't'), replacement(32, 'u');
+        Path bin = root + "/bin", twin = root + "/i686/bin";
+        createDirs(bin);
+        createDirs(twin);
+        Path first = bin + "/ar", second = twin + "/ar";
+        writeFile(first, "/gnu/store/" + token + "-binutils/bin/ar\n");
+        chmod(first.c_str(), 0555);
+        if (link(first.c_str(), second.c_str()))
+            throw SysError("linking the test twin");
+        struct stat before;
+        lstat(second.c_str(), &before);
+        check((before.st_mode & 07777) == 0555 && before.st_nlink == 2,
+            "the test fixture really is a hard-linked executable pair");
+
+        rewriteTreeForTest(root, token, replacement);
+
+        struct stat a, b;
+        lstat(first.c_str(), &a);
+        lstat(second.c_str(), &b);
+        check((a.st_mode & S_IXUSR) != 0,
+            "the first hard-linked executable stays executable");
+        check((b.st_mode & S_IXUSR) != 0,
+            "the hard-linked twin keeps its executable bit through the rewrite");
+        check((a.st_mode & 07777) == (b.st_mode & 07777),
+            "both hard-linked twins end with the same mode");
     }
 
     return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
