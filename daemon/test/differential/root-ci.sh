@@ -27,7 +27,11 @@ gid=$(id -g)
 
 # Deterministic no-root/no-store regressions first, so every pin move runs them
 # before any daemon is started.  A failure here stops the run naming the test.
-bash "$here/regressions.sh" "$root" || exit 1
+# Run them through the dev shell as the devinfo step below does: sqlite-contention
+# compiles the daemon's Database.hs with ghc, which is only on PATH inside
+# `nix develop`.  A missing compiler stays a FAIL (sqlite-contention.sh exits 2 on
+# "no ghc"); it must never turn into a silent pass.
+(cd "$root" && nix develop "$root#default" -c bash "$here/regressions.sh" "$root") || exit 1
 
 bash "$here/root-ci-setup.sh" "$daemon" "$label" || exit 1
 daemon=$(readlink -f "$daemon")
