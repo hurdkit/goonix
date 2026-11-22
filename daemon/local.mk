@@ -96,6 +96,12 @@ EXTRA_DIST += \
   daemon/test/differential/stale-socket.c daemon/test/differential/socket-connect.c \
   daemon/test/differential/socket-query.c \
   daemon/test/differential/builtin-ci.sh daemon/test/differential/builtin-ci.scm \
+  daemon/test/differential/regressions.sh \
+  daemon/test/differential/cabal-modules.sh \
+  daemon/test/differential/dedup-overflow.sh daemon/test/differential/dedup-overflow-test.c \
+  daemon/test/differential/dedup-linkcount-test.c \
+  daemon/test/differential/export-memory.sh daemon/test/differential/export-memory.scm \
+  daemon/test/differential/nar-memory.sh daemon/test/differential/nar-memory.scm \
   daemon/sandbox/README.md daemon/sandbox/guix-sandbox.cc \
   daemon/sandbox/Makefile daemon/test/lib.sh daemon/test/seed-restore.scm \
   daemon/test/sandbox-helper-cleanup.sh daemon/test/sandbox-helper-cleanup.scm \

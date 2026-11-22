@@ -25,6 +25,10 @@ work=/tmp/pr6-root-ci/$label
 uid=$(id -u)
 gid=$(id -g)
 
+# Deterministic no-root/no-store regressions first, so every pin move runs them
+# before any daemon is started.  A failure here stops the run naming the test.
+bash "$here/regressions.sh" "$root" || exit 1
+
 bash "$here/root-ci-setup.sh" "$daemon" "$label" || exit 1
 daemon=$(readlink -f "$daemon")
 gitrev=$(cat "$work/gitrev")

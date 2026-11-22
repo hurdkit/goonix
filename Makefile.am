@@ -717,6 +717,12 @@ tests/guix-gc.log: $(filter-out tests/guix-gc.log,$(TEST_LOGS))
 # other tests from the database.  Run it right before `tests/guix-gc.sh'.
 tests/store.log: $(filter-out tests/guix-gc.log tests/store.log,$(TEST_LOGS))
 
+# Deterministic no-root/no-store regressions (cabal module list, dedup C
+# harnesses).  They need only bash, git and the C compiler, all of which
+# check-local already has, so a plain `make check-local` runs them too.
+check-local:
+	$(AM_V_at)CC="$(CC)" $(SHELL) $(top_srcdir)/daemon/test/differential/regressions.sh $(top_srcdir)
+
 else !CAN_RUN_TESTS
 
 TESTS =
