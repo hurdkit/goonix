@@ -181,10 +181,28 @@ decided as it would be without it, so a caller that passes #f for an
 input-addressed derivation (a graft, say) leaves its derivation upstream's."
   (let* ((package-name (%package-derivation-name))
          (explicit (keyword-argument arguments #:addressing))
+         ;; goonix: an explicit #:addressing #f is "no override" (a graft over
+         ;; an input-addressed derivation passes it so its derivation stays
+         ;; upstream's).  It is falsy, so it must be recognised by PRESENCE,
+         ;; not by value, or the 'adopted branch below would turn that graft
+         ;; content-addressed and break upstream byte-identity.
+         (no-override? (and (memq #:addressing arguments) (not explicit)))
          (requested (cond (explicit explicit)
                           ((and package-name (string=? name package-name))
                            (%package-addressing))
-                          ((memq (%package-addressing-policy) '(content full))
+                          ;; goonix: under 'adopted everything that is not an
+                          ;; adopted upstream package is content-addressed
+                          ;; (plan 01-content-addressing.md, section 8's
+                          ;; table).  A gexp is "everything else": leaving it
+                          ;; input-addressed made the daemon refuse it once
+                          ;; its inputs had been adopted -- "input-addressed
+                          ;; derivation depends on content/resolved-addressed
+                          ;; ... mark the dependent as content-addressed too"
+                          ;; -- which stopped the CA-6 boot gate at
+                          ;; module-import-compiled.
+                          ((and (not no-override?)
+                                (memq (%package-addressing-policy)
+                                      '(content full adopted)))
                            'content)
                           ((eq? (%package-addressing-policy) 'mixed) 'mixed)
                           (else 'input)))

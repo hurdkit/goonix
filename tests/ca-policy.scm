@@ -509,5 +509,62 @@ NarSize: 1234\nNarHash: sha256:~a\nReferences: \nSystem: ~a\nDeriver: ~a\n"
             1
             (count (lambda (p) (string=? p shared-out)) scans)))))))
 
+(test-group "a gexp over an adopted input is content-addressed under adopted"
+  ;; The plan's policy table (01-content-addressing.md, section 8): under
+  ;; 'adopted, upstream's packages are adopted (content-addressed grafts) and
+  ;; EVERYTHING ELSE is content-addressed.  A gexp is "everything else".
+  ;;
+  ;; gexp-with-addressing chose 'input for every policy except content, full
+  ;; and mixed, so under 'adopted a gexp whose inputs had been adopted stayed
+  ;; input-addressed and the daemon refused it: "input-addressed derivation
+  ;; depends on content/resolved-addressed `…-guile-static-initrd-3.0.11.drv';
+  ;; mark the dependent as content-addressed too".  Measured on the CA-6 boot
+  ;; gate at module-import-compiled (compiled-modules, guix/gexp.scm), which
+  ;; takes its guile from %guile-for-build and imports modules over it.
+  ;;
+  ;; gexp-addressing's input test only ran under 'mixed, so the adopted case
+  ;; had no fallback either.  This test lowers a gexp over an ADOPTED input
+  ;; under 'adopted and requires the result to be content-addressed and to
+  ;; build, which is what the daemon's checkInputAddressedPolicy enforces.
+  (let* ((leaf (trivial "ca-policy-gexp-adopt-leaf"
+                        #~(call-with-output-file #$output
+                            (lambda (p) (display "LEAF" p))))))
+    (parameterize ((%package-addressing-policy 'adopted)
+                   (%upstream-package?
+                    (upstream-package-set
+                     (list->setq (list leaf %bootstrap-guile)))))
+      (let* ((adopted-leaf (package-derivation store leaf))
+             (_ (build-derivations store (list adopted-leaf)))
+             ;; A gexp, not a package: no %package-derivation-name is set, so
+             ;; gexp-with-addressing decides by POLICY alone.
+             (drv (run-with-store store
+                    (gexp->derivation "ca-policy-gexp-adopt-top"
+                      #~(call-with-output-file #$output
+                          (lambda (p)
+                            (format p "~a/TOP" #$adopted-leaf)))))))
+        (test-equal "the adopted leaf is content-addressed"
+          "content" (addressing adopted-leaf))
+        (test-equal "a gexp over an adopted input is content-addressed"
+          "content" (addressing drv))
+        ;; The daemon refuses an input-addressed derivation over a CA input.
+        ;; Catch that so the failure is a recorded FAIL, not an aborted suite.
+        (test-assert "the gexp over an adopted input builds"
+          (catch 'store-protocol-error
+            (lambda () (build-derivations store (list drv)))
+            (lambda (key . args)
+              (format #t "build refused: ~a~%" args)
+              #f)))
+        ;; An explicit #:addressing #f means "no override": a graft over an
+        ;; input-addressed derivation passes it so its derivation stays
+        ;; upstream's.  The 'adopted branch must not override that, or every
+        ;; input-addressed graft's bytes would change.
+        (test-equal "an explicit #:addressing #f stays input-addressed under adopted"
+          #f
+          (addressing
+           (run-with-store store
+             (gexp->derivation "ca-policy-gexp-no-override"
+                               #~(mkdir #$output)
+                               #:addressing #f))))))))
+
 (close-connection store)
 (test-end)
