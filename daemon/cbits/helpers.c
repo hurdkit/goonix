@@ -13,7 +13,10 @@
 #include <grp.h>
 
 /* Equivalent to the C++ daemon's killUser: the short-lived child changes to
-   the leased uid so kill(-1, SIGKILL) affects only that uid, including itself.
+   the leased uid so kill(-1, SIGKILL) affects only that uid's processes.  On
+   Linux kill(-1, sig) does NOT signal the calling process (man 2 kill NOTES;
+   kernel/signal.c kill_something_info skips same_thread_group(p, current)), so
+   the child survives the sweep and _exit(0); it is not "including itself".
    On failure, fills diag (a caller buffer of diag_len bytes) with the failing
    step and the errno, exit status or signal, so killUser can report the cause
    in the C++ form (nix/libutil/util.cc killUser / statusToString) instead of a
