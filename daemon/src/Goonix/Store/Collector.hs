@@ -22,7 +22,7 @@ import Goonix.Store.Database (Value (Bytes, Integer), execute, withTransaction)
 import Goonix.Store.Hash (HashAlgorithm (SHA256))
 import Goonix.Store.Files (deleteTree, withGCLock, announcedRoots, storeGcLockPathOf)
 import Goonix.Store.Hash (hashDigest)
-import Goonix.Store.Nar (hashNar, dumpNar)
+import Goonix.Store.Nar (hashNar, hashNarSize)
 import Goonix.Store.ReadOnly
 import Goonix.Store.Settings (Settings, settingBool)
 import System.IO.Error (isDoesNotExistError)
@@ -215,8 +215,7 @@ verifyStorePaths checkContents repair repairPath store paths = do
       registered <- isValidPath store path
       if not registered then pure False else do
         info <- queryPathInfo store path
-        actualHash <- hashNar path
-        actualSize <- fromIntegral . B.length <$> dumpNar path
+        (actualHash, actualSize) <- hashNarSize path
         if hashDigest actualHash /= infoHash info
           then if repair then not <$> tryRepair path else pure True
           else do
