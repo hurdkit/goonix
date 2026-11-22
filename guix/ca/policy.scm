@@ -143,14 +143,25 @@ glibc is re-lowered content-addressed from source instead."
         ;; (content-addressed).  Measured on CA-6's gate at glibc-2.41 over
         ;; gawk-boot0, and pinned by tests/ca-policy.scm's re-lower group: the
         ;; throw happens inside (package-derivation store glibc-like), before
-        ;; any build.  Skipping the build in adopt-derivation does not help,
-        ;; because the derivation is never successfully written.
+        ;; any build.
+        ;;
+        ;; The mark is on glibc's OWN derivation only (%package-addressing).
+        ;; The POLICY stays 'adopted for everything lowered inside this
+        ;; extent, so the builder's guile, module-import and any package a
+        ;; gexp of glibc's build pulls in are still ADOPTED - cheap grafts over
+        ;; the input-addressed items the other packages use - rather than
+        ;; re-lowered from source.  Measured both ways: with 'content for the
+        ;; whole extent, a glibc-named package using (default-guile) got a
+        ;; FROM-SOURCE guile-3.0 (graft=0, its own guile-3.0.9.tar input, a
+        ;; 198-derivation closure); with the policy left 'adopted the builder
+        ;; guile is a graft (graft=1) over the same input-addressed item its
+        ;; peers use.  gnu-build-system and trivial-build-system both lower
+        ;; the builder's guile inside bag lowering, and glibc passes no
+        ;; #:guile, so it is in that case.
         (let ((glibc? (and (eq? (%package-addressing-policy) 'adopted)
-                           (string-prefix? "glibc" (bag-name bag)))))
+                           (glibc-name? (bag-name bag)))))
           (state-parameterize ((%package-addressing
                                 (if glibc? 'content (package-addressing context)))
-                               (%package-addressing-policy
-                                (if glibc? 'content (%package-addressing-policy)))
                                (%package-derivation-name (bag-name bag)))
             (let ((drv (apply lower bag arguments)))
               (if (and (not glibc?) (adopt-package? context))

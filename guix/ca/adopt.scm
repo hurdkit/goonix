@@ -15,6 +15,7 @@
   #:use-module (guix store)
   #:use-module (guix grafts)
   #:use-module ((guix utils) #:select (%current-system))
+  #:use-module ((guix ca) #:select (glibc-name?))
   #:use-module (guix ca graft)
   #:use-module (guix ca scan)
   #:use-module (ice-9 match)
@@ -117,8 +118,11 @@ store item never changes, so it is scanned at most once per connection."
 
 (define (glibc-derivation? drv)
   "Whether DRV builds glibc, which must be built from source in adopted mode
-rather than adopted (its self-references are not all rewritable)."
-  (string-prefix? "glibc" (derivation-name drv)))
+rather than adopted (its self-references are not all rewritable).
+
+The rule itself is (guix ca)'s glibc-name?, shared with the policy's
+lower-bag-with-addressing so the two cannot drift."
+  (glibc-name? (derivation-name drv)))
 
 (define (adopted-item? store drv)
   "Whether DRV's output can be adopted: it is not glibc and the scanner does

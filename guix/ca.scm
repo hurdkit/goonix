@@ -35,10 +35,28 @@
             content-addressed-path
             resolved-addressed-path
             canonical-build-record-payload
-            build-record-content-hash))
+            build-record-content-hash
+            glibc-name?))
 
 (define %ca-store-directory "/gnu/store")
 (define %reserved-alphabet "eout")
+
+(define (glibc-name? name)
+  "Whether NAME names glibc, which is never adopted: its self-references are
+not all rewritable, so under the 'adopted policy it is lowered
+content-addressed from source instead.
+
+The ONE rule for both callers - guix/ca/adopt.scm's glibc-derivation? (on a
+derivation name) and guix/ca/policy.scm's lower-bag-with-addressing (on a bag
+name) - so the two cannot drift.  It lives here because both modules already
+import (guix ca), whereas policy importing adopt would be a cycle.
+
+The prefix also matches glibc-locales and glibc-utf8-locales.  That is
+intended, and is upstream's own grouping: those outputs are produced by glibc
+itself and carry the same unrewritable self-references, so they take the same
+from-source route.  This is the rule adopt.scm already used; naming it here
+changes no behaviour."
+  (string-prefix? "glibc" name))
 
 ;; Upstream's remove-store-references (guix/build/utils.scm) writes 32 #\e
 ;; characters followed by #\- as its nuke-refs marker, into every file it

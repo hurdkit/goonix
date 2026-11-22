@@ -723,5 +723,77 @@ NarSize: 1234\nNarHash: sha256:~a\nReferences: \nSystem: ~a\nDeriver: ~a\n"
   (test-equal "the re-lowered package is content-addressed, not input"
     "content" (and (pair? outcome) (cadr outcome))))
 
+(test-group "glibc's content mark does not widen to what its build lowers"
+  ;; The mark is on glibc's OWN derivation.  The POLICY must stay 'adopted
+  ;; inside its bag lowering, so everything lowered there is ADOPTED - a
+  ;; graft over the input-addressed item its peers use - not re-lowered
+  ;; content-addressed FROM SOURCE.
+  ;;
+  ;; Measured cost of widening it: with the policy 'content for the whole
+  ;; extent, a glibc-named package using (default-guile) got a FROM-SOURCE
+  ;; guile-3.0 (its own guile-3.0.9.tar input, a 198-derivation closure)
+  ;; instead of a graft.
+  ;;
+  ;; The property asserted here is the one that actually separates the two
+  ;; scopes: glibc's derivation closure must contain NO fresh from-source
+  ;; content-addressed lowering of an upstream package.  A graft is fine
+  ;; (it reuses a built item); a non-graft content-addressed derivation of an
+  ;; upstream package is the from-source re-lowering.
+  ;;
+  ;; An earlier version of this test compared the builder guile after
+  ;; normalising a graft to the item it rewrites.  That did NOT distinguish
+  ;; the scopes - widening the override still passed 72/0 - because the wide
+  ;; scope hands glibc the plain input-addressed guile and the narrow one a
+  ;; graft over that same guile, so both normalise to one path.  Recorded so
+  ;; the weaker assertion is not reintroduced.
+  (define (graft? d)
+    ;; A graft imports (guix ca build graft) in its builder script; the
+    ;; "__file:..." environment entry holds that script's TEXT inline
+    ;; (measured), not a path to it.
+    (any (lambda (entry)
+           (and (string-prefix? "__file:" (car entry))
+                (string? (cdr entry))
+                (string-contains (cdr entry) "(guix ca build graft)")))
+         (derivation-builder-environment-vars d)))
+  (define (closure drv)
+    (let ((table (make-hash-table)))
+      (let visit ((d drv))
+        (unless (hash-ref table (derivation-file-name d))
+          (hash-set! table (derivation-file-name d) d)
+          (for-each (lambda (i) (visit (derivation-input-derivation i)))
+                    (derivation-inputs d))))
+      (hash-map->list (lambda (k v) v) table)))
+  (let* ((leaf (trivial "ca-policy-scope-leaf"
+                        #~(call-with-output-file #$output
+                            (lambda (p) (display "L" p)))))
+         (glibc-like (trivial "glibc-ca-policy-scope"
+                              #~(call-with-output-file #$output
+                                  (lambda (p) (format p "~a/G" #$leaf)))
+                              `(("leaf" ,leaf)))))
+    (parameterize ((%package-addressing-policy 'adopted)
+                   (%upstream-package?
+                    (upstream-package-set
+                     (list->setq (list leaf glibc-like %bootstrap-guile)))))
+      (let* ((g (package-derivation store glibc-like))
+             ;; Upstream PACKAGES re-lowered from source inside the extent:
+             ;; content-addressed, NOT a graft, and not glibc itself.
+             ;; module-import / module-import-compiled are not packages: they
+             ;; are the compiled build modules, content-addressed by design
+             ;; and shared with every other package (measured: the same
+             ;; 8jwj8r0h… derivation in both closures), so they are excluded.
+             (from-source
+              (filter (lambda (d)
+                        (let ((name (derivation-name d)))
+                          (and (equal? "content" (addressing d))
+                               (not (graft? d))
+                               (not (glibc-name? name))
+                               (not (string-prefix? "module-import" name)))))
+                      (closure g))))
+        (test-equal "glibc's own derivation is content-addressed"
+          "content" (addressing g))
+        (test-equal "nothing upstream is re-lowered from source inside glibc"
+          '() (map (lambda (d) (basename (derivation-file-name d)))
+                   from-source))))))
+
 (close-connection store)
 (test-end)
