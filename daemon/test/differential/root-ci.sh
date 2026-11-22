@@ -134,6 +134,15 @@ timeout 300 unshare --user \
       "$root/guile" --no-auto-compile "$client" \
       "$work" "$gitrev" "$payload_hash" "$git_hash"
     rc=$?
+    # Substituter regressions (reviewer point 2): drain the flooded log pipe
+    # (52fe97d8ec7) and keep serving while a helper is silent (b79edc950f1),
+    # against the same installed daemon as namespace root with build users and
+    # the chroot.  Skipped when a custom ROOT_CI_CLIENT is set (e.g. the killUser
+    # reproduction), which is not the standard gate.
+    if test -z "${ROOT_CI_CLIENT:-}"; then
+      bash "$root/daemon/test/differential/root-ci-substitute.sh" \
+        "$daemon" "$work" "$root" "$dev_glp" "$dev_glcp" || rc=1
+    fi
     exit $rc   # the EXIT trap stops the daemon, socat and git-daemon
   '
 rc=$?

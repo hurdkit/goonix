@@ -106,6 +106,9 @@ EXTRA_DIST += \
   daemon/test/differential/substitute-log-flood-helper.sh \
   daemon/test/differential/substitute-silent.sh daemon/test/differential/substitute-silent.scm \
   daemon/test/differential/substitute-silent-helper.sh \
+  daemon/test/differential/root-ci.sh daemon/test/differential/root-ci-setup.sh \
+  daemon/test/differential/root-ci-client.scm daemon/test/differential/root-ci-http.sh \
+  daemon/test/differential/root-ci-killuser.scm daemon/test/differential/root-ci-substitute.sh \
   daemon/sandbox/README.md daemon/sandbox/guix-sandbox.cc \
   daemon/sandbox/Makefile daemon/test/lib.sh daemon/test/seed-restore.scm \
   daemon/test/sandbox-helper-cleanup.sh daemon/test/sandbox-helper-cleanup.scm \
