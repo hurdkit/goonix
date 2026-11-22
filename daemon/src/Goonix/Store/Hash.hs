@@ -21,7 +21,8 @@ module Goonix.Store.Hash
   , finishHashSink
   ) where
 
-import Control.Exception (bracketOnError, throwIO)
+import Control.Exception (throwIO)
+import Control.Monad (when)
 import Data.Bits (xor)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as B
@@ -32,7 +33,7 @@ import Data.Word (Word8)
 import Foreign.C.String (CString, withCString)
 import Foreign.C.Types (CInt (..), CSize (..), CUInt (..))
 import Foreign.ForeignPtr (ForeignPtr, newForeignPtr, withForeignPtr)
-import Foreign.Marshal.Alloc (free, mallocBytes)
+import Foreign.Marshal.Alloc (alloca)
 import Foreign.Ptr (FunPtr, Ptr, castPtr, nullPtr)
 import System.IO (IOMode (ReadMode), withBinaryFile)
 import Foreign.Storable (peek)
@@ -100,9 +101,18 @@ compressHash :: Int -> ByteString -> ByteString
 compressHash size input = B.pack [foldl xor 0 [B.index input i | i <- [j, j + size .. B.length input - 1]] | j <- [0 .. size - 1]]
 
 initialize :: IO ()
-initialize = do
+initialize = gcryInit `seq` pure ()
+{-# NOINLINE initialize #-}
+
+-- libgcrypt initialisation runs ONCE, before any hashing thread starts, not on
+-- every hash from many threads (gcry_check_version is not meant to be called
+-- repeatedly concurrently).  A pure CAF memoises the single initialisation;
+-- initialize forces it (seq) on first use, and GHC evaluates it at most once.
+gcryInit :: ()
+gcryInit = unsafePerformIO $ do
   version <- withCString "1.6.0" c_check_version
-  if version == nullPtr then throwIO (userError "libgcrypt initialization failed") else pure ()
+  when (version == nullPtr) (throwIO (userError "libgcrypt initialization failed"))
+{-# NOINLINE gcryInit #-}
 
 checkedDigestLength :: HashAlgorithm -> IO Int
 checkedDigestLength algorithm = do
@@ -114,7 +124,9 @@ data HashSink = HashSink !HashAlgorithm !(ForeignPtr ())
 newHashSink :: HashAlgorithm -> IO HashSink
 newHashSink algorithm = do
   initialize
-  bracketOnError (mallocBytes 8) free $ \handle -> do
+  -- alloca frees the 8-byte handle pointer on every exit (the old
+  -- mallocBytes/bracketOnError freed it only on error, leaking it on success).
+  alloca $ \handle -> do
     result <- c_md_open handle (algorithmId algorithm) 0
     if result /= 0 then throwIO (userError ("gcry_md_open failed: " ++ show result)) else do
       pointer <- peek handle
