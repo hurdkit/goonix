@@ -22,6 +22,26 @@ mkdir -p "$sub/store" "$sub/db" "$sub/var" "$sub/log" "$sub/etc" "$sub/cache" "$
 sqlite3 "$sub/db/db.sqlite" < "$root/guix/store/schema.sql"
 printf 7 > "$sub/db/schema"
 
+# The daemon spawns the helper with PATH=/nonexistent (env -i), so a helper with
+# a `#!/usr/bin/env bash' shebang cannot find bash, and its external commands
+# (sleep) are not found either.  Wrap each fake helper in a script with an
+# ABSOLUTE bash shebang (resolved from the caller's dev shell) and a PATH that
+# carries the dev-shell coreutils, exactly as the real guix script uses an
+# absolute guile shebang and finds its own tools.
+bash_abs=$(command -v bash)
+dev_path="$PATH"
+make_helper() { # body-script -> wrapper-path
+  local body=$1 wrapper="$sub/$(basename "$1").wrapper"
+  { printf '#!%s\n' "$bash_abs"
+    printf 'export PATH=%s\n' "$dev_path"
+    cat "$body"
+  } > "$wrapper"
+  chmod +x "$wrapper"
+  printf '%s' "$wrapper"
+}
+flood_helper=$(make_helper "$here/substitute-log-flood-helper.sh")
+silent_helper=$(make_helper "$here/substitute-silent-helper.sh")
+
 start_daemon() { # helper rts-args...
   local helper=$1; shift
   env -i TMPDIR="$sub/tmp" LC_ALL=C.UTF-8 PATH=/nonexistent GUIX="$helper" \
@@ -49,8 +69,7 @@ run_client() { # script logfile
 
 rc=0
 # --- 1. log-flood: drain the flooded log pipe and answer ---
-chmod +x "$here/substitute-log-flood-helper.sh"
-if start_daemon "$here/substitute-log-flood-helper.sh"; then
+if start_daemon "$flood_helper"; then
   if run_client "$here/substitute-log-flood.scm" "$sub/flood.log" && grep -q 'substitute-log-drain: PASS' "$sub/flood.log"; then
     echo "root-ci substitute-log-flood: PASS"
   else
@@ -62,8 +81,7 @@ else
 fi
 
 # --- 2. silent: keep serving while the helper is silent (small -A forces GC) ---
-chmod +x "$here/substitute-silent-helper.sh"
-if start_daemon "$here/substitute-silent-helper.sh" +RTS -A"${RTS_A:-1m}" -N -RTS; then
+if start_daemon "$silent_helper" +RTS -A"${RTS_A:-1m}" -N -RTS; then
   if run_client "$here/substitute-silent.scm" "$sub/silent.log" && grep -q 'substitute-silent-wait: PASS' "$sub/silent.log"; then
     echo "root-ci substitute-silent: PASS"
   else
