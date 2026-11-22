@@ -24,6 +24,8 @@ module Goonix.Store.Ca
   , contentAddressedPath
   , resolvedAddressedPath
   , encodeReserved
+  , reservedHashPart
+  , nukeMarker
   , put64
   , putBytes
   , treeDomain
@@ -45,6 +47,20 @@ import qualified System.Posix.Files.ByteString as Files
 -- | The reserved alphabet, as in C++ ca.cc.
 alphabet :: ByteString
 alphabet = "eout"
+
+-- | Upstream's remove-store-references (guix/build/utils.scm:1329) writes 32 'e'
+-- characters followed by '-' as its nuke-refs marker, into every file it
+-- processes and into every output that ships Guix's build modules.  That string
+-- must never be a goonix name, so it is not reserved.  To keep the exemption
+-- sound rather than fail-open, encodeReserved bumps a placeholder's last
+-- character to 'o' when all 31 encoded characters would be 'e': no placeholder
+-- can then be that string.  The cost is that one digest shares its name with the
+-- digest encoding to e...eo, a 2^-62 collision - the same order as the collision
+-- 62 bits already allow between any two placeholders.  Tokens start with 'o',
+-- 'u' or 't' and are unaffected.  Keep in step with reserved-hash in guix/ca.scm
+-- and nukeMarker / encodeReserved in nix/libstore/ca.cc.
+nukeMarker :: ByteString
+nukeMarker = B.replicate 32 101 -- 32 'e'
 
 treeDomain, contentDomain :: ByteString
 treeDomain = "goonix-tree-v1\0"
@@ -72,7 +88,10 @@ encodeReserved digest token =
         let bit = 2 + 2 * (i - 1)
             byte = B.index digest (bit `div` 8)
         in (byte `shiftR` (6 - bit `mod` 8)) .&. 3
-  in B.pack (first : rest)
+      result = B.pack (first : rest)
+  in if not token && result == nukeMarker
+       then B.pack (B.unpack (B.take 31 result) ++ [111]) -- last char 'o'
+       else result
 
 checkOutputName :: ByteString -> Either String ()
 checkOutputName name
@@ -103,6 +122,18 @@ makePlaceholder store unresolvedBytes output name = case checkOutputName output 
           <> ":" <> output <> ":"
     in store <> "/" <> encodeReserved (sha256 (prefix <> unresolvedBytes)) False <> "-" <> name
 
+-- | The one shared predicate (C++ reservedHashPart): a reserved hash part is 32
+-- characters of the reserved alphabet, EXCEPT upstream's nuke-refs marker (see
+-- nukeMarker above), which is ordinary upstream data and never a goonix name.
+-- Every site that decides "reserved" goes through this — the path predicate,
+-- the placeholder and token checks, the refusal of reserved names in requests,
+-- and the output scan (Goonix.Store.CaBuild.checkReserved).
+reservedHashPart :: ByteString -> Bool
+reservedHashPart part =
+  B.length part == 32
+  && B.all (\c -> c `B.elem` alphabet) part
+  && part /= nukeMarker
+
 -- | A reserved path is a store path whose 32-character hash part uses only the
 -- reserved alphabet (C++ reservedPath).  C++ uses baseNameOf (the full
 -- basename, hash included), NOT storePathToName (which strips the hash).
@@ -114,7 +145,7 @@ reservedPath store path =
      && B.length path >= B.length store + 35
      && B.length base >= 34
      && B.index base 32 == 45 -- '-'
-     && B.all (\c -> c `B.elem` alphabet) hashPart
+     && reservedHashPart hashPart
 
 baseNameOf :: ByteString -> ByteString
 baseNameOf = snd . C.breakEnd (== '/')

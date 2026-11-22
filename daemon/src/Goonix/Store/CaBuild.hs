@@ -122,14 +122,15 @@ replaceWhole input from to file rejectOpaque
           , let encoded = B.concatMap (\c -> c `B.cons` B.replicate (width - 1) 0) from ]
 
 -- | Scan a byte string for an unresolved placeholder: 32 reserved-alphabet
--- characters starting with 'e' followed by '-' (C++ checkReserved).
+-- characters starting with 'e' followed by '-' (C++ checkReserved).  The shared
+-- reservedHashPart predicate exempts upstream's nuke-refs marker.
 checkReserved :: ByteString -> ByteString -> Either String ()
 checkReserved path bytes = go 0
   where
     go offset
       | offset + 33 > B.length bytes = Right ()
       | B.index bytes offset /= 101 = go (offset + 1)
-      | not (B.all (`B.elem` "eout") (B.take 32 (B.drop offset bytes))) = go (offset + 1)
+      | not (reservedHashPart (B.take 32 (B.drop offset bytes))) = go (offset + 1)
       | B.index bytes (offset + 32) /= 45 = go (offset + 1)
       | otherwise = Left ("unresolved goonix placeholder in `" ++ C.unpack path
           ++ "' at byte " ++ show offset)
