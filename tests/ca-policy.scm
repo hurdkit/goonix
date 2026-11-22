@@ -659,5 +659,69 @@ NarSize: 1234\nNarHash: sha256:~a\nReferences: \nSystem: ~a\nDeriver: ~a\n"
                             #:env-vars '(("goonixProbe" . "yes"))))))
      "goonixProbe")))
 
+(test-group "a package re-lowered from source under adopted is content-addressed"
+  ;; CA-6 gate run 9 stopped at glibc-2.41.drv:
+  ;;   input-addressed derivation depends on content/resolved-addressed
+  ;;   `...-gawk-boot0-5.3.0.drv'; mark the dependent as content-addressed too
+  ;;
+  ;; adopt.scm never adopts glibc (glibc-derivation? is a name-prefix test):
+  ;; adopt-derivation returns the derivation unchanged and
+  ;; adopt-lowered-derivation re-lowers it "content-addressed from source".
+  ;; That re-lowering runs inside the OUTER (state-parameterize
+  ;; ((%package-addressing-policy 'input)) ...), and it sets only
+  ;; %package-addressing to 'content.  lower-bag-with-addressing then OVERWRITES
+  ;; %package-addressing with (package-addressing context), which under the
+  ;; 'input policy returns 'input.  So the re-lowered glibc came out
+  ;; input-addressed over adopted (content-addressed) inputs, and the daemon
+  ;; rightly refused it -- the same class as module-import-compiled earlier.
+  ;;
+  ;; A package named glibc-* takes exactly that path.  Two earlier attempts are
+  ;; recorded so they are not repeated:
+  ;;  v1 plain trivial inputs: PASSED 68/68.  The re-lowered bag's inputs are
+  ;;     lowered inside the same 'input extent, so they stay input-addressed
+  ;;     and nothing is inconsistent.
+  ;;  v2 an already-adopted input, built eagerly: reproduced the gate's EXACT
+  ;;     refusal, but it was thrown by (build-derivations ... leaf) OUTSIDE any
+  ;;     catch, so the group aborted with zero assertions run.
+  ;; So the whole fixture runs inside one catch, and the refusal is reported as
+  ;; a failed assertion rather than killing the suite.
+  (define outcome
+    (catch #t
+      (lambda ()
+        (let* ((leaf (trivial "ca-policy-relower-leaf"
+                              #~(call-with-output-file #$output
+                                  (lambda (p) (display "LEAF" p)))))
+               (adopted-leaf
+                (parameterize ((%package-addressing-policy 'adopted)
+                               (%upstream-package?
+                                (upstream-package-set
+                                 (list->setq (list leaf %bootstrap-guile)))))
+                  (let ((d (package-derivation store leaf)))
+                    (build-derivations store (list d))
+                    d)))
+               ;; glibc-like: its input is the ADOPTED content-addressed item.
+               (glibc-like (trivial "glibc-ca-policy-relower"
+                                    #~(call-with-output-file #$output
+                                        (lambda (p)
+                                          (format p "~a/GLIBC" #$adopted-leaf))))))
+          (parameterize ((%package-addressing-policy 'adopted)
+                         (%upstream-package?
+                          (upstream-package-set
+                           (list->setq (list leaf glibc-like %bootstrap-guile)))))
+            (let ((drv (package-derivation store glibc-like)))
+              (build-derivations store (list drv))
+              (list (addressing adopted-leaf) (addressing drv))))))
+      (lambda (key . args)
+        ;; Name the refusal, so a failure cannot be mistaken for a fixture
+        ;; problem: the daemon's message is the point of this test.
+        (format #t "re-lower refused: ~a ~a~%" key args)
+        (list 'refused key))))
+  (test-assert "a glibc-like package over an adopted input lowers and builds"
+    (not (and (pair? outcome) (eq? 'refused (car outcome)))))
+  (test-equal "the adopted input is content-addressed"
+    "content" (and (pair? outcome) (car outcome)))
+  (test-equal "the re-lowered package is content-addressed, not input"
+    "content" (and (pair? outcome) (cadr outcome))))
+
 (close-connection store)
 (test-end)

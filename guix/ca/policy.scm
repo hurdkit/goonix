@@ -130,12 +130,32 @@ adopted (its binary rewritten to a content-addressed item); a flagged item or
 glibc is re-lowered content-addressed from source instead."
   (let ((context (and (pair? arguments) (car arguments))))
     (if (package? context)
-        (state-parameterize ((%package-addressing (package-addressing context))
-                             (%package-derivation-name (bag-name bag)))
-          (let ((drv (apply lower bag arguments)))
-            (if (adopt-package? context)
-                (adopt-lowered-derivation lower bag arguments drv)
-                drv)))
+        ;; goonix: glibc is never adopted (guix/ca/adopt.scm's
+        ;; glibc-derivation?), so under 'adopted lower it CONTENT-ADDRESSED
+        ;; from the start instead of lowering it input-addressed and adopting
+        ;; afterwards.
+        ;;
+        ;; The IA-then-adopt route cannot work for it: registering the
+        ;; input-addressed derivation is itself refused, because
+        ;; checkInputAddressedPolicy runs at REGISTRATION
+        ;; (nix/libstore/local-store.cc:537, ca.cc:285), not only at build
+        ;; time, and glibc's inputs have already been adopted
+        ;; (content-addressed).  Measured on CA-6's gate at glibc-2.41 over
+        ;; gawk-boot0, and pinned by tests/ca-policy.scm's re-lower group: the
+        ;; throw happens inside (package-derivation store glibc-like), before
+        ;; any build.  Skipping the build in adopt-derivation does not help,
+        ;; because the derivation is never successfully written.
+        (let ((glibc? (and (eq? (%package-addressing-policy) 'adopted)
+                           (string-prefix? "glibc" (bag-name bag)))))
+          (state-parameterize ((%package-addressing
+                                (if glibc? 'content (package-addressing context)))
+                               (%package-addressing-policy
+                                (if glibc? 'content (%package-addressing-policy)))
+                               (%package-derivation-name (bag-name bag)))
+            (let ((drv (apply lower bag arguments)))
+              (if (and (not glibc?) (adopt-package? context))
+                  (adopt-lowered-derivation lower bag arguments drv)
+                  drv))))
         (apply lower bag arguments))))
 
 (define (adopt-lowered-derivation lower bag arguments drv)
@@ -153,9 +173,22 @@ source instead."
                                        'adopt-derivation)
                            store d)))
                (if (eq? adopt d)
-                   ;; Flagged or glibc: build content-addressed from source.
+                   ;; Flagged item: build content-addressed from source.
+                   ;;
+                   ;; goonix: set the POLICY, not only %package-addressing.
+                   ;; This runs inside the outer (state-parameterize
+                   ;; ((%package-addressing-policy 'input)) ...) above, and
+                   ;; lower-bag-with-addressing OVERWRITES %package-addressing
+                   ;; with (package-addressing context), which under the 'input
+                   ;; policy returns 'input.  Setting only %package-addressing
+                   ;; therefore had no effect on a flagged item's re-lowering.
+                   ;; (glibc no longer comes through here at all: it is lowered
+                   ;; content-addressed from the start, see
+                   ;; lower-bag-with-addressing.)
                    (values (run-with-store store
-                             (state-parameterize ((%package-addressing 'content))
+                             (state-parameterize ((%package-addressing-policy
+                                                   'content)
+                                                  (%package-addressing 'content))
                                (apply lower bag arguments)))
                            store)
                    (values adopt store))))))))
