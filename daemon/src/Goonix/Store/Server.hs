@@ -283,20 +283,37 @@ dispatch config store client settingsRef rootFd rootPath clientVersion operation
     (deleted, freed) <- withCollectorGCLock (storeGcLockPath config) $ do
       roots <- findRoots store
       withOtherTemporaryRoots (temporaryRootsPath config) rootFd $ \temporary -> do
-        live <- Collector.livePaths (map snd roots ++ temporary) store
+        let rootPaths = map snd roots ++ temporary
         if action == 3
-          then Collector.deleteSpecificPaths settings live paths minFreed store rootPath
+          then do
+            live <- Collector.livePaths rootPaths store
+            Collector.deleteSpecificPaths settings live paths minFreed store rootPath
           else do
             allPaths <- queryAllValidPaths store
             case action of
-              0 -> pure (live, 0)
-              1 -> pure (filter (`notElem` live) allPaths, 0)
-              2 -> Collector.collectPaths settings live minFreed store rootPath
+              -- C++ gcReturnLive / gcReturnDead return state.alive / state.dead,
+              -- populated by canReachRoot, which honours gc-keep-outputs and
+              -- gc-keep-derivations — not just the forward closure of the roots.
+              0 -> do
+                live <- Collector.livePathsWithSettings settings rootPaths store
+                pure (live, 0)
+              1 -> do
+                live <- Collector.livePathsWithSettings settings rootPaths store
+                pure (filter (`notElem` live) allPaths, 0)
+              2 -> Collector.collectPaths settings rootPaths minFreed store rootPath
               _ -> throwIO (storeError "unsupported garbage-collection action")
     writeFrame client stderrLast
     writeSocket client (encodeStrings deleted <> encodeWord64 freed <> encodeWord64 0)
-  1 -> queryOnePath $ \_ path ->
-    encodeBool <$> isValidPath store path
+  -- C++ wopIsValidPath (nix-daemon.cc:315) is the ONE single-path op that
+  -- reads with readString + assertStorePath, NOT readStorePath: it does not
+  -- refuse reserved names, so querying a placeholder answers #f instead of
+  -- an error (the ca-grafts unrealised-placeholder tests rely on this).
+  1 -> do
+    path <- readStringSocket client
+    _ <- assertStorePath store path
+    reply <- encodeBool <$> isValidPath store path
+    writeFrame client stderrLast
+    writeSocket client reply
   4 -> queryOnePath $ \_ path -> encodeString . encodeBase16 <$> queryPathHash store path
   5 -> queryOnePath $ \_ path -> encodeStrings <$> queryReferences store path
   6 -> queryOnePath $ \_ path -> encodeStrings <$> queryReferrers store path

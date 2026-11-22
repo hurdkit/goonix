@@ -3,6 +3,7 @@
 
 module Goonix.Store.Collector
   ( livePaths
+  , livePathsWithSettings
   , GCLimitReached (..)
   , collectPaths
   , deleteSpecificPaths
@@ -11,7 +12,7 @@ module Goonix.Store.Collector
 
 import Control.Exception (Exception, IOException, SomeException, handle, throwIO, try)
 import Data.Typeable (Typeable)
-import Control.Monad (foldM, forM_, unless, when)
+import Control.Monad (filterM, foldM, forM_, unless, when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as C
@@ -24,6 +25,7 @@ import Goonix.Store.Files (deleteTree, withGCLock, announcedRoots, storeGcLockPa
 import Goonix.Store.Hash (hashDigest)
 import Goonix.Store.Nar (hashNar, hashNarSize)
 import Goonix.Store.ReadOnly
+import Goonix.Store.Records (derivationsForPath, originalsForPath, chosenPaths, queryRecordsByResolved, BuildRecord (recordPath))
 import Goonix.Store.Settings (Settings, settingBool)
 import System.IO.Error (isDoesNotExistError)
 import qualified System.Posix.Files.ByteString as Files
@@ -39,6 +41,22 @@ livePaths roots store = Set.toAscList <$> go Set.empty roots
           if not valid then go seen rest else do
             references <- queryReferences store path
             go (Set.insert path seen) (references ++ rest)
+
+-- | The live set as C++ collectGarbage computes it for gcReturnLive /
+-- gcReturnDead: every valid path that canReachRoot (which honours
+-- gc-keep-outputs and gc-keep-derivations), not just the forward closure of
+-- the roots.  With gc-keep-outputs an output whose derivation is rooted is
+-- alive even though no root references it directly.
+livePathsWithSettings :: Settings -> [ByteString] -> Store -> IO [ByteString]
+livePathsWithSettings settings roots store = do
+  paths <- queryAllValidPaths store
+  reach <- foldM step (Reachability Set.empty Set.empty) paths
+  pure (Set.toAscList (liveSet reach))
+  where
+    rootSet = Set.fromList roots
+    step reach path = do
+      (next, _) <- canReachRoot settings rootSet store reach path
+      pure next
 
 -- Memoized reverse reachability.  A path reached only through the current
 -- recursion stack is not live; a known-live incoming edge makes it live.
@@ -62,13 +80,39 @@ canReachRoot settings roots store = go
           if not valid then pure (state, False) else goIncoming state Set.empty path
     goIncoming state visited path = do
       incoming0 <- queryReferrers store path
-      derivers <- if keepOutputs then queryValidDerivers store path else pure []
-      outputs <- if keepDerivations && ".drv" `B.isSuffixOf` path
+      let db = database store
+          isDrv = ".drv" `B.isSuffixOf` path
+      -- gc-keep-outputs: an output is alive if any deriver is alive.  Beyond the
+      -- historical derivers (queryValidDerivers), goonix keeps every derivation
+      -- whose build records name the output (derivationsForPath) and every
+      -- original derivation whose choice names it (originalsForPath) — so rooting
+      -- the ORIGINAL derivation keeps a CA output whose historical deriver is the
+      -- resolved one (C++ gc.cc:510-523).
+      derivers <- if keepOutputs
+        then do
+          vd <- queryValidDerivers store path
+          rd <- derivationsForPath db path
+          od <- originalsForPath db path
+          rdValid <- filterM (isValidPath store) rd
+          odValid <- filterM (isValidPath store) od
+          pure (vd ++ rdValid ++ odValid)
+        else pure []
+      -- gc-keep-derivations: a derivation is alive if any of its outputs is alive.
+      -- Beyond the historical output:ID rows (queryDerivationOutputs filtered to
+      -- those whose deriver is this drv), goonix keeps the chosen outputs
+      -- (chosenPaths) and the outputs of the resolved derivation's build facts
+      -- (queryRecordsByResolved) — CA output paths are not historical rows
+      -- (C++ gc.cc:501-506, 528-535).
+      outputs <- if keepDerivations && isDrv
         then do
           candidates <- queryDerivationOutputs store path
           valid <- mapM (isValidPath store) candidates
           actualDerivers <- mapM (queryDeriver store) candidates
-          pure [candidate | (candidate, True, deriver) <- zip3 candidates valid actualDerivers, deriver == path]
+          let historical = [candidate | (candidate, True, deriver) <- zip3 candidates valid actualDerivers, deriver == path]
+          chosen <- chosenPaths db path >>= filterM (isValidPath store)
+          records <- queryRecordsByResolved db path
+          recValid <- filterM (isValidPath store) (map recordPath records)
+          pure (historical ++ chosen ++ recValid)
         else pure []
       walk state (Set.insert path visited) path (filter (/= path) (incoming0 ++ derivers ++ outputs))
     walk state visited _ [] = pure (state { deadSet = Set.union (deadSet state) visited }, False)

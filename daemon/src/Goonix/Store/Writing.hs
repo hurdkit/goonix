@@ -24,7 +24,7 @@ import qualified Data.Int
 import Data.Word (Word64)
 import Goonix.Store.Base32 (encodeBase16, encodeBase32)
 import Goonix.Store.Ca (goonixAddressed, resolvedDerivation)
-import Goonix.Store.CaBuild (checkGoonixDerivationOutputs)
+import Goonix.Store.CaBuild (checkGoonixDerivationOutputs, checkInputAddressedPolicy)
 import Goonix.Store.Database
 import Goonix.Store.Derivation (parseDerivation, outputs, outputPath, outputHash, parseHashInfo, environment)
 import Goonix.Store.Files
@@ -132,9 +132,18 @@ registerPath store path (Hash algorithm digest) size references deriver = do
           -- derivation's output paths must match their placeholder/token/fixed identity
           -- and its environment the logical token; a malformed CA derivation is refused
           -- and the registration rolled back.
-          when (goonixAddressed (Map.lookup "goonixAddressing" (environment derivation))
-                || resolvedDerivation (Map.lookup "goonixResolved" (environment derivation))) $
-            either (throwIO . storeError) pure (checkGoonixDerivationOutputs (storeDirectory store) path derivation)
+          if (goonixAddressed (Map.lookup "goonixAddressing" (environment derivation))
+                || resolvedDerivation (Map.lookup "goonixResolved" (environment derivation)))
+            then either (throwIO . storeError) pure (checkGoonixDerivationOutputs (storeDirectory store) path derivation)
+            -- goonix: C++ registerValidPaths (local-store.cc:1001) runs
+            -- checkInputAddressedPolicy for a non-CA derivation at registration,
+            -- so an input-addressed derivation with a CA input is refused before
+            -- any build (the ca-sharing mixed-policy case).
+            else checkInputAddressedPolicy derivation $ \input -> do
+              inputValid <- isValidPath store input
+              if not inputValid then pure Nothing else do
+                inputBytes <- B.readFile (C.unpack input)
+                pure (either (const Nothing) Just (parseDerivation inputBytes))
           forM_ (Map.elems (outputs derivation)) $ \output ->
             unless (B.null (outputHash output)) $ do
               (_, algorithm, digest) <- either (throwIO . storeError) pure (parseHashInfo output)
