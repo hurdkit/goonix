@@ -795,5 +795,69 @@ NarSize: 1234\nNarHash: sha256:~a\nReferences: \nSystem: ~a\nDeriver: ~a\n"
           '() (map (lambda (d) (basename (derivation-file-name d)))
                    from-source))))))
 
+(test-group "an input-addressed request over adopted inputs is corrected"
+  ;; CA-6 gate, narrow glibc scope (699dc449953): the daemon refused
+  ;;   input-addressed derivation depends on content/resolved-addressed
+  ;;   `…-gawk-boot0-5.3.0.drv'; mark the dependent as content-addressed too
+  ;; while writing file-5.46.drv.
+  ;;
+  ;; Measured with a backtrace probe inside `derivation` (before the write,
+  ;; since the refusal happens inside add-data-to-store): the caller is an
+  ;; ordinary NESTED PACKAGE lowering - package->derivation -> bag->derivation
+  ;; -> expand-input -> package->derivation, three levels, all in
+  ;; guix/packages.scm - not a gexp compiler, lower-object or a graft.  At the
+  ;; leaking lowering the parameters were
+  ;;   POLICY=adopted MARK=input NAMEPARAM=#f addressing=input
+  ;; i.e. a gexp whose requested kind stayed 'input while its inputs had
+  ;; already been lowered content-addressed.
+  ;;
+  ;; gexp-addressing re-decided the kind from the ACTUAL inputs only under
+  ;; 'mixed; under 'adopted it returned the request unchanged.  The wide glibc
+  ;; scope hid this because the policy inside glibc's extent was 'content, so
+  ;; those gexps were content-addressed by the policy clause anyway.
+  ;;
+  ;; So 'adopted needs the same input-based correction 'mixed has.  An explicit
+  ;; #:addressing #f ("no override", used by grafts over input-addressed
+  ;; derivations) must still be honoured - that is asserted here too.
+  (let* ((leaf (trivial "ca-policy-stale-input-leaf"
+                        #~(call-with-output-file #$output
+                            (lambda (p) (display "LEAF" p))))))
+    (parameterize ((%package-addressing-policy 'adopted)
+                   (%upstream-package?
+                    (upstream-package-set
+                     (list->setq (list leaf %bootstrap-guile)))))
+      (let* ((adopted-leaf (package-derivation store leaf))
+             (_ (build-derivations store (list adopted-leaf)))
+             ;; An explicit 'input request over an ADOPTED input: the stale
+             ;; request the gate hit.  The daemon refuses the WRITE, so catch
+             ;; it here: an uncaught throw aborts the whole suite instead of
+             ;; recording a FAIL (the same lesson as the re-lower group).
+             (outcome
+              (catch #t
+                (lambda ()
+                  (let ((drv (run-with-store store
+                               (gexp->derivation "ca-policy-stale-input-top"
+                                 #~(call-with-output-file #$output
+                                     (lambda (p)
+                                       (format p "~a/TOP" #$adopted-leaf)))
+                                 #:addressing 'input))))
+                    (build-derivations store (list drv))
+                    (addressing drv)))
+                (lambda (key . args)
+                  (format #t "stale-input refused: ~a ~a~%" key args)
+                  'refused))))
+        (test-equal "the adopted input is content-addressed"
+          "content" (addressing adopted-leaf))
+        (test-equal "an 'input request over adopted inputs becomes content"
+          "content" outcome)
+        ;; The no-override case must NOT be swept up by the correction.
+        (test-equal "#:addressing #f still stays input-addressed under adopted"
+          #f
+          (addressing
+           (run-with-store store
+             (gexp->derivation "ca-policy-stale-input-no-override"
+                               #~(mkdir #$output)
+                               #:addressing #f))))))))
+
 (close-connection store)
 (test-end)

@@ -311,8 +311,27 @@ input-addressed derivation (a graft, say) leaves its derivation upstream's."
       (every (lambda (path) (not (placeholder-path? path))) references)))
 
 (define (gexp-addressing requested guile inputs graphs allowed disallowed)
-  "Choose REQUESTED using the actual lowered inputs and reference paths."
-  (if (not (eq? (%package-addressing-policy) 'mixed))
+  "Choose REQUESTED using the actual lowered inputs and reference paths.
+
+goonix: 'adopted needs this as much as 'mixed.  A gexp can be lowered with a
+requested 'input while its inputs have already been adopted (content- or
+resolved-addressed); the daemon refuses to REGISTER such a derivation
+(checkInputAddressedPolicy runs at registration, not only at build time), so
+the kind has to be re-decided from the actual inputs here.
+
+Measured on CA-6's gate with the narrow glibc scope (699dc449953): writing
+file-5.46.drv was refused over an adopted gawk-boot0.  A backtrace probe inside
+`derivation` named the caller as an ordinary nested package lowering
+(package->derivation -> bag->derivation -> expand-input -> package->derivation)
+and showed POLICY=adopted MARK=input NAMEPARAM=#f addressing=input at the
+leaking lowering.  The wide glibc scope hid the hole because the policy inside
+glibc's extent was 'content, so the policy clause in gexp-with-addressing made
+those gexps content-addressed anyway.
+
+An explicit #:addressing #f means \"no override\" and arrives here as #f, not
+as 'input (gexp-with-addressing keeps it), so a graft over an input-addressed
+derivation is untouched by the correction below."
+  (if (not (memq (%package-addressing-policy) '(mixed adopted)))
       requested
       (if (and (memq requested '(input mixed))
                (or (not (gexp-inputs-input-addressed? guile inputs graphs))
