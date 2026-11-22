@@ -495,6 +495,66 @@ static void checkSiblingAlreadyFinal(const Path & root)
             "the sibling's final path and the self reference are both correct");
 }
 
+/* goonix: the SAME sibling present both as its token and as its final path.
+
+   Reviewer, 2026-11-22, on 356945478fc: that fix selected per SIBLING, not per
+   occurrence, so the mixed case was expected to fail the inverse check again.
+   MEASURED: it does not.  On 356945478fc this fixture printed refused=0.
+
+   The reason is that scanForReferences cannot see a reserved name at all
+   (RefScanSink's search rejects every byte outside nix's base32 alphabet, and
+   goonix tokens use the disjoint 'eout' alphabet; probe: tokens=1 present=0).
+   So that selection was always empty and no sibling was ever reversed.
+
+   What is correct here, stated explicitly: after the sibling loop every
+   occurrence of that sibling in the tree is its FINAL path — the token one was
+   rewritten, the already-final one was left alone — and `built` is hashed from
+   that tree.  Finalisation's job is exactly to leave no token behind, so the
+   output must finalise with both occurrences final.  This test pins that, and
+   pins that no token survives. */
+static void checkSiblingMixedForms(const Path & root)
+{
+    configureIsolatedStore(root);
+    LocalStore store(false);
+    createDirs(settings.nixStore);
+    Path libToken = tokenPath("lib", "sibmixed-lib");
+    createDirs(libToken);
+    writeFile(libToken + "/payload", "library");
+    PathSet references;
+    Hash narHash;
+    uint64_t narSize = 0;
+    Path libFinal = finaliseContentOutput(store, libToken, "lib", "sibmixed-lib",
+        PathSet{libToken}, references, narHash, narSize);
+    Path outToken = tokenPath("out", "sibmixed-out");
+    createDirs(outToken);
+    /* One file holds the token, another holds the same sibling's final path. */
+    writeFile(outToken + "/from-builder", libToken);
+    writeFile(outToken + "/from-graft", libFinal);
+    references.clear();
+    bool refused = false;
+    std::string message;
+    Path outFinal;
+    try {
+        outFinal = finaliseContentOutput(store, outToken, "out", "sibmixed-out",
+            PathSet{outToken, libToken, libFinal}, references, narHash, narSize,
+            std::map<Path, Path>{{libToken, libFinal}});
+    } catch (const Error & e) {
+        refused = true;
+        message = e.what();
+    }
+    std::cout << "sibmixed: refused=" << refused << " message=" << message << '\n';
+    check(!refused,
+        "a sibling present as both token and final is finalised, not refused");
+    if (!refused) {
+        check(readFile(outFinal + "/from-builder") == libFinal,
+            "the token occurrence becomes the sibling's final path");
+        check(readFile(outFinal + "/from-graft") == libFinal,
+            "the already-final occurrence stays the sibling's final path");
+        check(references.count(libFinal) == 1,
+            "the sibling is registered once as a reference");
+    }
+}
+
 static void checkFinalRootBeforeExistence(const Path & root)
 {
     configureIsolatedStore(root);
@@ -946,6 +1006,10 @@ int main(int argc, char ** argv)
     }
     if (argc == 3 && string(argv[1]) == "--sibling-already-final") {
         checkSiblingAlreadyFinal(argv[2]);
+        return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+    if (argc == 3 && string(argv[1]) == "--sibling-mixed-forms") {
+        checkSiblingMixedForms(argv[2]);
         return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }
     if (argc == 3 && string(argv[1]) == "--existing-item") {
