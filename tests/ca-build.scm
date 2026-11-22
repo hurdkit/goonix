@@ -535,5 +535,86 @@
     (build-derivations store (list one two))
     (string=? (realised one) (realised two))))
 
+(test-group "upstream's nuke-refs marker is not a goonix reserved name"
+  ;; Upstream's remove-store-references (guix/build/utils.scm) writes the
+  ;; constant "/gnu/store/<32 e's>-" into every file it processes, and every
+  ;; output shipping guix/build/utils.scm or .go carries that literal.  It
+  ;; must NOT be treated as an unresolved placeholder: it is ordinary
+  ;; upstream data.  Sound because no goonix name can be 32 e's — a
+  ;; placeholder whose 31 encoded characters would all be 'e' has its last
+  ;; character bumped to 'o' (see reserved-hash / encodeReserved).
+  (define nuke-marker
+    (string-append (%store-prefix) "/" (make-string 32 #\e) "-foo"))
+
+  (test-assert "the marker is not a reserved path"
+    (not (or (placeholder-path? nuke-marker)
+             (token-store-path? nuke-marker))))
+
+  (test-assert "a CA output containing the marker builds and registers"
+    (let* ((drv (shell-drv (fresh-name "ca-nuke-literal")
+                           (write-output nuke-marker)))
+           (out (begin (build-derivations store (list drv)) (realised drv))))
+      (and (valid-path? store out)
+           (string-contains (read-all out) nuke-marker))))
+
+  (test-assert "a CA output written THROUGH remove-store-references builds"
+    ;; The real path by which the marker enters outputs: a file holding a
+    ;; genuine store reference is nuked, leaving 32 e's in the result.  The
+    ;; nuke pattern is reproduced in the builder from upstream's own
+    ;; definition rather than imported: the builder runs BOOTSTRAP guile 2.0,
+    ;; whose module tree does not carry our guix/build/utils.scm, and the
+    ;; source tree is not in the build sandbox.  The constant written is
+    ;; upstream's, byte for byte (guix/build/utils.scm:1329).
+    (let* ((dep (shell-drv (fresh-name "ca-nuke-dep") (write-output "DEP")))
+           (dep-out (begin (build-derivations store (list dep)) (realised dep)))
+           (script
+            (string-append
+             "(call-with-output-file out (lambda (p) (display "
+             (object->string dep-out) " p)))\n"
+             ;; Upstream's substitution: prefix + slash + 32 hash chars + hyphen
+             ;; becomes prefix + slash + 32 e's + hyphen.
+             "(let* ((text (call-with-input-file out read-all))\n"
+             "       (at (string-rindex text #\\/))\n"
+             "       (nuked (string-append (substring text 0 (+ at 1))\n"
+             "                            (make-string 32 #\\e)\n"
+             "                            (substring text (+ at 33)))))\n"
+             "  (call-with-output-file out (lambda (p) (display nuked p))))\n"))
+           (drv (shell-drv (fresh-name "ca-nuke-refs") script))
+           (out (begin (build-derivations store (list drv)) (realised drv))))
+      (and (valid-path? store out)
+           (string-contains (read-all out) (make-string 32 #\e)))))
+
+  ;; A reserved path embedded WHOLE in the builder is refused earlier, as an
+  ;; invalid input path.  To exercise the output SCAN the string is assembled
+  ;; in the builder from two halves, exactly as the existing "reserved
+  ;; placeholder read boundaries" group does.  The point stands: the exemption
+  ;; is exactly the 32-e string and weakens nothing else.
+  (define (split-reserved path)
+    (let ((at (+ 1 (string-rindex path #\/))))
+      (string-append
+       "(call-with-output-file out (lambda (p) (display (string-append "
+       (object->string (substring path 0 at)) " "
+       (object->string (substring path at)) ") p)))")))
+
+  (let* ((input (shell-drv (fresh-name "ca-nuke-real-input")
+                           (write-output "A")))
+         (real-placeholder (placeholder (derivation->bytevector input)
+                                        "out" "ca-nuke-real-input")))
+    (test-equal "a REAL unresolved placeholder in an output still fails"
+      "unresolved goonix placeholder"
+      (build-fails-with? (shell-drv (fresh-name "ca-nuke-real")
+                                    (split-reserved real-placeholder))
+                         "unresolved goonix placeholder")))
+
+  (let ((near (string-append (%store-prefix) "/"
+                             (make-string 31 #\e) "o-foo")))
+    (test-assert "e...eo is a placeholder path"
+      (placeholder-path? near))
+    (test-equal "a placeholder one character off the marker is still refused"
+      "unresolved goonix placeholder"
+      (build-fails-with? (shell-drv (fresh-name "ca-nuke-near")
+                                    (split-reserved near))
+                         "unresolved goonix placeholder"))))
+
 (close-connection store)
 (test-end)

@@ -61,12 +61,12 @@ Lock and inspect the flake in the current directory.\n"))
   (display (G_ "The valid values for COMMAND are:\n"))
   (newline)
   (display (G_ "\
-   lock             resolve the inputs and write flake.lock; nothing of the
+   lock             resolve the inputs and write guix.lock; nothing of the
                     flake or of its inputs is evaluated\n"))
   (display (G_ "\
    update [INPUT]...
                     resolve anew all inputs, or those named, and write
-                    flake.lock\n"))
+                    guix.lock\n"))
   (display (G_ "\
    metadata         print the lock that is in effect: every tree, and why
                     each input points where it does\n"))
@@ -381,7 +381,7 @@ are about; it must hold a flake.scm."
 (define (flake-lock-command opts update)
   (let ((directory (flake-directory opts)))
     (unless (null? (flake-overrides-from-opts opts))
-      (leave (G_ "an override is for one run and never goes into flake.lock; \
+      (leave (G_ "an override is for one run and never goes into guix.lock; \
 give it to the command that is to use it, or put it in flake.local.scm~%")))
     (lock-flake directory #:update update)
     ;; What flake.local.scm redirects is resolved again as well.
@@ -389,7 +389,7 @@ give it to the command that is to use it, or put it in flake.local.scm~%")))
                  (equal? update '()))
       (unless (null? (read-local-overrides directory))
         (effective-flake-lock directory #:update? #t)))
-    (format #t "~a~%" (string-append directory "/flake.lock"))))
+    (format #t "~a~%" (string-append directory "/guix.lock"))))
 
 (define (flake-check store opts)
   "Evaluate every output of the flake of OPTS and build its checks.  With

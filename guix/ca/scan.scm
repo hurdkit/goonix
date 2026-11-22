@@ -12,6 +12,8 @@
 (define-module (guix ca scan)
   #:use-module (srfi srfi-1)
   #:use-module (srfi srfi-9)
+  #:use-module (srfi srfi-13)
+  #:use-module (srfi srfi-14)
   #:use-module (srfi srfi-34)
   #:use-module (ice-9 binary-ports)
   #:use-module (ice-9 ftw)
@@ -127,11 +129,12 @@
 ;; UTF-16LE), the right context, and the left context of a window.
 (define %retained 127)
 
-(define* (scan-bytes hash bytes
-                     #:optional (from 0) (to (bytevector-length bytes)))
-  "Count the self references in BYTES that end after offset FROM and not
-after offset TO.  Return an alist with the keys full, fragments and utf16.
-Every occurrence counts, also one that overlaps the one before."
+(define (scan-bytes/sweeps hash bytes from to)
+  "The straightforward reading of the self-reference rules: one
+'string-contains' sweep per needle — the whole hash, its 25 eight-character
+windows and its UTF-16LE encoding.  Kept as the reference the single-pass
+scanner below is measured against (tests/ca-scan.scm); it is 27 passes over
+every chunk, which is what made a full closure scan slow."
   (define text (latin1 bytes))
   (define hash-text (latin1 hash))
   (define (owned needle)
@@ -144,6 +147,191 @@ Every occurrence counts, also one that overlaps the one before."
   (list (cons 'full (length (owned hash-text)))
         (cons 'fragments (apply + (map fragments (iota 25))))
         (cons 'utf16 (length (owned (latin1 (utf16-le-bytes hash)))))))
+
+;; The hash's 8-byte windows, keyed by the window's bytes as an exact
+;; integer.  A window of the content can only be one of the hash's windows if
+;; it is in this table, so the table answers "which offsets does this window
+;; match" without a search per offset.  A hash with repeated windows maps one
+;; key to several offsets and each counts, as the per-offset sweeps counted
+;; each.
+(define (window-value bytes start)
+  "The 8 bytes at START of BYTES as an exact integer, most significant first.
+A fixnum on a 64-bit Guile, so the table lookup stays out of the bignum
+path."
+  (let loop ((index 0) (key 0))
+    (if (= index 8)
+        key
+        (loop (+ index 1)
+              (logior (ash key 8)
+                      (bytevector-u8-ref bytes (+ start index)))))))
+
+(define (hash-window-table hash)
+  (let ((table (make-hash-table 32)))
+    (let loop ((offset 0))
+      (when (<= offset 24)
+        (let ((key (window-value hash offset)))
+          (hashv-set! table key (cons offset (hashv-ref table key '()))))
+        (loop (+ offset 1))))
+    table))
+
+(define (bytes-equal? bytes start needle)
+  "Whether the (length NEEDLE) bytes at START of BYTES are NEEDLE.  False
+when they would run past either end, as the string comparison was."
+  (let ((size (bytevector-length needle)))
+    (and (>= start 0)
+         (<= (+ start size) (bytevector-length bytes))
+         (let loop ((index 0))
+           (or (= index size)
+               (and (= (bytevector-u8-ref bytes (+ start index))
+                       (bytevector-u8-ref needle index))
+                    (loop (+ index 1))))))))
+
+(define (window-anchor-set hash-text)
+  "A set of characters that every 8-character window of HASH-TEXT contains at
+least one of.  A search of the content for that SET therefore finds every
+place a window of the hash can end, in one C pass, and the set is kept small
+so that pass has few hits.
+
+Greedy: the window with the fewest candidate characters left is covered
+first, by its rarest character in the hash.  A character covers the windows
+it lies in, so 4 characters always suffice (windows 0..7, 8..15, 16..23,
+24..31 partition the hash) and a repeated-character hash needs fewer.  The
+choice cannot change the result: it only decides which positions are
+examined, and every window is examined at least once."
+  (let ((positions (make-vector 256 '()))
+        (covered (make-vector 25 #f)))
+    (let loop ((index 0))
+      (when (< index 32)
+        (let ((byte (char->integer (string-ref hash-text index))))
+          (vector-set! positions byte (cons index (vector-ref positions byte))))
+        (loop (+ index 1))))
+    (let pick ((chosen '()))
+      (let ((open (filter (lambda (offset) (not (vector-ref covered offset)))
+                          (iota 25))))
+        (if (null? open)
+            (list->char-set (map integer->char chosen))
+            ;; The rarest character among those lying in an uncovered window,
+            ;; preferring one that covers the most uncovered windows.
+            (let loop ((byte 0) (best #f) (best-score #f))
+              (if (= byte 256)
+                  (let ((covers (filter (lambda (offset)
+                                          (any (lambda (at)
+                                                 (and (<= offset at)
+                                                      (< at (+ offset 8))))
+                                               (vector-ref positions best)))
+                                        open)))
+                    (for-each (lambda (offset) (vector-set! covered offset #t))
+                              covers)
+                    (pick (cons best chosen)))
+                  (let* ((at (vector-ref positions byte))
+                         (hits (count (lambda (offset)
+                                        (any (lambda (position)
+                                               (and (<= offset position)
+                                                    (< position (+ offset 8))))
+                                             at))
+                                      open))
+                         ;; More uncovered windows first, then rarer in the
+                         ;; hash (fewer occurrences means fewer hits).
+                         (score (and (> hits 0) (cons hits (- (length at))))))
+                    (if (and score
+                             (or (not best-score)
+                                 (> (car score) (car best-score))
+                                 (and (= (car score) (car best-score))
+                                      (> (cdr score) (cdr best-score)))))
+                        (loop (+ byte 1) byte score)
+                        (loop (+ byte 1) best best-score))))))))))
+
+(define* (scan-bytes hash bytes
+                     #:optional (from 0) (to (bytevector-length bytes)))
+  "Count the self references in BYTES that end after offset FROM and not
+after offset TO.  Return an alist with the keys full, fragments and utf16.
+Every occurrence counts, also one that overlaps the one before.
+
+One pass over the content, not one 'string-contains' sweep per needle.  The
+pass is a search for a SINGLE character of the hash, done by 'string-index'
+in C; every 8-byte window of the hash contains that character or another, so
+each window that ends in the content ends at or before one of those hits.
+At a hit the at most 25 windows covering it are looked up in the hash's
+window table by their bytes, and each match is settled by comparing the
+whole hash once at the alignment that would cover it — the comparison the
+per-offset sweep made after searching the whole text for the window.  It
+reads the bytes AROUND the window, which is why a chunk leaves
+%RIGHT-CONTEXT bytes undecided: the covering hash may end up to 24 bytes
+later.
+
+The whole hash and its UTF-16LE encoding are found by their own C searches,
+one each, instead of being recounted per window."
+  (let* ((size (bytevector-length bytes))
+         (text (latin1 bytes))
+         (hash-text (latin1 hash))
+         (windows (hash-window-table hash))
+         (utf16 (utf16-le-bytes hash))
+         (anchor (window-anchor-set hash-text))
+         (full 0) (fragments 0) (utf16-count 0))
+    (define (owned? end) (and (> end from) (<= end to)))
+    ;; Whole hashes: one C search, every occurrence, overlapping included.
+    (let loop ((start 0))
+      (let ((at (string-contains text hash-text start)))
+        (when at
+          (when (owned? (+ at 32)) (set! full (+ full 1)))
+          (loop (+ at 1)))))
+    ;; The hash in UTF-16LE: one C search over the same text.
+    (let ((needle (latin1 utf16)))
+      (let loop ((start 0))
+        (let ((at (string-contains text needle start)))
+          (when at
+            (when (owned? (+ at 64)) (set! utf16-count (+ utf16-count 1)))
+            (loop (+ at 1))))))
+    ;; Fragments: walk the hits of the anchor set.  A window ending at END
+    ;; that matches the hash contains an anchor character, so END is within 8
+    ;; of a hit.  Hits come in increasing order, so the candidate ends of a
+    ;; hit overlap only those of the previous few hits: remembering the
+    ;; highest end already examined is enough to examine each end once, with
+    ;; no per-byte table.  The window's LAST byte must be the last byte of one
+    ;; of the hash's windows, which one vector reference decides; only then
+    ;; are the window's 8 bytes read and compared.  In a binary almost every
+    ;; candidate is rejected by that one reference.
+    (let ((by-last (make-vector 256 '()))
+          (by-first (make-vector 256 #f)))
+      ;; Bucket the hash's windows by their last byte, and note which first
+      ;; bytes any window starts with: two vector references reject almost
+      ;; every candidate before its 8 bytes are read.
+      (let loop ((offset 0))
+        (when (<= offset 24)
+          (let ((last (bytevector-u8-ref hash (+ offset 7))))
+            (vector-set! by-last last
+                         (cons (cons (window-value hash offset) offset)
+                               (vector-ref by-last last)))
+            (vector-set! by-first (bytevector-u8-ref hash offset) #t))
+          (loop (+ offset 1))))
+      (let hit-loop ((hit (string-index text anchor 0)) (done 7))
+        (when hit
+          (let end-loop ((end (max (+ hit 1) (+ done 1)))
+                         (stop (min (+ hit 8) size)))
+            (when (<= end stop)
+              (let ((candidates (vector-ref by-last
+                                            (bytevector-u8-ref bytes (- end 1)))))
+                (when (and (pair? candidates)
+                           (vector-ref by-first
+                                       (bytevector-u8-ref bytes (- end 8)))
+                           (owned? end))
+                  (let ((key (window-value bytes (- end 8)))
+                        (window-start (- end 8)))
+                    (let try ((rest candidates))
+                      (when (pair? rest)
+                        (let ((candidate (car rest)))
+                          (when (= (car candidate) key)
+                            (unless (bytes-equal? bytes
+                                                  (- window-start (cdr candidate))
+                                                  hash)
+                              (set! fragments (+ fragments 1)))))
+                        (try (cdr rest)))))))
+              (end-loop (+ end 1) stop)))
+          (hit-loop (string-index text anchor (+ hit 1))
+                    (max done (min (+ hit 8) size))))))
+    (list (cons 'full full)
+          (cons 'fragments fragments)
+          (cons 'utf16 utf16-count))))
 
 (define* (scan-port hash port limit #:key (chunk-size (* 128 1024))
                     (count-bytes? #f))

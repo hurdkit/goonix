@@ -41,7 +41,7 @@
 ;;; Commentary:
 ;;;
 ;;; Resolving reads declarations and fetches trees.  It evaluates nothing:
-;;; 'flake.scm', 'flake.lock' and '.guix-channel' are read as data.
+;;; 'flake.scm', 'guix.lock' and '.guix-channel' are read as data.
 ;;;
 ;;; The inputs of one flake are resolved in two steps: each is fetched, then
 ;;; each is descended into.  So an input can follow any of its siblings, and
@@ -51,7 +51,7 @@
 ;;; Code:
 
 (define (lock-file directory)
-  (string-append directory "/flake.lock"))
+  (string-append directory "/guix.lock"))
 
 (define (git-origin url)
   "Return the identity of the repository at URL, without the variations of
@@ -126,7 +126,7 @@ what the tree is ('flake, 'library or 'source), the inputs it declares, and
 the S-expression of the lock it carries, or #f."
   (let ((flake   (tree-file tree "flake.scm"))
         (channel (tree-file tree ".guix-channel"))
-        (lock    (tree-file tree "flake.lock")))
+        (lock    (tree-file tree "guix.lock")))
     (values (cond (flake 'flake) (channel 'library) (else 'source))
             (cond (flake (flake-inputs (read-flake flake)))
                   (channel (channel-inputs channel))
@@ -153,7 +153,7 @@ the S-expression of the lock it carries, or #f."
   ;; For a node made for this input, what its tree declares and carries.
   (new?      entry-new? (default #f))
   (inputs    entry-inputs (default '()))
-  (carried   entry-carried (default #f))  ;the S-expression of its flake.lock
+  (carried   entry-carried (default #f))  ;the S-expression of its guix.lock
   (directory entry-directory (default #f)) ;where a local tree is, else #f
   (key       entry-key (default #f))      ;(ORIGIN . COMMIT)
   (old       entry-old (default #f))      ;the node the previous lock had
@@ -235,9 +235,9 @@ them.  OVERRIDES is an alist of names of inputs of the flake and the
                           (let ((tree (fetch-git-tree source)))
                             (values #f
                                     (read-flake-lock
-                                     (or (tree-file tree "flake.lock")
+                                     (or (tree-file tree "guix.lock")
                                          (raise (formatted-message
-                                                 (G_ "'~a' has no flake.lock")
+                                                 (G_ "'~a' has no guix.lock")
                                                  source))))))))
                      ((edge)
                       (or (flake-lock-root-edge other name)
@@ -598,7 +598,7 @@ which is not an input of the flake that says so")
 ;;;
 
 (define* (lock-flake directory #:key (update '()))
-  "Resolve the lock of the flake in DIRECTORY, keeping what its flake.lock
+  "Resolve the lock of the flake in DIRECTORY, keeping what its guix.lock
 pins unless UPDATE says otherwise (see 'resolve-flake-lock'), and write it if
 it differs from the file.  Return the lock."
   (let* ((file     (lock-file directory))
@@ -688,9 +688,9 @@ and <flake-input> records; the empty list when there is no such file."
 
 (define* (effective-flake-lock directory #:key (overrides '()) update?)
   "Return the lock that commands use for the flake in DIRECTORY: its
-flake.lock, or, when 'flake.local.scm' or OVERRIDES (an alist of names and
+guix.lock, or, when 'flake.local.scm' or OVERRIDES (an alist of names and
 <flake-input> records, which win) redirect inputs, the lock that results.
-That one is kept in the cache directory and flake.lock is left alone.  With
+That one is kept in the cache directory and guix.lock is left alone.  With
 UPDATE?, resolve the redirected inputs again."
   (let* ((directory (canonicalize-path directory))
          (file      (lock-file directory))
@@ -719,7 +719,7 @@ UPDATE?, resolve the redirected inputs again."
            (flake-lock))
           (else
            (raise (formatted-message
-                   (G_ "'~a' has inputs and no flake.lock; run 'guix flake \
+                   (G_ "'~a' has inputs and no guix.lock; run 'guix flake \
 lock'")
                    directory))))))
 

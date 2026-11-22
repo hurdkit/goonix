@@ -2,7 +2,7 @@
 
 A flake is a directory with a `flake.scm`. The file names what the project
 is made from (its inputs), and has one procedure that says what the project
-provides (its outputs). `flake.lock` pins every input, transitively.
+provides (its outputs). `guix.lock` pins every input, transitively.
 
 The first design is in `flakes-design.md`; this file describes what the code
 does. Pure evaluation of ordinary files is in `pure-evaluation.md`.
@@ -46,7 +46,7 @@ G-expression syntax (`#~`, `#$`, `#+`) and no other reader extension.
 | `(branch "B")`, `(tag "T")`, `(commit "C")` | what to take; the default branch otherwise |
 | `(as flake)`, `(as library)`, `(as source)` | what the input is used as. Unsaid, the tree decides: `flake` with a `flake.scm`, `library` with only a `.guix-channel`; a tree with neither must say |
 | `(worktree)` | for a local input: the tracked files as they are, instead of a commit |
-| `(pinned)` | the input keeps its own `flake.lock` for everything below it |
+| `(pinned)` | the input keeps its own `guix.lock` for everything below it |
 | `(inputs (THEIRS follows OURS) (THEIRS SOURCE FIELD...))` | point an input of the input at one of ours, or replace it |
 | `(options (NAME VALUE) ...)` | set options of the input's flake |
 | `(introduction (commit "C") (signer "FINGERPRINT"))` | authenticate the history from that commit, as for a channel |
@@ -98,7 +98,7 @@ is three hooks in `(guix packages)` and the module
 
 ## The lock
 
-`flake.lock` is a graph. A node is a tree: where it comes from, the commit,
+`guix.lock` is a graph. A node is a tree: where it comes from, the commit,
 the NAR SHA-256 of its tracked files, and whether its history was
 authenticated. An edge is an input of a flake: its name, the node, what it
 is used as, its options, and why it points there (`direct`, `followed`,
@@ -121,7 +121,7 @@ is used as, its options, and why it points there (`direct`, `followed`,
   `(flake-local (version 1) (inputs (NAME SOURCE FIELD...) ...))`.
   `--override-input=NAME=SPEC` does the same for one run; SPEC is a path or
   the fields of an input. The lock that results is kept in the cache
-  directory; `flake.lock` is not touched. What the flake says about the
+  directory; `guix.lock` is not touched. What the flake says about the
   input, and what follows it, stays.
 
 ## Evaluation

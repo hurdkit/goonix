@@ -40,6 +40,7 @@ MODULES +=					\
 
 SCM_TESTS +=					\
   tests/ca.scm					\
+  tests/ca-scan.scm				\
   tests/ca-build.scm				\
   tests/ca-compiler.scm				\
   tests/ca-grafts.scm				\

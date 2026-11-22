@@ -22,6 +22,8 @@
   #:use-module (ice-9 match)
   #:export (build-records
             %ca-store-directory
+            reserved-hash
+            reserved-hash-part?
             self-token
             token-path
             token-store-path?
@@ -38,6 +40,19 @@
 (define %ca-store-directory "/gnu/store")
 (define %reserved-alphabet "eout")
 
+;; Upstream's remove-store-references (guix/build/utils.scm) writes 32 #\e
+;; characters followed by #\- as its nuke-refs marker, into every file it
+;; processes and into every output that ships Guix's build modules.  That
+;; string must never be a goonix name, so it is not reserved.  To keep the
+;; exemption sound rather than fail-open, reserved-hash bumps a placeholder's
+;; last character to #\o when all 31 encoded characters would be #\e: no
+;; placeholder can then be that string.  The cost is that one digest shares
+;; its name with the digest encoding to e...eo, a 2^-62 collision - the same
+;; order as the collision 62 bits already allow between any two placeholders.
+;; Tokens start with #\o, #\u or #\t and are unaffected.  Keep in step with
+;; encodeReserved in nix/libstore/ca.cc.
+(define %nuke-refs-marker (make-string 32 #\e))
+
 (define (reserved-hash digest self?)
   "Encode 62 digest bits, with a self-token discriminator in character zero."
   (when (< (bytevector-length digest) 8)
@@ -50,13 +65,29 @@
                      #\e))
     (let loop ((index 1))
       (if (= index 32)
-          result
+          (begin
+            ;; Never produce upstream's nuke-refs marker (see above).
+            (when (and (not self?) (string=? result %nuke-refs-marker))
+              (string-set! result 31 #\o))
+            result)
           (let* ((bit (+ 2 (* 2 (- index 1))))
                  (byte (bytevector-u8-ref digest (quotient bit 8)))
                  (shift (- 6 (modulo bit 8)))
                  (value (logand (ash byte (- shift)) 3)))
             (string-set! result index (string-ref %reserved-alphabet value))
             (loop (+ index 1)))))))
+
+(define (reserved-hash-part? part)
+  "The one shared predicate: PART is a reserved hash part when it is 32
+characters of the reserved alphabet, EXCEPT upstream's nuke-refs marker,
+which is ordinary upstream data and never a goonix name."
+  (and (string? part)
+       (= 32 (string-length part))
+       (not (string=? part %nuke-refs-marker))
+       (string-every (lambda (character)
+                       (string-index %reserved-alphabet character))
+                     part)
+       #t))
 
 (define (valid-name? name)
   (and (string? name)
@@ -109,9 +140,7 @@
        (let ((base (basename path)))
          (and (> (string-length base) 33)
               (char=? #\- (string-ref base 32))
-              (string-every (lambda (character)
-                              (string-index %reserved-alphabet character))
-                            (string-take base 32))
+              (reserved-hash-part? (string-take base 32))
               (valid-name? (string-drop base 33))
               (list (string-take base 32) (string-drop base 33))))))
 

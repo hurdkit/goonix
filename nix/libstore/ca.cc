@@ -23,6 +23,19 @@ static const string alphabet = "eout";
 static const string treeDomain("goonix-tree-v1\0", 15);
 static const string contentDomain("goonix-content-v1\0", 18);
 
+/* Upstream's remove-store-references (guix/build/utils.scm) writes 32 'e'
+   characters followed by '-' as its nuke-refs marker, into every file it
+   processes and into every output that ships Guix's build modules.  That
+   string must never be a goonix name, so it is not reserved.  To keep the
+   exemption sound rather than fail-open, encodeReserved bumps a
+   placeholder's last character to 'o' when all 31 encoded characters would
+   be 'e': no placeholder can then be that string.  The cost is that one
+   digest shares its name with the digest encoding to e...eo, a 2^-62
+   collision - the same order as the collision 62 bits already allow between
+   any two placeholders.  Tokens start with 'o', 'u' or 't' and are
+   unaffected.  Keep in step with reserved-hash in guix/ca.scm. */
+static const string nukeMarker(32, 'e');
+
 static string encodeReserved(const Hash & digest, bool token)
 {
     string result(32, 'e');
@@ -31,6 +44,8 @@ static string encodeReserved(const Hash & digest, bool token)
         unsigned bit = 2 + 2 * (i - 1);
         result[i] = alphabet[(digest.hash[bit / 8] >> (6 - bit % 8)) & 3];
     }
+    if (!token && result == nukeMarker)
+        result[31] = 'o';
     return result;
 }
 
@@ -65,13 +80,23 @@ Path makePlaceholder(const string & unresolvedBytes, const string & output,
         + "-" + name;
 }
 
+/* The one shared predicate: a reserved hash part is 32 characters of the
+   reserved alphabet, EXCEPT upstream's nuke-refs marker (see nukeMarker
+   above), which is ordinary upstream data and never a goonix name. */
+static bool reservedHashPart(std::string_view part)
+{
+    return part.size() == 32
+        && part.find_first_not_of(alphabet) == string::npos
+        && part != nukeMarker;
+}
+
 static bool reservedPath(const Path & path)
 {
     if (!isStorePath(path) || path.size() < settings.nixStore.size() + 35)
         return false;
     auto base = baseNameOf(path);
     if (base.size() < 34 || base[32] != '-') return false;
-    return base.substr(0, 32).find_first_not_of(alphabet) == string::npos;
+    return reservedHashPart(base.substr(0, 32));
 }
 
 bool isReservedStorePath(const Path & path) { return reservedPath(path); }
@@ -499,13 +524,19 @@ void checkRewriteForTest(const Path & path, const string & from, const string & 
     rewriteRegularFile(path, from, to, 0444);
 }
 
+string encodeReservedForTest(const Hash & digest, bool token)
+{
+    return encodeReserved(digest, token);
+}
+
 static void checkReserved(const Path & path, const string & bytes)
 {
     /* The normal reference scanner only knows base32 hashes.  Reserved
-       paths deliberately use the other alphabet, so scan for them here. */
+       paths deliberately use the other alphabet, so scan for them here.
+       The shared predicate exempts upstream's nuke-refs marker. */
     for (size_t offset = 0; offset + 33 <= bytes.size(); ++offset) {
         if (bytes[offset] != 'e') continue;
-        if (bytes.substr(offset, 32).find_first_not_of(alphabet) != string::npos)
+        if (!reservedHashPart(std::string_view(bytes).substr(offset, 32)))
             continue;
         if (bytes[offset + 32] != '-') continue;
         throw BuildError(std::format("unresolved goonix placeholder in `{}' at byte {}",

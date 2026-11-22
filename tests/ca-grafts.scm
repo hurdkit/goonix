@@ -15,6 +15,7 @@
              (guix ca policy)
              (guix derivations)
              (guix monads)
+             (guix build-system trivial)
              (gnu packages bootstrap)
              (ice-9 match)
              (ice-9 textual-ports)
@@ -184,6 +185,154 @@
                     (placeholder-path? (derivation->output-path grafted))
                     (not (token-store-path?
                            (realised-output-path store grafted "out"))))))))))
+
+(test-group "a graft over an unrealised reserved output does not query it"
+  ;; A resolved or opaque package lowered under 'content has PLACEHOLDER
+  ;; outputs until the daemon finalises them.  Computing its graft used to
+  ;; call non-self-references, which asked the daemon for the references of
+  ;; those placeholders; the store error made upstream's fallback try to
+  ;; BUILD the derivation, sending the placeholder to the daemon, which
+  ;; refuses reserved paths (assertNotReserved) and DROPS the connection.
+  ;; The goonix hook must skip reserved outputs when READING, and realise
+  ;; DRV by its .drv name when references are needed.  Before the fix this
+  ;; group died with SIGPIPE (the daemon dropped the connection); after it,
+  ;; the graft is computed and the connection is still usable.
+  (define (content-package name)
+    (package
+      (name name)
+      (version "1")
+      (source #f)
+      (build-system trivial-build-system)
+      (arguments
+       (list #:guile %bootstrap-guile
+             #:builder #~(call-with-output-file #$output
+                           (lambda (p) (display "PAYLOAD" p)))))
+      (synopsis "CA graft placeholder test")
+      (description "CA graft placeholder test")
+      (home-page #f)
+      (license #f)))
+  (let* ((pkg (content-package (fresh-name "ca-graft-unrealised")))
+         (drv (parameterize ((%package-addressing-policy 'content))
+                (package-derivation store pkg))))
+    (test-assert "the package's output is an unrealised placeholder"
+      (and (placeholder-path? (derivation->output-path drv))
+           (not (valid-path? store (derivation->output-path drv)))))
+    (test-assert "the goonix hook reports the reserved output"
+      (and (pair? (goonix-unrealised-outputs drv (derivation-output-names drv)))
+           (not (goonix-unrealised-outputs
+                 drv '()))))
+    (test-assert "reading references realises DRV rather than querying a placeholder"
+      ;; The helper builds DRV by its .drv file name, so afterwards the
+      ;; realised output is a real store item and no reserved path was ever
+      ;; sent to the daemon.
+      (let ((refs (goonix-references-of-realised
+                   store drv (derivation-output-names drv))))
+        (and (list? refs)
+             (not (any (lambda (ref)
+                         (or (placeholder-path? ref)
+                             (token-store-path? ref)))
+                       refs))
+             (let ((path (goonix-realised-output-path store drv "out")))
+               (and path (not (placeholder-path? path)))))))
+    ;; The graft itself: this is the call that used to kill the connection.
+    ;; A real graft pair, so the rewriting path is exercised rather than a
+    ;; no-op short circuit.
+    (test-assert "computing the graft over the placeholder succeeds"
+      (let ((orig (plain-drv (fresh-name "graft-orig") "ORIG"))
+            (repl (plain-drv (fresh-name "graft-repl") "REPL")))
+        (build-derivations store (list orig repl))
+        (derivation? (graft-derivation store drv
+                       (list (graft (origin orig) (replacement repl)))
+                       #:guile guile-drv))))
+    (test-assert "the connection is still usable afterwards"
+      (valid-path? store (derivation->output-path guile-drv)))))
+
+(test-group "an unrealised package is still grafted through its inputs"
+  ;; The security property: a 'content package P whose input D has a
+  ;; replacement D* must be GRAFTED, even though P's own output is an
+  ;; unrealised placeholder at lowering time.  Grafts carry security fixes
+  ;; (a glibc replacement), so dropping one silently is a vulnerability.
+  ;;
+  ;; Returning '() from the reserved-output path made cumulative-grafts read
+  ;; "no dependencies" and return P ungrafted.  These assertions pin that the
+  ;; graft really reaches P: a different derivation, and a built result that
+  ;; refers to D*'s output and NOT to D's.
+  (define (dep-package name payload)
+    (package
+      (name name)
+      (version "1")
+      (source #f)
+      (build-system trivial-build-system)
+      (arguments
+       (list #:guile %bootstrap-guile
+             #:builder #~(call-with-output-file #$output
+                           (lambda (p) (display #$payload p)))))
+      (synopsis "CA graft input test")
+      (description "CA graft input test")
+      (home-page #f)
+      (license #f)))
+  (define (user-package name dep)
+    (package
+      (name name)
+      (version "1")
+      (source #f)
+      (build-system trivial-build-system)
+      (inputs (list dep))
+      (arguments
+       (list #:guile %bootstrap-guile
+             #:builder #~(call-with-output-file #$output
+                           (lambda (p)
+                             (format p "USES ~a" #$dep)))))
+      (synopsis "CA graft consumer test")
+      (description "CA graft consumer test")
+      (home-page #f)
+      (license #f)))
+  ;; Guix grafts rewrite in place, so the origin and replacement names must
+  ;; have the SAME LENGTH (guix/build/graft.scm refuses otherwise).  Real
+  ;; grafts satisfy this by construction (glibc-2.39 -> glibc-2.39-grafted
+  ;; style padding); the fixture pads D*'s name to D's length.
+  (let* ((d-name  (fresh-name "ca-graft-dep"))
+         (d*-name (string-append "ca-graft-rep"
+                                 (make-string (- (string-length d-name)
+                                                 (string-length "ca-graft-rep"))
+                                              #\x)))
+         (p-name  (fresh-name "ca-graft-user"))
+         (dep     (dep-package d-name "DEP"))
+         (dep*    (dep-package d*-name "DEP-STAR"))
+         (pkg     (user-package p-name dep))
+         (lower   (lambda (p)
+                    (parameterize ((%package-addressing-policy 'content))
+                      (package-derivation store p))))
+         (p-drv   (lower pkg))
+         (d-drv   (lower dep))
+         (d*-drv  (lower dep*)))
+    (test-assert "P's output is an unrealised placeholder"
+      (and (placeholder-path? (derivation->output-path p-drv))
+           (not (valid-path? store (derivation->output-path p-drv)))))
+    ;; D and D* are realised, so their REALISED paths are what a reference
+    ;; in P's built output will name.
+    (build-derivations store (list d-drv d*-drv))
+    (let* ((grafted (graft-derivation store p-drv
+                      (list (graft (origin d-drv) (replacement d*-drv)))
+                      #:guile guile-drv))
+           (d-real  (realised-output-path store d-drv "out"))
+           (d*-real (realised-output-path store d*-drv "out")))
+      (test-assert "the graft changes P's derivation (it is not returned ungrafted)"
+        (not (string=? (derivation-file-name grafted)
+                       (derivation-file-name p-drv))))
+      (build-derivations store (list grafted))
+      (let* ((out   (realised-output-path store grafted "out"))
+             (text  (read-all out))
+             (refs  (references store out)))
+        (test-assert "the built result refers to the REPLACEMENT's output"
+          (or (member d*-real refs) (string-contains text d*-real)))
+        (test-assert "the built result does not refer to the ORIGIN's output"
+          (and (not (member d-real refs))
+               (not (string-contains text d-real))))
+        (test-assert "the payload was rewritten"
+          (string-contains text d*-real))))
+    (test-assert "the connection is still usable afterwards"
+      (valid-path? store (derivation->output-path guile-drv)))))
 
 (close-connection store)
 (test-end)

@@ -56,6 +56,32 @@
      ((@@ (guix derivations) make-derivation)
       '() '() '() "x86_64-linux" "" '() '() path))))
 
+(test-group "upstream's nuke-refs marker is not a goonix name"
+  ;; Upstream's remove-store-references writes 32 #\e characters plus #\- as
+  ;; its marker.  It is ordinary upstream data, so it is not reserved; and no
+  ;; goonix name may BE it, so reserved-hash bumps such a placeholder's last
+  ;; character to #\o.  The all-zero-digest vector below must match
+  ;; encodeReserved in nix/libstore/ca.cc, which asserts the same string.
+  (define (reserved-hash-for-test digest self?)
+    ;; reserved-hash is exported so the C++ and Scheme encoders can be
+    ;; checked against the same all-zero-digest vector.
+    (reserved-hash digest self?))
+  (define marker (make-string 32 #\e))
+  (define zero-digest (make-bytevector 32 0))
+  (test-equal "an all-zero digest encodes to e...eo, never the marker"
+    (string-append (string-take marker 31) "o")
+    (reserved-hash-for-test zero-digest #f))
+  (test-assert "a self token never starts with e, even for an all-zero digest"
+    (not (char=? #\e (string-ref (reserved-hash-for-test zero-digest #t) 0))))
+  (test-assert "the marker is not a placeholder or a token"
+    (parameterize ((%store-prefix "/gnu/store"))
+      (let ((path (string-append "/gnu/store/" marker "-hello")))
+        (not (or (placeholder-path? path) (token-store-path? path))))))
+  (test-assert "the bumped e...eo encoding is still a placeholder"
+    (parameterize ((%store-prefix "/gnu/store"))
+      (placeholder-path?
+       (string-append "/gnu/store/" (string-take marker 31) "o-hello")))))
+
 (test-group "tokens and placeholders"
   (test-assert "self token is deterministic and reserved"
     (let ((token (self-token "out")))

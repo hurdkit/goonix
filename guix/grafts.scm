@@ -180,7 +180,9 @@ references."
       (append-map (cut references/cached store <>) items)))
 
   (let* ((self (map (cut derivation->output-path drv <>) outputs))
-         (refs (references* self)))
+         (refs (or ((@ (guix ca graft) goonix-non-self-references) ;goonix: hook
+                    store drv outputs)
+                   (references* self))))
     (remove (cut member <> self) refs)))
 
 (define %graft-cache
@@ -287,7 +289,9 @@ derivations to the corresponding set of grafts."
                      (cumulative-grafts store drv grafts
                                         #:guile guile
                                         #:system system)))))
-            (reference-origins drv items)))
+            (or ((@ (guix ca graft) goonix-reference-origins*) ;goonix: hook
+                 store drv items)
+                (reference-origins drv items))))
 
     (with-cache (list (derivation-file-name drv) outputs grafts)
       (match (non-self-references store drv outputs)
@@ -297,7 +301,11 @@ derivations to the corresponding set of grafts."
          (mlet %state-monad ((grafts (dependency-grafts deps)))
            (let ((grafts (delete-duplicates (concatenate grafts) equal?)))
              (match (filter (lambda (graft)
-                              (member (graft-origin-file-name graft) deps))
+                              (member (or ((@ (guix ca graft) goonix-graft-origin) ;goonix:
+                                           store drv outputs (graft-origin graft)
+                                           (graft-origin-output graft))
+                                          (graft-origin-file-name graft))
+                                      deps))
                             grafts)
                (()
                 (return grafts))

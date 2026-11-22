@@ -101,10 +101,10 @@ commit "$project"
 fails guix build -d "$project#sample" 2> "$root/errors"
 grep "guix flake lock" "$root/errors"
 
-test "`guix flake lock -C "$project"`" = "$project/flake.lock"
-cp "$project/flake.lock" "$root/lock"
+test "`guix flake lock -C "$project"`" = "$project/guix.lock"
+cp "$project/guix.lock" "$root/lock"
 guix flake lock -C "$project"
-cmp "$project/flake.lock" "$root/lock"
+cmp "$project/guix.lock" "$root/lock"
 
 guix flake metadata -C "$project" | grep "$root/dep"
 
@@ -172,7 +172,7 @@ fails guix build -d "$project#sample" --option=absent=1
 # An override is for one run, and the lock stays as it is.
 test "`cat "\`guix build "$project#sample" \
                 --override-input=dep="$root/other"\`"`" = "from other"
-cmp "$project/flake.lock" "$root/lock"
+cmp "$project/guix.lock" "$root/lock"
 test "`guix build -d "$project#sample"`" = "$drv"
 
 # An update moves the input.
@@ -180,7 +180,7 @@ word_flake "from dep, later" > "$root/dep/flake.scm"
 commit "$root/dep"
 test "`guix build -d "$project#sample"`" = "$drv"
 guix flake update dep -C "$project"
-fails cmp "$project/flake.lock" "$root/lock"
+fails cmp "$project/guix.lock" "$root/lock"
 test "`cat "\`guix build "$project#sample"\`"`" = "from dep, later"
 
 exit 0

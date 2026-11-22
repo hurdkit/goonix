@@ -60,7 +60,8 @@ rather than adopted (its self-references are not all rewritable)."
 
 (define (adopted-item? store drv)
   "Whether DRV's output can be adopted: it is not glibc and the scanner does
-not flag it.  DRV's output must already be realised."
+not flag it.  DRV's output must already be realised, except for glibc, which
+is refused by name and whose contents are therefore never read."
   (and (not (glibc-derivation? drv))
        (not (item-flagged? store (realised-output-path store drv "out")))))
 
@@ -86,6 +87,17 @@ re-lower).  The rewrite goes through graft-derivation/shallow under
             (hash-set! cache key result)
             result))))
   (define (adopt* drv)
+    ;; Realise EVERY output of DRV before it is scanned or grafted.  A
+    ;; multi-output package referenced through one output (gcc:lib, glib:bin,
+    ;; any :debug output) has its other outputs absent from the store until
+    ;; now: adopted-item? and non-self-references read them, and the graft
+    ;; over all outputs needs them present.  (derivation-input drv) defaults
+    ;; to every output, so substitutes are used; upstream does the same when
+    ;; lowering needs an item's contents (references-oracle, guix/grafts.scm).
+    ;; glibc is the one case that needs no contents: it is re-lowered from
+    ;; source, so its input-addressed outputs are not fetched for that.
+    (unless (glibc-derivation? drv)
+      (build-derivations store (list (derivation-input drv))))
     (cond
      ;; Flagged items and glibc are not adopted; the policy re-lowers them
      ;; content-addressed from source.  Here we return the derivation itself.

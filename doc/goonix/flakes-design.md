@@ -31,7 +31,7 @@ Goals:
 
 1. One file, `flake.scm`, at the root of a project declares inputs and
    outputs.
-2. One generated file, `flake.lock`, pins every input, transitively, to a
+2. One generated file, `guix.lock`, pins every input, transitively, to a
    commit and a content hash. Commands never resolve a branch name when a
    lock exists.
 3. Evaluation depends only on the flake, its lock, and the system type.
@@ -122,7 +122,7 @@ The input named `guix` is special: it is the Guix that evaluates
 `outputs`. If it is absent, the running Guix is used and recorded in the
 lock, so that the build is still pinned.
 
-## 4. `flake.lock`
+## 4. `guix.lock`
 
 Generated, committed to version control, never edited by hand. An
 S-expression, so that it can be read with `read` and no code is evaluated:
@@ -165,7 +165,7 @@ S-expression, so that it can be read with `read` and no code is evaluated:
 
 ```
 guix flake init                 write a template flake.scm
-guix flake lock                 create flake.lock entries that are missing
+guix flake lock                 create guix.lock entries that are missing
 guix flake update [INPUT…]      move the named inputs (or all) to their branch heads
 guix flake show [REF]           list outputs
 guix flake metadata [REF]       print inputs with locked commits and dates
@@ -258,7 +258,7 @@ All new code goes into new files (see `GOONIX.md`, "add files").
 
 | Phase | Deliverable | New files | Done when |
 |---|---|---|---|
-| 1 | Records and readers: `<flake>`, `<flake-input>`, `<flake-outputs>`; read `flake.scm` inputs without evaluating outputs; read/write `flake.lock` | `guix/flakes.scm`, `tests/flakes.scm` | round-trip tests for the lock pass; a malformed lock is rejected with the file and line |
+| 1 | Records and readers: `<flake>`, `<flake-input>`, `<flake-outputs>`; read `flake.scm` inputs without evaluating outputs; read/write `guix.lock` | `guix/flakes.scm`, `tests/flakes.scm` | round-trip tests for the lock pass; a malformed lock is rejected with the file and line |
 | 2 | Locking: `guix flake lock`, `update`, `metadata`; git and directory inputs; `nar-sha256` computed and verified | `guix/scripts/flake.scm` | locking twice is a no-op; changing a URL re-locks only that input; a tampered checkout fails verification |
 | 3 | Evaluation in the running Guix: `guix flake show`, `check`; `guix build .#x` | `guix/flakes/eval.scm`, edits to `guix/scripts/build.scm` | an output builds to the same derivation as the equivalent `-f`/`-e` invocation |
 | 4 | Re-execution under the locked `guix` input, through `cached-channel-instance` | edits to `guix/scripts/flake.scm` | with a lock naming another commit, `guix --version` inside the evaluation is that commit |

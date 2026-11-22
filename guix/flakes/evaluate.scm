@@ -530,7 +530,7 @@ the way what local checkouts are not what the lock uses."
     (for-each (lambda (input)
                 (unless (flake-lock-root-edge lock (flake-input-name input))
                   (raise (formatted-message
-                          (G_ "flake.lock has no input '~a'; run 'guix flake \
+                          (G_ "guix.lock has no input '~a'; run 'guix flake \
 lock'")
                           (flake-input-name input)))))
               (flake-inputs flake))

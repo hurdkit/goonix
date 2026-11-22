@@ -180,7 +180,7 @@ which is made if need be; commit, and return the commit."
 
 (test-assert "a lock on disk reads back as the same lock"
   (with-workspace directory
-    (let ((file (string-append directory "/flake.lock"))
+    (let ((file (string-append directory "/guix.lock"))
           (lock (sexp->flake-lock %lock-sexp)))
       (write-flake-lock lock file)
       (let ((text (contents file)))
@@ -298,7 +298,7 @@ which is made if need be; commit, and return the commit."
                               `(dep (git ,dep))))
            (lock    (lock-flake project))
            (node    (node-of lock 'dep)))
-      (and (file-exists? (string-append project "/flake.lock"))
+      (and (file-exists? (string-append project "/guix.lock"))
            (string=? commit (lock-node-commit node))
            (string=? (tree-hash (fetch-git-tree dep))
                      (lock-node-tree-hash node))
@@ -311,7 +311,7 @@ which is made if need be; commit, and return the commit."
            (first   (commit! dep `("flake.scm" . ,(flake))))
            (project (project! (string-append directory "/project")
                               `(dep (git ,dep) (branch "master"))))
-           (file    (string-append project "/flake.lock")))
+           (file    (string-append project "/guix.lock")))
       (lock-flake project)
       (let ((text (contents file)))
         (commit! dep '("new" . "file"))
@@ -347,7 +347,7 @@ which is made if need be; commit, and return the commit."
            (_       (commit! dep `("flake.scm" . ,(flake))))
            (project (project! (string-append directory "/project")
                               `(dep (git ,dep))))
-           (file    (string-append project "/flake.lock"))
+           (file    (string-append project "/guix.lock"))
            (lock    (lock-flake project))
            (hash    (lock-node-tree-hash (node-of lock 'dep)))
            (text    (contents file))
@@ -498,10 +498,10 @@ which is made if need be; commit, and return the commit."
                               `("flake.scm"
                                 . ,(contents
                                     (string-append directory "/flake.scm")))
-                              `("flake.lock"
+                              `("guix.lock"
                                 . ,(contents
                                     (string-append directory
-                                                   "/flake.lock"))))))
+                                                   "/guix.lock"))))))
            (first  (commit! child `("flake.scm" . ,(flake))))
            (_      (parent left))
            (second (commit! child '("second" . "x")))
@@ -639,7 +639,7 @@ which is made if need be; commit, and return the commit."
       (and (string=? "deps/dep" (lock-node-path node))
            (string=? commit (lock-node-commit node))
            (not (string-contains
-                 (contents (string-append project "/flake.lock"))
+                 (contents (string-append project "/guix.lock"))
                  directory))
            ;; The lock is usable from another directory.
            (with-directory-excursion "/"
@@ -669,7 +669,7 @@ which is made if need be; commit, and return the commit."
             (write-file (string-append tree "/data") "y")
             (list clean changed moved (notices))))))))
 
-(test-assert "an override leaves flake.lock as it is"
+(test-assert "an override leaves guix.lock as it is"
   (with-workspace directory
     (let* ((dep     (string-append directory "/dep"))
            (local   (string-append directory "/local"))
@@ -684,7 +684,7 @@ which is made if need be; commit, and return the commit."
            (project (project! (string-append directory "/project")
                               `(dep (git ,dep) (as library))
                               `(middle (git ,middle))))
-           (file    (string-append project "/flake.lock"))
+           (file    (string-append project "/guix.lock"))
            (_       (lock-flake project))
            (text    (contents file))
            (lock    (effective-flake-lock
@@ -714,14 +714,14 @@ which is made if need be; commit, and return the commit."
            (_       (commit! dep `("flake.scm" . ,(flake))))
            (theirs  (commit! local `("flake.scm" . ,(flake))))
            (_       (lock-flake (project! project `(dep (git ,dep)))))
-           (text    (contents (string-append project "/flake.lock"))))
+           (text    (contents (string-append project "/guix.lock"))))
       (write-file (string-append project "/flake.local.scm")
                   "(flake-local (version 1) (inputs (dep (local \"local\"))))")
       (let ((lock (with-directory-excursion "/"
                     (effective-flake-lock project))))
         (and (string=? theirs (lock-node-commit (node-of lock 'dep)))
              (string=? text
-                       (contents (string-append project "/flake.lock"))))))))
+                       (contents (string-append project "/guix.lock"))))))))
 
 (test-equal "an override on the command line is a path or the fields"
   '((local "/some/where" #f) (git "https://example.org/x" "next"))
@@ -794,5 +794,40 @@ which is made if need be; commit, and return the commit."
                        (commit "third" (signer ,other))))
                 (and (raises? (lock-flake (declare signer) #:update #t))
                      'unauthorized-commit-refused)))))))
+
+(test-assert "a Nix flake.lock alone leaves the Guix flake unlocked"
+  ;; The Guix lock is guix.lock; flake.lock belongs to Nix (its JSON).  A
+  ;; directory holding only a Nix flake.lock must be treated as unlocked, not
+  ;; misread: the Guix code never reads flake.lock, and there is no fallback.
+  (with-workspace directory
+    (let* ((project (project! (string-append directory "/project")))
+           (nix-lock "{\"nodes\":{\"nixpkgs\":{\"locked\":{\
+\"lastModified\":1794386569,\"narHash\":\"sha256-AAAAAAAAAAAAAAAAAAAAAAAAAA\\
+AAAAAAAAAAAAAAAAAAAAAAAAA=\",\"owner\":\"NixOS\",\"repo\":\"nixpkgs\",\"rev\":\
+\"0000000000000000000000000000000000000000\",\"type\":\"github\"}}},\"root\":\
+\"nixpkgs\",\"version\":7}"))
+      ;; A Nix flake.lock (JSON), and no guix.lock.
+      (write-file (string-append project "/flake.lock") nix-lock)
+      (let ((lock (effective-flake-lock project)))
+        (and (flake-lock? lock)
+             ;; Unlocked: no inputs, no nodes — the Nix lock was not read.
+             (null? (flake-lock-inputs lock))
+             (null? (flake-lock-nodes lock))
+             ;; The Nix file is untouched, and no guix.lock was conjured.
+             (string=? nix-lock (contents (string-append project "/flake.lock")))
+             (not (file-exists? (string-append project "/guix.lock"))))))))
+
+(test-assert "a Nix flake.lock is not read even when the flake has inputs"
+  ;; With inputs and only a Nix flake.lock, the flake is still unlocked: the
+  ;; code asks for guix.lock and refuses, rather than misreading Nix's JSON.
+  (with-workspace directory
+    (let* ((dep     (string-append directory "/dep"))
+           (_       (commit! dep `("flake.scm" . ,(flake))))
+           (project (project! (string-append directory "/project")
+                              `(dep (git ,dep)))))
+      (write-file (string-append project "/flake.lock")
+                  "{\"nodes\":{},\"root\":\"nixpkgs\",\"version\":7}")
+      (and (raises? (effective-flake-lock project))
+           (not (file-exists? (string-append project "/guix.lock")))))))
 
 (test-end "flakes")

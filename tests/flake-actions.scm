@@ -14,6 +14,11 @@
   #:use-module (guix derivations)
   #:use-module (guix tests)
   #:use-module (guix tests git)
+  #:use-module ((guix config) #:select (%state-directory))
+  #:use-module ((guix diagnostics) #:select (formatted-message?
+                                             formatted-message-string
+                                             formatted-message-arguments))
+  #:use-module ((guix profiles) #:select (generation-numbers))
   #:use-module ((guix pure-eval) #:select (pure-eval-supported?))
   #:use-module ((guix utils) #:select (call-with-temporary-directory))
   #:use-module ((guix build utils) #:select (mkdir-p))
@@ -217,6 +222,50 @@ expression, as its host name; 'machines' deploys it twice."
       (dynamic-wind
         (lambda () (setenv "FLAKE_HOST" "outside"))
         (lambda () (raises? (act directory)))
+        (lambda () (unsetenv "FLAKE_HOST"))))))
+
+;; The reconfigure action ITSELF, not 'build --dry-run'.  Reconfigure is one of
+;; the actions that change a machine (flake-command-action sets acting? for
+;; 'reconfigure and 'init), so it goes through the same pure/acting comparison.
+;; Here the outside evaluation differs (the host name comes from the
+;; environment, which the container has none of), so the action must be refused
+;; with the "not carrying this out" message BEFORE anything acts: no activation,
+;; no profile switch, no generation written.  Only the refusal path is tested;
+;; acting needs root.
+(define (reconfigure directory)
+  (evaluate-flake-command %store directory 'system '(systems) 'box
+                          '("reconfigure" "--no-grafts" "--skip-checks"
+                            "--no-bootloader")
+                          #:act? #t))
+
+(test-assert "reconfigure refuses when the pure and the acting derivation differ"
+  (call-with-flake (system-flake "(or (getenv \"FLAKE_HOST\") \"inside\")")
+    (lambda (directory)
+      (define system-profile
+        (string-append %state-directory "/profiles/system"))
+      (define generations-before (generation-numbers system-profile))
+      (define current-system-before
+        (false-if-exception (readlink "/run/current-system")))
+      (dynamic-wind
+        (lambda () (setenv "FLAKE_HOST" "outside"))
+        (lambda ()
+          (let ((refused
+                 (guard (condition
+                         ((formatted-message? condition)
+                          (apply simple-format #f
+                                 (formatted-message-string condition)
+                                 (formatted-message-arguments condition)))
+                         (#t #f))
+                   (reconfigure directory)
+                   #f)))
+            (and (string? refused)
+                 (string-contains refused "not carrying this out")
+                 ;; Nothing acted: no generation was written, the system
+                 ;; profile is untouched, and /run/current-system did not move.
+                 (equal? (generation-numbers system-profile)
+                         generations-before)
+                 (equal? (false-if-exception (readlink "/run/current-system"))
+                         current-system-before))))
         (lambda () (unsetenv "FLAKE_HOST"))))))
 
 (test-end "flake-actions")

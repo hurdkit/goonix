@@ -6,7 +6,10 @@
              (guix sets)
              (guix derivations)
              (guix gexp)
+             (guix serialization)
              (guix build-system trivial)
+             ((guix build utils) #:select (mkdir-p delete-file-recursively))
+             (gcrypt hash)
              (gnu packages base)
              (gnu packages bootstrap)
              (ice-9 binary-ports)
@@ -360,6 +363,112 @@
         "content" (addressing (package-derivation store inherited)))
       (test-equal "an opaque package stays resolved"
         "resolved" (addressing (package-derivation store opaque))))))
+
+(test-group "adopting a reference through one output realises the whole deriver"
+  ;; A multi-output package referenced through ONE output (gcc:lib, glib:bin,
+  ;; any :debug output): only the referenced output is substituted, so the
+  ;; deriver's other outputs are absent from the store AND the filesystem.
+  ;; Adoption must realise every output before scanning the deriver.  Before
+  ;; the fix, adopt* scanned the deriver's out output without realising it and
+  ;; failed with lstat on the absent path (the CA-6 boot gate's gcc:lib case).
+  ;; The gate goes through the 'adopted POLICY's entry point (package lowering
+  ;; -> lower-bag-with-addressing -> adopt-lowered-derivation), not a direct
+  ;; adopt-derivation on a prebuilt closure.
+  (define (fresh-name prefix)
+    (string-append prefix "-"
+                   (number->string (random 1000000000
+                                           (random-state-from-platform)))))
+  ;; A fresh connection with substitutes enabled before any build, so the
+  ;; daemon's substituter picks up the file:// cache (as derivations.scm does).
+  (with-store store
+    (%graft? #f)
+    (let* ((multi-name (fresh-name "ca-policy-multi"))
+           (ref-name   (fresh-name "ca-policy-ref-lib"))
+           ;; A two-output package: out and lib.
+           (multi (package
+                    (inherit (trivial multi-name
+                               #~(begin
+                                   (call-with-output-file #$output
+                                     (lambda (p) (display "OUT" p)))
+                                   (call-with-output-file #$output:lib
+                                     (lambda (p) (display "LIB" p))))))
+                    (outputs '("out" "lib"))))
+           ;; A second package that refers ONLY to multi's lib output: the
+           ;; input tuple (,multi "lib") and the #$multi:lib reference both
+           ;; request lib alone, so multi's out output is never built.
+           (ref-lib (trivial ref-name
+                             #~(call-with-output-file #$output
+                                 (lambda (p) (format p "~a/REF" #$multi:lib)))
+                             `(("multi" ,multi "lib")))))
+      ;; The input-addressed lib path, for comparison.
+      (define multi-drv
+        (parameterize ((%package-addressing-policy 'input))
+          (package-derivation store multi)))
+      (define lib-path (derivation->output-path multi-drv "lib"))
+      (define out-path (derivation->output-path multi-drv "out"))
+      ;; Install a substitute for ONLY the lib output, built from a temporary
+      ;; directory (no build of multi, so out stays absent).  The files are
+      ;; removed on exit, as call-with-derivation-narinfo does; that helper
+      ;; only covers the "out" output, so the lib narinfo is written here.
+      (define dir (%substitute-directory))
+      (define tag (fresh-name "lib-sub"))
+      (define tmp-lib (string-append dir "/" tag))
+      (define nar-file (string-append tag ".nar"))
+      (define cache-info (string-append dir "/nix-cache-info"))
+      (define narinfo
+        (string-append dir "/" (store-path-hash-part lib-path) ".narinfo"))
+      (dynamic-wind
+        (lambda ()
+          (mkdir-p tmp-lib)
+          (call-with-output-file (string-append tmp-lib "/libfile")
+            (lambda (p) (display "LIB" p)))
+          (call-with-output-file (string-append dir "/" nar-file)
+            (lambda (p) (write-file tmp-lib p)))
+          (let ((nar-hash (call-with-input-file (string-append dir "/" nar-file)
+                            port-sha256)))
+            (call-with-output-file cache-info
+              (lambda (p)
+                (format p "StoreDir: ~a\nWantMassQuery: 0\n" (%store-prefix))))
+            (call-with-output-file narinfo
+              (lambda (p)
+                (format p "StorePath: ~a\nURL: ~a\nCompression: none\n\
+NarSize: 1234\nNarHash: sha256:~a\nReferences: \nSystem: ~a\nDeriver: ~a\n"
+                        lib-path nar-file
+                        (bytevector->nix-base32-string nar-hash)
+                        (derivation-system multi-drv)
+                        (basename (derivation-file-name multi-drv)))))))
+        (lambda ()
+          (set-build-options store #:use-substitutes? #t
+                             #:substitute-urls (%test-substitute-urls))
+          (test-assert "the lib output has a substitute"
+            (has-substitutes? store lib-path))
+          ;; Lower ref-lib through the adopted policy and build it.  Only
+          ;; multi:lib is substituted; multi:out is absent until adoption
+          ;; realises it.
+          (parameterize ((%package-addressing-policy 'adopted)
+                         (%upstream-package?
+                          (upstream-package-set
+                           (list->setq (list multi ref-lib %bootstrap-guile)))))
+            (let ((d (package-derivation store ref-lib)))
+              (test-equal "the adopted ref-lib is content-addressed"
+                "content" (addressing d))
+              (build-derivations store (list d))
+              (test-assert "adoption realised the deriver's absent out output"
+                (valid-path? store out-path))
+              (let* ((out (realised-output-path store d "out"))
+                     (refs (references store out)))
+                (test-assert "the adopted ref-lib references the adopted lib, not the IA one"
+                  (and (pair? refs)
+                       (not (member lib-path refs))
+                       (every (lambda (r) (string-contains r multi-name)) refs)))
+                (test-assert "the adopted ref-lib keeps its payload"
+                  (string-suffix? "/REF"
+                                  (call-with-input-file out get-string-all)))))))
+        (lambda ()
+          (false-if-exception (delete-file narinfo))
+          (false-if-exception (delete-file cache-info))
+          (false-if-exception (delete-file (string-append dir "/" nar-file)))
+          (false-if-exception (delete-file-recursively tmp-lib)))))))
 
 (close-connection store)
 (test-end)

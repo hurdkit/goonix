@@ -513,8 +513,8 @@ body, after the definitions the tests share."
   "Lock the flake in DIRECTORY and commit the lock; return DIRECTORY."
   (lock-flake directory)
   (commit! directory
-           `("flake.lock"
-             . ,(contents (string-append directory "/flake.lock"))))
+           `("guix.lock"
+             . ,(contents (string-append directory "/guix.lock"))))
   directory)
 
 (define (child! directory)
