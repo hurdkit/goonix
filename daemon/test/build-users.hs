@@ -107,4 +107,28 @@ main = do
   check "existing table entry excludes a rival pool" (case excluded of Left _ -> True; Right _ -> False)
   releaseLease pool lease
   removeDirectoryRecursive state
+
+  -- killUser reports the failing step in the C++ form (util.cc killUser /
+  -- statusToString), not a generic message.  uid 0 is refused deterministically
+  -- before any fork, so this exercises the diagnostic path without root.
+  let rootUser = BuildUser "root" 0 0 []
+  killResult <- try (killUser rootUser) :: IO (Either SomeException ())
+  case killResult of
+    Left err -> do
+      let msg = show err
+      check "killUser names the uid in the C++ form" (contains msg "cannot kill processes for uid `0'")
+      check "killUser carries the failing step" (contains msg "refusing to kill processes for uid 0")
+    Right () -> die "FAIL: killUser uid 0 unexpectedly succeeded"
   putStrLn "HS-6 build-user parsing, allocation, and cleanup: PASS"
+  putStrLn "killUser diagnostic carries the failing step: PASS"
+
+contains :: String -> String -> Bool
+contains haystack needle = any (prefixOf needle) (tails haystack)
+  where
+    prefixOf [] _ = True
+    prefixOf _ [] = False
+    prefixOf (x:xs) (y:ys) = x == y && prefixOf xs ys
+
+tails :: [a] -> [[a]]
+tails [] = [[]]
+tails xs@(_:rest) = xs : tails rest
