@@ -15,6 +15,7 @@
   #:use-module (guix store)
   #:use-module (guix grafts)
   #:use-module ((guix utils) #:select (%current-system))
+  #:use-module ((guix ca) #:select (glibc-name?))
   #:use-module (guix ca graft)
   #:use-module (guix ca scan)
   #:use-module (ice-9 match)
@@ -41,22 +42,87 @@
 ;;;
 ;;; Code:
 
+;; Memoisation ACROSS calls, per store connection.
+;;
+;; The 'adopted policy calls adopt-derivation for EVERY package it lowers
+;; (guix/ca/policy.scm, adopt-lowered-derivation).  A cache made inside each
+;; call therefore memoises nothing across packages: each one re-adopted, and
+;; item-flagged? rescanned, its whole reference closure.  On the CA-6 boot
+;; gate that was O(packages x closure): the client read 165.9 GB from a
+;; 6.05 GB store (~27 passes, all page cache) with the daemon idle, and gcc
+;; came round once per package.
+;;
+;; Two caches, both keyed by the store CONNECTION's SOCKET so the tests'
+;; separate daemons never share results:
+;;   %adopt-caches: socket -> (derivation file name -> adopted derivation)
+;;   %scan-caches:  socket -> (realised store path -> flagged?)
+;; The scan cache is sound because a store item never changes once valid.
+;;
+;; The key is the SOCKET, not the <store-connection> record: upstream warns
+;; at guix/store.scm's build-accumulator that "cache-object-mapping and
+;; similar functional setters change the store's object identity", so two
+;; lowerings on one connection pass DIFFERENT record objects.  Keying on the
+;; record made every lookup miss (measured: a shared dependency was scanned
+;; once per lowering even with the cache in place).  The socket is the
+;; connection's stable identity, as upstream's own eq? test there uses.
+;; Weak keys let a closed connection's tables be collected.
+;;
+;; The adopt cache keeps upstream's derivation OBJECTS alive, and the callers
+;; compare cached results with eq?: (eq? adopt d) in guix/ca/policy.scm decides
+;; whether to re-lower from source, and (eq? origin adopted) here decides
+;; whether a reference changed.  That stays correct across calls because
+;; upstream's derivation and read-derivation-from-file return the object held
+;; in %derivation-cache (guix/derivations.scm, "Preserve pointer equality"),
+;; so the same .drv always yields the same object while this cache holds it.
+;;
+;; The key includes the SYSTEM and the GUILE derivation's file name as well as
+;; the adopted derivation's: the graft derivation returned is BUILT with those
+;; two (graft-derivation/shallow* ... #:guile guile #:system system), so keying
+;; on the derivation alone would let the first caller's guile and system win
+;; for every later caller.  A per-call cache could not show this; a cache that
+;; outlives the call can.
+(define %adopt-caches (make-weak-key-hash-table))
+(define %scan-caches (make-weak-key-hash-table))
+
+(define (connection-cache caches store)
+  "Return the table for STORE's connection in CACHES, creating it on first
+use.  Keyed by the connection's socket, which is stable across the record
+copies that the store monad's functional setters make."
+  (let ((key (store-connection-socket store)))
+    (or (hashq-ref caches key)
+        (let ((table (make-hash-table)))
+          (hashq-set! caches key table)
+          table))))
+
 (define (item-flagged? store path)
   "Whether the store item at PATH is flagged by the scanner: it carries a
 self-reference the rewriter cannot provably reverse (a fragment, a UTF-16
 encoding, a hidden archive member, or a self-referencing name or link).  A
-whole plain self-reference is rewritable and does not flag the item."
-  (let ((report (scan-store-item path)))
-    (or (> (scan-report-fragments report) 0)
-        (> (scan-report-utf16 report) 0)
-        (> (scan-report-hidden report) 0)
-        (> (scan-report-names report) 0)
-        (> (scan-report-links report) 0))))
+whole plain self-reference is rewritable and does not flag the item.
+
+The answer is memoised per store connection and per realised PATH: a valid
+store item never changes, so it is scanned at most once per connection."
+  (let ((cache (connection-cache %scan-caches store)))
+    (let ((cached (hash-ref cache path 'unset)))
+      (if (not (eq? cached 'unset))
+          cached
+          (let ((flagged
+                 (let ((report (scan-store-item path)))
+                   (or (> (scan-report-fragments report) 0)
+                       (> (scan-report-utf16 report) 0)
+                       (> (scan-report-hidden report) 0)
+                       (> (scan-report-names report) 0)
+                       (> (scan-report-links report) 0)))))
+            (hash-set! cache path flagged)
+            flagged)))))
 
 (define (glibc-derivation? drv)
   "Whether DRV builds glibc, which must be built from source in adopted mode
-rather than adopted (its self-references are not all rewritable)."
-  (string-prefix? "glibc" (derivation-name drv)))
+rather than adopted (its self-references are not all rewritable).
+
+The rule itself is (guix ca)'s glibc-name?, shared with the policy's
+lower-bag-with-addressing so the two cannot drift."
+  (glibc-name? (derivation-name drv)))
 
 (define (adopted-item? store drv)
   "Whether DRV's output can be adopted: it is not glibc and the scanner does
@@ -68,20 +134,55 @@ is refused by name and whose contents are therefore never read."
 (define graft-derivation/shallow*
   (store-lower graft-derivation/shallow))
 
+;; goonix: resolve the graft builder's guile WITHOUT re-entering adoption.
+;;
+;; Cached per connection socket, like the caches above, and keyed by system:
+;; resolving it lowers a package, and doing that once per adopt call was part
+;; of the O(packages x closure) cost.  The lookup goes through (guix packages)
+;; lazily, as gexp.scm does, to avoid a module cycle.
+(define %build-guile-caches (make-weak-key-hash-table))
+
+(define (resolved-build-guile store system)
+  "Return the derivation of the default guile for SYSTEM, lowered under the
+input-addressed policy so goonix's adoption hook is not re-entered while
+resolving the guile that adoption itself needs."
+  (let ((cache (connection-cache %build-guile-caches store)))
+    (or (hash-ref cache system)
+        (let ((drv (parameterize (((@ (guix ca policy) %package-addressing-policy)
+                                   'input))
+                     (run-with-store store
+                       ((module-ref (resolve-module '(guix packages))
+                                    'default-guile-derivation)
+                        system)
+                       #:system system))))
+          (hash-set! cache system drv)
+          drv))))
+
 (define* (adopt-derivation store drv
                            #:key (guile (%guile-for-build))
                            (system (%current-system)))
   "Adopt DRV, an upstream input-addressed derivation: return a
 content-addressed derivation whose output is DRV's tree with every store
 reference rewritten to its adopted counterpart and its own path rewritten to
-the content address.  References are adopted recursively, memoised per item;
-an item the scanner flags, and glibc, is built content-addressed from source
-instead of adopted (its derivation is returned unchanged for the policy to
-re-lower).  The rewrite goes through graft-derivation/shallow under
-%graft-content-addressed?, so it is the two-pass content-addressed graft."
-  (define cache (make-hash-table))
+the content address.  References are adopted recursively; an item the scanner
+flags, and glibc, is built content-addressed from source instead of adopted
+(its derivation is returned unchanged for the policy to re-lower).  The
+rewrite goes through graft-derivation/shallow under
+%graft-content-addressed?, so it is the two-pass content-addressed graft.
+
+Results are memoised ACROSS calls in %adopt-caches, keyed by the store
+connection and then by derivation file name, because the 'adopted policy
+calls this for every package it lowers: a per-call cache would re-adopt and
+rescan the whole closure once per package.  The scan reports are memoised
+separately in item-flagged?."
+  (define cache (connection-cache %adopt-caches store))
   (define (adopt drv)
-    (let ((key (derivation-file-name drv)))
+    ;; The key carries the system and the guile derivation as well as DRV:
+    ;; the graft returned is built with them, so a key of DRV alone would
+    ;; serve the first caller's guile and system to every later caller.
+    (let ((key (list system
+                     (and (derivation? guile) (derivation-file-name guile))
+                     (derivation-file-name drv))))
       (or (hash-ref cache key)
           (let ((result (adopt* drv)))
             (hash-set! cache key result)
@@ -125,19 +226,45 @@ re-lower).  The rewrite goes through graft-derivation/shallow under
                               (replacement adopted)
                               (replacement-output output)))))
                adopted-origins)))
-        (if (null? grafts)
-            ;; No reference changed: adopt DRV's own output alone (a self
-            ;; graft), so its path still becomes the content address.
-            (parameterize ((%graft-content-addressed? #t)
-                           (%graft-with-utf8-locale? #f))
-              (graft-derivation/shallow* store drv
-                                         (list (graft (origin drv)
-                                                      (replacement drv)))
-                                         #:guile guile #:system system))
-            (parameterize ((%graft-content-addressed? #t)
-                           (%graft-with-utf8-locale? #f))
-              (graft-derivation/shallow* store drv grafts
-                                         #:guile guile #:system system)))))))
+        ;; goonix: bind %guile-for-build around the graft lowering.
+        ;;
+        ;; The graft builder's guile is lowered by gexp->derivation.  When
+        ;; GUILE is #f (the default: %guile-for-build is #f outside the test
+        ;; harness) that lowering resolves the guile PACKAGE through
+        ;; bag->derivation, where goonix's addressing hook is installed
+        ;; (guix/packages.scm).  Under the 'adopted policy the hook then
+        ;; ADOPTS that guile, which needs its own graft builder, which lowers
+        ;; guile again -- unbounded recursion.  Measured on the CA-6 gate:
+        ;; 1950 nested adopt calls over two derivations, none returning,
+        ;; 24.7 GB allocated, 203 GCs, a 2 GiB block, OOM-killed at 8G.
+        ;; The adopt cache cannot break it: a result is stored only after
+        ;; adopt* returns, so a re-entrant call always misses.
+        ;;
+        ;; Realising GUILE here and binding it for the dynamic extent of the
+        ;; lowering keeps the graft builder's guile an already-lowered
+        ;; derivation, so no package is lowered and the hook is not reached.
+        ;; run-with-store runs synchronously (run-with-state), so a plain
+        ;; parameterize covers the whole lowering.  This does not change the
+        ;; graft's addressing: that comes from %graft-content-addressed? and
+        ;; the derivation's marker (goonix-graft-addressing), not the policy.
+        (let ((builder-guile (or guile (resolved-build-guile store system))))
+          (if (null? grafts)
+              ;; No reference changed: adopt DRV's own output alone (a self
+              ;; graft), so its path still becomes the content address.
+              (parameterize ((%graft-content-addressed? #t)
+                             (%graft-with-utf8-locale? #f)
+                             (%guile-for-build builder-guile))
+                (graft-derivation/shallow* store drv
+                                           (list (graft (origin drv)
+                                                        (replacement drv)))
+                                           #:guile builder-guile
+                                           #:system system))
+              (parameterize ((%graft-content-addressed? #t)
+                             (%graft-with-utf8-locale? #f)
+                             (%guile-for-build builder-guile))
+                (graft-derivation/shallow* store drv grafts
+                                           #:guile builder-guile
+                                           #:system system))))))))
   ;; Build or substitute DRV first so its references can be queried.
   (build-derivations store (list drv))
   (adopt drv))

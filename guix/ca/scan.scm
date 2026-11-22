@@ -37,6 +37,7 @@
             scan-report-unsupported
             scan-report->alist
             scan-store-item
+            %scan-count
             store-directory-items))
 
 (define-record-type <scan-report>
@@ -479,12 +480,25 @@ anything besides the member that was scanned."
       (cons 'utf16 1)
       entry))
 
+(define %scan-count
+  ;; goonix: a test hook.  When set to a PROCEDURE, scan-store-item calls it
+  ;; with the absolute path of every item it scans, so a test can count how
+  ;; often a particular item is scanned across several package lowerings.
+  ;; Not used in production.
+  (make-parameter #f))
+
 (define (scan-store-item item)
   "Read ITEM's tree and return its self-reference report.  ITEM is a store
 item name or a full path; no file is modified and no symlink is followed."
   (let* ((path (if (string-prefix? "/" item)
                    item (string-append (%store-prefix) "/" item)))
-         (name (basename path))
+         (hook (%scan-count)))
+    (when hook (hook path))
+    (scan-store-item* path)))
+
+(define (scan-store-item* path)
+  ;; The scan itself, on an absolute PATH.
+  (let* ((name (basename path))
          (hash (string->utf8 (string-take name 32)))
          (counters (make-vector 10 0))
          (keys '(files bytes full fragments utf16 hidden names links

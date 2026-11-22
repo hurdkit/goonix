@@ -121,7 +121,9 @@ goonix_ca_store_checks =			\
   deep-scan					\
   streaming					\
   symlink-modes					\
-  path-validation
+  path-validation				\
+  sibling-already-final				\
+  sibling-mixed-forms
 
 EXTRA_DIST += doc/goonix-secrets.smd
 

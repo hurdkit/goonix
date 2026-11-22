@@ -19,6 +19,7 @@
 using namespace nix;
 namespace nix {
 void checkRewriteForTest(const Path & path, const string & from, const string & to);
+void rewriteTreeForTest(const Path & path, const string & from, const string & to);
 string encodeReservedForTest(const Hash & digest, bool token);
 }
 
@@ -438,6 +439,120 @@ static void checkSiblingOutputReferences(const Path & root)
         "sibling token is replaced by its final output path");
     check(references.count(libFinal) == 1,
         "sibling output is registered as a reference");
+}
+
+/* goonix: a tree that already carries a sibling's FINAL path, not its token.
+
+   Measured on CA-6's gcc-14.3.0: bin/gcc-ar holds
+   sans3lascpwwjmmml8p7y4x8rh34hgrz (the REALISED lib output) while the
+   derivation declares that sibling as the token
+   teuttuuueeuttoototeeeutooeeeuout.  A graft writes the replacement's realised
+   path through (guix/ca/build/graft.scm stands in only own-outputs).
+
+   The forward sibling loop in finaliseContentOutput rewrites sibling TOKENS to
+   finals; an occurrence that is already final is untouched and enters `built`
+   as a final.  inverseTree then maps every sibling final back to its token,
+   including that one, so the inverse disagrees with `built`.
+
+   The control above writes the sibling TOKEN, so both sides see the same
+   token-to-final change and agree. */
+static void checkSiblingAlreadyFinal(const Path & root)
+{
+    configureIsolatedStore(root);
+    LocalStore store(false);
+    createDirs(settings.nixStore);
+    Path libToken = tokenPath("lib", "sibfinal-lib");
+    createDirs(libToken);
+    writeFile(libToken + "/payload", "library");
+    PathSet references;
+    Hash narHash;
+    uint64_t narSize = 0;
+    Path libFinal = finaliseContentOutput(store, libToken, "lib", "sibfinal-lib",
+        PathSet{libToken}, references, narHash, narSize);
+    Path outToken = tokenPath("out", "sibfinal-out");
+    createDirs(outToken);
+    /* The sibling's FINAL path, plus this output's own token. */
+    writeFile(outToken + "/driver", libFinal + " " + outToken);
+    references.clear();
+    bool refused = false;
+    std::string message;
+    Path outFinal;
+    try {
+        outFinal = finaliseContentOutput(store, outToken, "out", "sibfinal-out",
+            PathSet{outToken, libToken, libFinal}, references, narHash, narSize,
+            std::map<Path, Path>{{libToken, libFinal}});
+    } catch (const Error & e) {
+        refused = true;
+        message = e.what();
+    }
+    /* Name the refusal, so a future failure cannot be mistaken for a fixture
+       problem: this test's whole point is that finalisation must not refuse. */
+    std::cout << "sibfinal: refused=" << refused << " message=" << message << '\n';
+    check(!refused,
+        "a tree carrying a sibling's final path is finalised, not refused");
+    if (!refused)
+        check(readFile(outFinal + "/driver") == libFinal + " " + outFinal,
+            "the sibling's final path and the self reference are both correct");
+}
+
+/* goonix: the SAME sibling present both as its token and as its final path.
+
+   Reviewer, 2026-11-22, on 356945478fc: that fix selected per SIBLING, not per
+   occurrence, so the mixed case was expected to fail the inverse check again.
+   MEASURED: it does not.  On 356945478fc this fixture printed refused=0.
+
+   The reason is that scanForReferences cannot see a reserved name at all
+   (RefScanSink's search rejects every byte outside nix's base32 alphabet, and
+   goonix tokens use the disjoint 'eout' alphabet; probe: tokens=1 present=0).
+   So that selection was always empty and no sibling was ever reversed.
+
+   What is correct here, stated explicitly: after the sibling loop every
+   occurrence of that sibling in the tree is its FINAL path — the token one was
+   rewritten, the already-final one was left alone — and `built` is hashed from
+   that tree.  Finalisation's job is exactly to leave no token behind, so the
+   output must finalise with both occurrences final.  This test pins that, and
+   pins that no token survives. */
+static void checkSiblingMixedForms(const Path & root)
+{
+    configureIsolatedStore(root);
+    LocalStore store(false);
+    createDirs(settings.nixStore);
+    Path libToken = tokenPath("lib", "sibmixed-lib");
+    createDirs(libToken);
+    writeFile(libToken + "/payload", "library");
+    PathSet references;
+    Hash narHash;
+    uint64_t narSize = 0;
+    Path libFinal = finaliseContentOutput(store, libToken, "lib", "sibmixed-lib",
+        PathSet{libToken}, references, narHash, narSize);
+    Path outToken = tokenPath("out", "sibmixed-out");
+    createDirs(outToken);
+    /* One file holds the token, another holds the same sibling's final path. */
+    writeFile(outToken + "/from-builder", libToken);
+    writeFile(outToken + "/from-graft", libFinal);
+    references.clear();
+    bool refused = false;
+    std::string message;
+    Path outFinal;
+    try {
+        outFinal = finaliseContentOutput(store, outToken, "out", "sibmixed-out",
+            PathSet{outToken, libToken, libFinal}, references, narHash, narSize,
+            std::map<Path, Path>{{libToken, libFinal}});
+    } catch (const Error & e) {
+        refused = true;
+        message = e.what();
+    }
+    std::cout << "sibmixed: refused=" << refused << " message=" << message << '\n';
+    check(!refused,
+        "a sibling present as both token and final is finalised, not refused");
+    if (!refused) {
+        check(readFile(outFinal + "/from-builder") == libFinal,
+            "the token occurrence becomes the sibling's final path");
+        check(readFile(outFinal + "/from-graft") == libFinal,
+            "the already-final occurrence stays the sibling's final path");
+        check(references.count(libFinal) == 1,
+            "the sibling is registered once as a reference");
+    }
 }
 
 static void checkFinalRootBeforeExistence(const Path & root)
@@ -889,6 +1004,14 @@ int main(int argc, char ** argv)
         checkSiblingOutputReferences(argv[2]);
         return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }
+    if (argc == 3 && string(argv[1]) == "--sibling-already-final") {
+        checkSiblingAlreadyFinal(argv[2]);
+        return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+    if (argc == 3 && string(argv[1]) == "--sibling-mixed-forms") {
+        checkSiblingMixedForms(argv[2]);
+        return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
     if (argc == 3 && string(argv[1]) == "--existing-item") {
         checkExistingItemIsUntouched(argv[2]);
         return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
@@ -952,6 +1075,86 @@ int main(int argc, char ** argv)
         check(isPlaceholderPath(settings.nixStore + "/" + marker.substr(0, 31)
                                 + "o-hello"),
             "the bumped e...eo encoding is still a placeholder");
+    }
+
+    /* goonix: a hard-linked executable keeps its executable bit through the
+       rewrite.  Measured on CA-8's binutils-mesboot0 and CA-6's gcc: the
+       inverse mapping failed, and the kept trees showed 8 files in
+       i686-unknown-linux-gnu/bin/ at 0444 whose twins in bin/ were 0555, with
+       identical bytes.  Cause: rewriteRegularFile starts with
+       chmod(path, 0600), and chmod changes the mode of the INODE, so every
+       hard link of that file loses S_IXUSR at once.  rewriteTree stats each
+       entry as it reaches it, so the twin visited later computes
+       (st_mode & S_IXUSR) ? 0555 : 0444 from the already-cleared mode and is
+       installed non-executable.  The tree hash covers the executable bit, so
+       the inverse no longer matches and finalisation is refused.
+       Proven separately with a two-link file: chmod(a, 0600) leaves b at 0600
+       with S_IXUSR=0. */
+    {
+        Path root = createTempDir("", "goonix-hardlink-mode");
+        AutoDelete delRoot(root, true);
+        std::string token(32, 't'), replacement(32, 'u');
+        Path bin = root + "/bin", twin = root + "/i686/bin";
+        createDirs(bin);
+        createDirs(twin);
+        Path first = bin + "/ar", second = twin + "/ar";
+        writeFile(first, "/gnu/store/" + token + "-binutils/bin/ar\n");
+        chmod(first.c_str(), 0555);
+        if (link(first.c_str(), second.c_str()))
+            throw SysError("linking the test twin");
+        struct stat before;
+        lstat(second.c_str(), &before);
+        check((before.st_mode & 07777) == 0555 && before.st_nlink == 2,
+            "the test fixture really is a hard-linked executable pair");
+
+        rewriteTreeForTest(root, token, replacement);
+
+        struct stat a, b;
+        lstat(first.c_str(), &a);
+        lstat(second.c_str(), &b);
+        check((a.st_mode & S_IXUSR) != 0,
+            "the first hard-linked executable stays executable");
+        check((b.st_mode & S_IXUSR) != 0,
+            "the hard-linked twin keeps its executable bit through the rewrite");
+        check((a.st_mode & 07777) == (b.st_mode & 07777),
+            "both hard-linked twins end with the same mode");
+    }
+
+    /* goonix: the same property across SEVERAL rewrite passes over one tree.
+       A multi-output derivation rewrites the tree once per sibling output and
+       then once for its own token (finaliseContentOutput), so an executable
+       must survive every pass, not just the first.
+
+       This is a PROPERTY test, not the regression test for the chmod fix:
+       measured, it passes on 460360f28bb as well, because that commit's
+       per-pass capture already restored 0555 before the next pass stat'ed.
+       It is kept because the property is worth pinning now that the capture
+       map is gone and the mode comes straight from the inode. */
+    {
+        Path root = createTempDir("", "goonix-hardlink-passes");
+        AutoDelete delRoot(root, true);
+        std::string sibling(32, 's'), siblingTo(32, 'v');
+        std::string self(32, 't'), selfTo(32, 'u');
+        createDirs(root + "/bin");
+        createDirs(root + "/triplet/bin");
+        Path first = root + "/bin/ld", second = root + "/triplet/bin/ld";
+        writeFile(first, "/gnu/store/" + sibling + "-gcc/lib /gnu/store/"
+                  + self + "-gcc/bin\n");
+        chmod(first.c_str(), 0555);
+        if (link(first.c_str(), second.c_str()))
+            throw SysError("linking the test twin");
+
+        /* Two passes, as a two-output derivation does. */
+        rewriteTreeForTest(root, sibling, siblingTo);
+        rewriteTreeForTest(root, self, selfTo);
+
+        struct stat a, b;
+        lstat(first.c_str(), &a);
+        lstat(second.c_str(), &b);
+        check((a.st_mode & S_IXUSR) != 0,
+            "an executable stays executable across two rewrite passes");
+        check((b.st_mode & S_IXUSR) != 0,
+            "its hard-linked twin stays executable across two rewrite passes");
     }
 
     return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;

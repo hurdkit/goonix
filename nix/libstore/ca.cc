@@ -13,6 +13,9 @@
 #include <set>
 #include <functional>
 #include <vector>
+#include <fstream>
+#include <iostream>
+#include <cstdio>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -474,8 +477,13 @@ static string replaceWhole(string input, const string & from, const string & to,
 static void rewriteRegularFile(const Path & path, const string & from,
     const string & to, mode_t mode)
 {
-    if (chmod(path.c_str(), 0600))
-        throw SysError(std::format("making `{}' writable for CA rewrite", path));
+    /* goonix: make the original READABLE if it is not, and never clear a bit. */
+    struct stat original;
+    if (lstat(path.c_str(), &original))
+        throw SysError(std::format("reading `{}' for CA rewrite", path));
+    if (!(original.st_mode & S_IRUSR)
+        && chmod(path.c_str(), (original.st_mode & 07777) | S_IRUSR))
+        throw SysError(std::format("making `{}' readable for CA rewrite", path));
     Path temporary = path + ".goonix-rewrite";
     if (pathExists(temporary))
         throw BuildError(std::format("CA temporary file `{0}' already exists", temporary));
@@ -523,6 +531,10 @@ void checkRewriteForTest(const Path & path, const string & from, const string & 
 {
     rewriteRegularFile(path, from, to, 0444);
 }
+
+/* goonix: expose the whole-tree rewrite so a test can pin the mode of every
+   entry, including hard-linked twins.  Defined after rewriteTree itself. */
+void rewriteTreeForTest(const Path & path, const string & from, const string & to);
 
 string encodeReservedForTest(const Hash & digest, bool token)
 {
@@ -654,6 +666,11 @@ static void rewriteTree(const Path & path, const string & from, const string & t
     } else throw BuildError(std::format("unsupported CA output file `{}'", path));
 }
 
+void rewriteTreeForTest(const Path & path, const string & from, const string & to)
+{
+    rewriteTree(path, from, to);
+}
+
 static string inverseTree(const Path & path, const string & final,
     const string & token, const std::map<Path, Path> & siblings = {}, unsigned depth = 0)
 {
@@ -747,6 +764,35 @@ Path finaliseContentOutput(LocalStore & store, const Path & token,
     for (auto & sibling : finalOutputs)
         referencePaths.insert(sibling.second);
     checkReservedTree(physical, 0, baseNameOf(token));
+    /* goonix: the inverse check must NOT reverse sibling paths at all.
+
+       The sibling loop below turns sibling tokens into their final paths
+       BEFORE `built = treeHash(physical)`, so `built` already holds finals.
+       inverseTree's sibling reversal (added with the loop in 22142502179) maps
+       every sibling final back to its token, undoing a change `built` never
+       had.  That refused CA-6's gcc-14.3.0, whose graft output carries the
+       lib output's REALISED path (bin/gcc-ar holds sans3la..., not the token
+       teuttuu...); reproduced by ca-test --sibling-already-final.
+
+       Reversing only the siblings whose token the scan finds was tried first
+       (356945478fc).  Measured with a probe: it never selects anything, because
+       scanForReferences cannot see a reserved name at all — RefScanSink's
+       search (nix/libstore/references.cc) rejects every byte outside nix's
+       base32 alphabet 0123456789abcdfghijklmnpqrsvwxyz, and goonix tokens use
+       the disjoint 'eout' alphabet.  Probe on --siblings: tokens=1 present=0.
+       So that code was an expensive way to pass an empty map, and its comment
+       described a mechanism it did not implement.
+
+       Passing no siblings is what is actually correct: after the loop every
+       sibling occurrence in the tree is final, whether the builder wrote a
+       token or a graft wrote a realised path, and `built` is hashed from that
+       same tree.  The inverse then only has to undo this output's OWN token,
+       which is what it does without the map.  --siblings and --sibling-order
+       still pass, and the mixed case (same sibling as both token and final)
+       finalises with both occurrences final, which is what finalisation means.
+
+       The sibling parameter stays on inverseTree/sameContent for the vectors
+       that pass it explicitly; finalisation passes none. */
     for (auto & sibling : finalOutputs)
         if (sibling.first != token)
             rewriteTree(physical, baseNameOf(sibling.first).substr(0, 32),
@@ -787,7 +833,7 @@ Path finaliseContentOutput(LocalStore & store, const Path & token,
         if (pathExists(final) && stagedSibling && !store.isValidPath(final)) {
             /* A previous output of this build already produced this path.
                Verify it and leave registration to the output-set commit. */
-            bool same = sameContent(final, final, token, built, finalOutputs);
+            bool same = sameContent(final, final, token, built);
             if (!same)
                 throw BuildError(std::format(
                     "CA content address collision at `{0}': existing item differs", final));
@@ -800,7 +846,7 @@ Path finaliseContentOutput(LocalStore & store, const Path & token,
             return final;
         }
         if (pathExists(final)) {
-            bool same = sameContent(final, final, token, built, finalOutputs);
+            bool same = sameContent(final, final, token, built);
             if (!same)
                 throw BuildError(std::format(
                     "CA content address collision at `{0}': existing item differs", final));
@@ -821,7 +867,7 @@ Path finaliseContentOutput(LocalStore & store, const Path & token,
         throw SysError(std::format("moving CA output `{}' to `{}'", physical, final));
     if (created) *created = true;
     /* goonix: the inverse mapping is verified without touching the final tree. */
-    bool good = sameContent(final, final, token, built, finalOutputs);
+    bool good = sameContent(final, final, token, built);
     if (!good) {
         deletePath(final);
         throw BuildError(std::format("CA inverse mapping failed for `{}'", final));

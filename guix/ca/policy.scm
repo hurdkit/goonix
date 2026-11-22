@@ -130,12 +130,43 @@ adopted (its binary rewritten to a content-addressed item); a flagged item or
 glibc is re-lowered content-addressed from source instead."
   (let ((context (and (pair? arguments) (car arguments))))
     (if (package? context)
-        (state-parameterize ((%package-addressing (package-addressing context))
-                             (%package-derivation-name (bag-name bag)))
-          (let ((drv (apply lower bag arguments)))
-            (if (adopt-package? context)
-                (adopt-lowered-derivation lower bag arguments drv)
-                drv)))
+        ;; goonix: glibc is never adopted (guix/ca/adopt.scm's
+        ;; glibc-derivation?), so under 'adopted lower it CONTENT-ADDRESSED
+        ;; from the start instead of lowering it input-addressed and adopting
+        ;; afterwards.
+        ;;
+        ;; The IA-then-adopt route cannot work for it: registering the
+        ;; input-addressed derivation is itself refused, because
+        ;; checkInputAddressedPolicy runs at REGISTRATION
+        ;; (nix/libstore/local-store.cc:537, ca.cc:285), not only at build
+        ;; time, and glibc's inputs have already been adopted
+        ;; (content-addressed).  Measured on CA-6's gate at glibc-2.41 over
+        ;; gawk-boot0, and pinned by tests/ca-policy.scm's re-lower group: the
+        ;; throw happens inside (package-derivation store glibc-like), before
+        ;; any build.
+        ;;
+        ;; The mark is on glibc's OWN derivation only (%package-addressing).
+        ;; The POLICY stays 'adopted for everything lowered inside this
+        ;; extent, so the builder's guile, module-import and any package a
+        ;; gexp of glibc's build pulls in are still ADOPTED - cheap grafts over
+        ;; the input-addressed items the other packages use - rather than
+        ;; re-lowered from source.  Measured both ways: with 'content for the
+        ;; whole extent, a glibc-named package using (default-guile) got a
+        ;; FROM-SOURCE guile-3.0 (graft=0, its own guile-3.0.9.tar input, a
+        ;; 198-derivation closure); with the policy left 'adopted the builder
+        ;; guile is a graft (graft=1) over the same input-addressed item its
+        ;; peers use.  gnu-build-system and trivial-build-system both lower
+        ;; the builder's guile inside bag lowering, and glibc passes no
+        ;; #:guile, so it is in that case.
+        (let ((glibc? (and (eq? (%package-addressing-policy) 'adopted)
+                           (glibc-name? (bag-name bag)))))
+          (state-parameterize ((%package-addressing
+                                (if glibc? 'content (package-addressing context)))
+                               (%package-derivation-name (bag-name bag)))
+            (let ((drv (apply lower bag arguments)))
+              (if (and (not glibc?) (adopt-package? context))
+                  (adopt-lowered-derivation lower bag arguments drv)
+                  drv))))
         (apply lower bag arguments))))
 
 (define (adopt-lowered-derivation lower bag arguments drv)
@@ -153,26 +184,64 @@ source instead."
                                        'adopt-derivation)
                            store d)))
                (if (eq? adopt d)
-                   ;; Flagged or glibc: build content-addressed from source.
+                   ;; Flagged item: build content-addressed from source.
+                   ;;
+                   ;; goonix: set the POLICY, not only %package-addressing.
+                   ;; This runs inside the outer (state-parameterize
+                   ;; ((%package-addressing-policy 'input)) ...) above, and
+                   ;; lower-bag-with-addressing OVERWRITES %package-addressing
+                   ;; with (package-addressing context), which under the 'input
+                   ;; policy returns 'input.  Setting only %package-addressing
+                   ;; therefore had no effect on a flagged item's re-lowering.
+                   ;; (glibc no longer comes through here at all: it is lowered
+                   ;; content-addressed from the start, see
+                   ;; lower-bag-with-addressing.)
                    (values (run-with-store store
-                             (state-parameterize ((%package-addressing 'content))
+                             (state-parameterize ((%package-addressing-policy
+                                                   'content)
+                                                  (%package-addressing 'content))
                                (apply lower bag arguments)))
                            store)
                    (values adopt store))))))))
 
 (define (keyword-argument arguments keyword)
+  ;; goonix: walk keyword/value PAIRS.  Stepping one element at a time also
+  ;; matches the keyword in a value position (#:local-build? #:addressing),
+  ;; which is not an argument named KEYWORD.
   (let loop ((rest arguments))
     (and (pair? rest)
+         (pair? (cdr rest))
          (if (eq? (car rest) keyword)
              (cadr rest)
-             (loop (cdr rest))))))
+             (loop (cddr rest))))))
+
+(define (addressing-keyword-present? arguments)
+  ;; goonix: whether #:addressing was passed as an ARGUMENT, walking
+  ;; keyword/value pairs.  A plain memq over the list also finds the keyword
+  ;; in a value position (#:local-build? #:addressing), which is not an
+  ;; addressing argument at all.
+  (let loop ((rest arguments))
+    (and (pair? rest)
+         (pair? (cdr rest))
+         (or (eq? (car rest) #:addressing)
+             (loop (cddr rest))))))
 
 (define (strip-keyword arguments keyword)
   "Return ARGUMENTS without KEYWORD and its value."
+  ;; goonix: walk keyword/value PAIRS, as keyword-argument does.  Stepping one
+  ;; element at a time looked at value positions: with (#:local-build?
+  ;; #:addressing #:env-vars (...)) it kept #:local-build?, then saw the decoy
+  ;; #:addressing as a keyword and dropped it together with #:env-vars, so the
+  ;; lowerer never received the environment variables.  A trailing odd
+  ;; element is kept unchanged.
   (let loop ((rest arguments) (result '()))
     (cond ((null? rest) (reverse result))
-          ((eq? (car rest) keyword) (loop (cddr rest) result))
-          (else (loop (cdr rest) (cons (car rest) result))))))
+          ((not (pair? (cdr rest)))
+           (loop '() (cons (car rest) result)))
+          ((eq? (car rest) keyword)
+           (loop (cddr rest) result))
+          (else
+           (loop (cddr rest) (cons (cadr rest) (cons (car rest) result)))))))
 
 (define (gexp-with-addressing lower name exp . arguments)
   "Apply LOWER with the requested kind for this derivation only.  An explicit
@@ -181,12 +250,35 @@ decided as it would be without it, so a caller that passes #f for an
 input-addressed derivation (a graft, say) leaves its derivation upstream's."
   (let* ((package-name (%package-derivation-name))
          (explicit (keyword-argument arguments #:addressing))
+         (policy (%package-addressing-policy))
+         ;; goonix: an explicit #:addressing #f is "no override": a graft over
+         ;; an input-addressed derivation passes it (goonix-graft-addressing
+         ;; returns #f) so that graft's derivation stays upstream's.  #f is
+         ;; falsy, so the `explicit' clause below does not catch it.  Only
+         ;; 'adopted honours it: under 'content and 'full everything is
+         ;; content-addressed, so there "no override" IS content, and
+         ;; guarding those policies too changed their result (measured:
+         ;; content and full went from "content" to #f).
+         (no-override? (and (eq? policy 'adopted)
+                            (addressing-keyword-present? arguments)
+                            (not explicit)))
          (requested (cond (explicit explicit)
                           ((and package-name (string=? name package-name))
                            (%package-addressing))
-                          ((memq (%package-addressing-policy) '(content full))
+                          ;; goonix: under 'adopted everything that is not an
+                          ;; adopted upstream package is content-addressed
+                          ;; (plan 01-content-addressing.md, section 8's
+                          ;; table).  A gexp is "everything else": leaving it
+                          ;; input-addressed made the daemon refuse it once
+                          ;; its inputs had been adopted -- "input-addressed
+                          ;; derivation depends on content/resolved-addressed
+                          ;; ... mark the dependent as content-addressed too"
+                          ;; -- which stopped the CA-6 boot gate at
+                          ;; module-import-compiled.
+                          ((or (memq policy '(content full))
+                               (and (eq? policy 'adopted) (not no-override?)))
                            'content)
-                          ((eq? (%package-addressing-policy) 'mixed) 'mixed)
+                          ((eq? policy 'mixed) 'mixed)
                           (else 'input)))
          (arguments (if (memq #:addressing arguments)
                         (strip-keyword arguments #:addressing)
@@ -219,8 +311,27 @@ input-addressed derivation (a graft, say) leaves its derivation upstream's."
       (every (lambda (path) (not (placeholder-path? path))) references)))
 
 (define (gexp-addressing requested guile inputs graphs allowed disallowed)
-  "Choose REQUESTED using the actual lowered inputs and reference paths."
-  (if (not (eq? (%package-addressing-policy) 'mixed))
+  "Choose REQUESTED using the actual lowered inputs and reference paths.
+
+goonix: 'adopted needs this as much as 'mixed.  A gexp can be lowered with a
+requested 'input while its inputs have already been adopted (content- or
+resolved-addressed); the daemon refuses to REGISTER such a derivation
+(checkInputAddressedPolicy runs at registration, not only at build time), so
+the kind has to be re-decided from the actual inputs here.
+
+Measured on CA-6's gate with the narrow glibc scope (699dc449953): writing
+file-5.46.drv was refused over an adopted gawk-boot0.  A backtrace probe inside
+`derivation` named the caller as an ordinary nested package lowering
+(package->derivation -> bag->derivation -> expand-input -> package->derivation)
+and showed POLICY=adopted MARK=input NAMEPARAM=#f addressing=input at the
+leaking lowering.  The wide glibc scope hid the hole because the policy inside
+glibc's extent was 'content, so the policy clause in gexp-with-addressing made
+those gexps content-addressed anyway.
+
+An explicit #:addressing #f means \"no override\" and arrives here as #f, not
+as 'input (gexp-with-addressing keeps it), so a graft over an input-addressed
+derivation is untouched by the correction below."
+  (if (not (memq (%package-addressing-policy) '(mixed adopted)))
       requested
       (if (and (memq requested '(input mixed))
                (or (not (gexp-inputs-input-addressed? guile inputs graphs))
