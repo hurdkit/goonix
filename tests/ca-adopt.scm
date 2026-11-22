@@ -17,6 +17,9 @@
   #:use-module (guix ca)
   #:use-module (guix ca adopt)
   #:use-module (guix ca scan)
+  #:use-module (guix ca policy)
+  #:use-module (guix sets)
+  #:use-module (guix build-system trivial)
   #:use-module (guix derivations)
   #:use-module (guix monads)
   #:use-module (gnu packages bootstrap)
@@ -50,6 +53,21 @@
   (string-append prefix "-"
                  (number->string (random 1000000000
                                          (random-state-from-platform)))))
+
+;; A trivial package, as tests/ca-policy.scm builds them: the policy hook acts
+;; on PACKAGE lowering, so the re-entry test needs packages, not bare gexps.
+(define* (trivial name builder #:optional (inputs '()))
+  (package
+    (name name)
+    (version "1")
+    (source #f)
+    (build-system (@@ (guix build-system trivial) trivial-build-system))
+    (arguments (list #:guile %bootstrap-guile #:builder builder))
+    (inputs inputs)
+    (synopsis "CA adopt test")
+    (description "CA adopt test")
+    (home-page #f)
+    (license #f)))
 
 ;; An input-addressed derivation writing TEXT.
 (define (ia-plain name text)
@@ -164,6 +182,80 @@
     (test-assert "the second result does not use the first guile"
       (not (member (derivation-file-name guile-drv)
                    (input-drv-files second))))))
+
+(test-group "adopting under the adopted policy does not re-enter itself"
+  ;; CA-6's gate hung for hours and was OOM-killed at 8G with a 2 GiB single
+  ;; allocation.  Measured cause: adopt builds its graft with
+  ;; graft-derivation/shallow*, a monadic value run through run-with-store.
+  ;; With %guile-for-build #f the graft builder's guile is lowered as a PACKAGE
+  ;; (default-guile-derivation, guix/gexp.scm), which goes through
+  ;; bag->derivation, where goonix's policy hook is installed
+  ;; (guix/packages.scm).  Under 'adopted that hook ADOPTS the guile, which
+  ;; needs its own graft builder, which lowers guile again, forever.  Traced on
+  ;; the gate: 1950 nested adopt calls, depth 1950, only two distinct
+  ;; derivations, none ever returning; 24.7 GB allocated, 203 GCs.
+  ;;
+  ;; The memoisation cannot break it: adopt stores its result only AFTER adopt*
+  ;; returns, so a re-entrant call always misses.
+  ;;
+  ;; Every other test here passes #:guile guile-drv explicitly, and
+  ;; open-connection-for-tests sets %guile-for-build to %bootstrap-guile, so
+  ;; the package-lowering path was never taken.  This test takes it: the
+  ;; default guile is #f and the policy is 'adopted, as in `guix system image'.
+  ;;
+  ;; The recursion is COUNTED with a wrapper, not timed: a depth limit turns
+  ;; the hang into a prompt failure, and the assertion is on the count.
+  (let* ((leaf (trivial "ca-adopt-reentry-leaf"
+                        #~(call-with-output-file #$output
+                            (lambda (p) (display "LEAF" p)))))
+         (top  (trivial "ca-adopt-reentry-top"
+                        #~(call-with-output-file #$output
+                            (lambda (p) (format p "~a/TOP" #$leaf)))
+                        `(("leaf" ,leaf)))))
+    (define calls 0)
+    (define max-depth 0)
+    (define depth 0)
+    (define real-adopt adopt-derivation)
+    (define limit 24)
+    ;; A sentinel thrown when the recursion passes LIMIT, so the test fails
+    ;; fast instead of allocating until the OOM killer intervenes.
+    (define tag (make-symbol "adopt-reentry"))
+    (define (counting-adopt store drv . args)
+      (set! depth (+ depth 1))
+      (set! calls (+ calls 1))
+      (when (> depth max-depth) (set! max-depth depth))
+      (when (> depth limit)
+        (throw tag 'too-deep))
+      (let ((result (apply real-adopt store drv args)))
+        (set! depth (- depth 1))
+        result))
+    (parameterize ((%package-addressing-policy 'adopted)
+                   (%guile-for-build #f)
+                   (%upstream-package?
+                    (upstream-package-set
+                     (list->setq (list leaf top %bootstrap-guile)))))
+      (let ((escaped
+             (catch tag
+               (lambda ()
+                 ;; Replace the binding the policy hook looks up, so the
+                 ;; re-entrant calls are counted too.
+                 (module-set! (resolve-module '(guix ca adopt))
+                              'adopt-derivation counting-adopt)
+                 (dynamic-wind
+                   (lambda () #t)
+                   (lambda ()
+                     (package-derivation store top)
+                     #f)
+                   (lambda ()
+                     (module-set! (resolve-module '(guix ca adopt))
+                                  'adopt-derivation real-adopt))))
+               (lambda (key . args) #t))))
+        (test-assert "lowering a package under the adopted policy terminates"
+          (not escaped))
+        (test-assert "adoption does not recurse into its own graft builder"
+          ;; A small closure needs a handful of adopts, not one per level of
+          ;; an unbounded chain.  LIMIT is far above what this closure needs.
+          (<= max-depth limit))))))
 
 (close-connection store)
 (test-end "ca-adopt")

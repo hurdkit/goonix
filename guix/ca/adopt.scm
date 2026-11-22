@@ -130,6 +130,30 @@ is refused by name and whose contents are therefore never read."
 (define graft-derivation/shallow*
   (store-lower graft-derivation/shallow))
 
+;; goonix: resolve the graft builder's guile WITHOUT re-entering adoption.
+;;
+;; Cached per connection socket, like the caches above, and keyed by system:
+;; resolving it lowers a package, and doing that once per adopt call was part
+;; of the O(packages x closure) cost.  The lookup goes through (guix packages)
+;; lazily, as gexp.scm does, to avoid a module cycle.
+(define %build-guile-caches (make-weak-key-hash-table))
+
+(define (resolved-build-guile store system)
+  "Return the derivation of the default guile for SYSTEM, lowered under the
+input-addressed policy so goonix's adoption hook is not re-entered while
+resolving the guile that adoption itself needs."
+  (let ((cache (connection-cache %build-guile-caches store)))
+    (or (hash-ref cache system)
+        (let ((drv (parameterize (((@ (guix ca policy) %package-addressing-policy)
+                                   'input))
+                     (run-with-store store
+                       ((module-ref (resolve-module '(guix packages))
+                                    'default-guile-derivation)
+                        system)
+                       #:system system))))
+          (hash-set! cache system drv)
+          drv))))
+
 (define* (adopt-derivation store drv
                            #:key (guile (%guile-for-build))
                            (system (%current-system)))
@@ -198,19 +222,45 @@ separately in item-flagged?."
                               (replacement adopted)
                               (replacement-output output)))))
                adopted-origins)))
-        (if (null? grafts)
-            ;; No reference changed: adopt DRV's own output alone (a self
-            ;; graft), so its path still becomes the content address.
-            (parameterize ((%graft-content-addressed? #t)
-                           (%graft-with-utf8-locale? #f))
-              (graft-derivation/shallow* store drv
-                                         (list (graft (origin drv)
-                                                      (replacement drv)))
-                                         #:guile guile #:system system))
-            (parameterize ((%graft-content-addressed? #t)
-                           (%graft-with-utf8-locale? #f))
-              (graft-derivation/shallow* store drv grafts
-                                         #:guile guile #:system system)))))))
+        ;; goonix: bind %guile-for-build around the graft lowering.
+        ;;
+        ;; The graft builder's guile is lowered by gexp->derivation.  When
+        ;; GUILE is #f (the default: %guile-for-build is #f outside the test
+        ;; harness) that lowering resolves the guile PACKAGE through
+        ;; bag->derivation, where goonix's addressing hook is installed
+        ;; (guix/packages.scm).  Under the 'adopted policy the hook then
+        ;; ADOPTS that guile, which needs its own graft builder, which lowers
+        ;; guile again -- unbounded recursion.  Measured on the CA-6 gate:
+        ;; 1950 nested adopt calls over two derivations, none returning,
+        ;; 24.7 GB allocated, 203 GCs, a 2 GiB block, OOM-killed at 8G.
+        ;; The adopt cache cannot break it: a result is stored only after
+        ;; adopt* returns, so a re-entrant call always misses.
+        ;;
+        ;; Realising GUILE here and binding it for the dynamic extent of the
+        ;; lowering keeps the graft builder's guile an already-lowered
+        ;; derivation, so no package is lowered and the hook is not reached.
+        ;; run-with-store runs synchronously (run-with-state), so a plain
+        ;; parameterize covers the whole lowering.  This does not change the
+        ;; graft's addressing: that comes from %graft-content-addressed? and
+        ;; the derivation's marker (goonix-graft-addressing), not the policy.
+        (let ((builder-guile (or guile (resolved-build-guile store system))))
+          (if (null? grafts)
+              ;; No reference changed: adopt DRV's own output alone (a self
+              ;; graft), so its path still becomes the content address.
+              (parameterize ((%graft-content-addressed? #t)
+                             (%graft-with-utf8-locale? #f)
+                             (%guile-for-build builder-guile))
+                (graft-derivation/shallow* store drv
+                                           (list (graft (origin drv)
+                                                        (replacement drv)))
+                                           #:guile builder-guile
+                                           #:system system))
+              (parameterize ((%graft-content-addressed? #t)
+                             (%graft-with-utf8-locale? #f)
+                             (%guile-for-build builder-guile))
+                (graft-derivation/shallow* store drv grafts
+                                           #:guile builder-guile
+                                           #:system system))))))))
   ;; Build or substitute DRV first so its references can be queried.
   (build-derivations store (list drv))
   (adopt drv))
