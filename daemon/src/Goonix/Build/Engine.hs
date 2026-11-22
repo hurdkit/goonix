@@ -313,7 +313,7 @@ buildWithHook userPool rootFd store settings trace pool mode drvPath drv = do
                 writeIORef (fst currentPool) Nothing
                 finally
                   (do
-                    inputRoots <- Set.toList <$> derivationInputs store drvPath Set.empty drv
+                    inputRoots <- Set.toList <$> derivationInputs store drvPath drv
                     inputs <- Set.toList . Set.fromList . concat <$> mapM (referenceClosure store) (drvPath:inputRoots)
                     let outputPaths = map outputPath (Map.elems (outputs drv))
                     logPath <- buildLogPath settings store drvPath
@@ -408,20 +408,41 @@ offloadFailed settings store trace drvPath drv status = do
     mapM_ (registerFailedPath store . outputPath) (Map.elems (outputs drv))
   throwIO (StoreError (C.pack ("build of " ++ C.unpack drvPath ++ " failed: " ++ failure)) statusCode)
 
-derivationInputs :: Store -> ByteString -> Set.Set ByteString -> Derivation -> IO (Set.Set ByteString)
-derivationInputs store drvPath seen current = do
-  let direct = Set.filter (\path -> not ("builtin:" `B.isPrefixOf` path))
-        (if "builtin:" `B.isPrefixOf` builder current
+-- | The input paths of a derivation, matching C++ DerivationGoal::inputsRealised
+-- (nix/libstore/build.cc:1108-1125): the selected outputs of each DIRECT input
+-- derivation plus the input sources.  It NEVER recurses into an input
+-- derivation's own inputs.  The caller computeFSClosures these (referenceClosure)
+-- to get the chroot/offload closure.  Recursing collected the whole build-time
+-- graph down to source tarballs, which (a) crashes with "path ... is not valid"
+-- when a transitive source is absent (a CI store keeps packages but not their
+-- sources) and (b) leaks undeclared build-time dependencies into the chroot.
+--
+-- The builder's top-level store path is included for a non-builtin builder: the
+-- Haskell sandbox (guix-sandbox.cc) mounts only this closure, with no whole-"/"
+-- mount, so the builder executable must be in it.  C++ instead relies on the
+-- builder being a declared input (Guix gexp->derivation declares guile-for-build).
+derivationInputs :: Store -> ByteString -> Derivation -> IO (Set.Set ByteString)
+derivationInputs store drvPath current = do
+  let isBuiltin = "builtin:" `B.isPrefixOf` builder current
+      direct = Set.filter (\path -> not ("builtin:" `B.isPrefixOf` path))
+        (if isBuiltin
           then inputSrcs current
           else Set.insert (topLevelStorePath store (builder current)) (inputSrcs current))
   dependencies <- mapM (\(path, selected) -> (\drv -> (path, selected, drv)) <$> readStoreDerivation path)
-    (filter (\(path, _) -> Set.notMember path seen) (Map.toList (inputDrvs current)))
-  let dependencyOutputs = Set.fromList
-        [ outputPath output
-        | (path, selected, dependency) <- dependencies
-        , output <- Map.elems (if Set.null selected then outputs dependency else Map.restrictKeys (outputs dependency) selected)
-        ]
-  foldM (\seen' (path, _selected, drv) -> derivationInputs store path seen' drv) (Set.insert drvPath (Set.union seen (Set.union direct dependencyOutputs))) dependencies
+    (Map.toList (inputDrvs current))
+  -- C++: for each direct input derivation, iterate the SELECTED output names; a
+  -- selected name absent from the input's outputs is an error; an EMPTY selection
+  -- selects nothing (the loop over i.second is empty).
+  dependencyOutputs <- fmap concat $ forM dependencies $ \(path, selected, dependency) ->
+    if Set.null selected
+      then pure []
+      else forM (Set.toList selected) $ \name ->
+        case Map.lookup name (outputs dependency) of
+          Just output -> pure (outputPath output)
+          Nothing -> throwIO (storeError
+            ("derivation `" ++ C.unpack drvPath ++ "' requires non-existent output `"
+              ++ C.unpack name ++ "' from input derivation `" ++ C.unpack path ++ "'"))
+  pure (Set.union direct (Set.fromList dependencyOutputs))
   where
     readStoreDerivation path = do
       bytes <- B.readFile (C.unpack path)
@@ -488,7 +509,7 @@ runBuilderWithUser buildUser rootFd store settings trace mode drvPath drv = do
       replacements = zip outPaths redirected
       actualDrv = if mode == Check then replaceDerivationPaths replacements drv else drv
   mapM_ (appendTempRoot rootFd) outPaths
-  inputRoots <- derivationInputs store drvPath Set.empty drv
+  inputRoots <- derivationInputs store drvPath drv
   mapM_ (appendTempRoot rootFd) (Set.toList inputRoots)
   withWritableStore (storeDirectory store) $ mapM_ deleteTree redirected
   work <- makeBuildDirectory store
@@ -673,7 +694,7 @@ spawnSandboxedBuilder buildUser settings store work drvPath drv command env (Fd 
           (sandboxFlagSlirpNetwork .|. (if ipv6 then sandboxFlagIpv6Network else 0) .|.
             (if isolate then sandboxFlagIsolateHostLoopback else 0),
             C.pack program, slirpSeccompFilter nativeArchitecture)
-  inputs <- derivationInputs store drvPath Set.empty drv
+  inputs <- derivationInputs store drvPath drv
   let writableInputs = Set.fromList [work, storeDirectory store]
   closure <- Set.unions . map Set.fromList <$> mapM (referenceClosure store) (Set.toList inputs)
   let sandboxWork = "/tmp/guix-build-" <> storePathToName (storeDirectory store) drvPath <> "-0"

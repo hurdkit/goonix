@@ -1,14 +1,16 @@
 ;; PR #6 CI-like regression client.
 ;; Run inside the user namespace as a client WITHOUT GUIX_LOG_DIRECTORY.
 ;; Builds: builtin:download (file:// URI), builtin:git-download (local repo),
-;; one ordinary derivation in the chroot, and a deliberately failing derivation
-;; whose log `guix build --log-file` must find in /var/log/guix.
+;; one ordinary derivation in the chroot, a deliberately failing derivation
+;; whose log `guix build --log-file` must find in /var/log/guix, and a
+;; derivation whose transitive fixed-output source has been deleted (the store
+;; keeps packages but not their sources, as CI restores it).
 ;;
 ;; Args: WORK-DIR GIT-REV PAYLOAD-HASH GIT-HASH
 (use-modules (guix store) (guix derivations) (guix monads) (guix download)
              (guix git-download) (guix hash) (guix base32) (guix tests)
              (guix utils) (gnu packages bootstrap) (gcrypt hash) (rnrs io ports) (rnrs bytevectors)
-             (ice-9 match) (ice-9 textual-ports) (srfi srfi-1) (srfi srfi-34))
+             (ice-9 match) (ice-9 textual-ports) (ice-9 string-fun) (srfi srfi-1) (srfi srfi-34))
 
 (define work (cadr (command-line)))
 (define gitrev (caddr (command-line)))
@@ -74,6 +76,77 @@
 (record "failing-build-log-found"
   (and (string? fail-log) (file-exists? fail-log)))
 (format #t "  fail-log: ~a~%" fail-log)
+
+;; --- 5. a transitive fixed-output SOURCE need not be valid (PR #6 CI blocker) ---
+;; A depends on B; B depends on a fixed-output source C.  Build B, delete C's
+;; output (the store keeps packages but not their sources, as CI restores it),
+;; then build A.  A must succeed: the chroot needs only the runtime closure of
+;; A's direct inputs (B), never B's own build-time inputs (C).  C++ inputsRealised
+;; never recurses into an input derivation's inputs.
+(record "transitive-source-missing"
+  (guard (c (else (format #t "  transitive-source error: ~a~%" c) #f))
+    (let* ((c-content (string->utf8 "pr6 ci source payload\n"))
+           (c-script (add-text-to-store store "pr6-c-builder.sh"
+                       "printf \"pr6 ci source payload\\n\" > $out\n" (list)))
+           (c (derivation store "pr6-ci-source" bash (list "-e" c-script)
+                          #:inputs (list (list bash) (list c-script))
+                          #:hash-algo 'sha256 #:hash (sha256 c-content)))
+           (c-out (derivation->output-path c))
+           (b-script (add-text-to-store store "pr6-b-builder.sh"
+                       "printf \"hello-B\\n\" > $out\n" (list)))
+           (b (derivation store "pr6-ci-b" bash (list "-e" b-script)
+                          #:inputs (list (derivation-input c) (list bash) (list b-script))))
+           (b-out (derivation->output-path b))
+           (a-script (add-text-to-store store "pr6-a-builder.sh"
+                       (string-append "read -r line < " b-out "\n"
+                                      "printf \"%s-A\\n\" \"$line\" > $out\n") (list)))
+           (a (derivation store "pr6-ci-a" bash (list "-e" a-script)
+                          #:inputs (list (derivation-input b) (list bash) (list a-script))))
+           (a-out (derivation->output-path a)))
+      (build-derivations store (list b))
+      (delete-paths store (list c-out))
+      (and (not (valid-path? store c-out))
+           (valid-path? store b-out)
+           (build-derivations store (list a))
+           (valid-path? store a-out)))))
+
+;; --- 6. the chroot holds the runtime closure of the DIRECT inputs only ---
+;; With every path present, A's builder lists the chroot store: B's output (a
+;; direct input A references) must be there; C's output (B's own build-time
+;; input, not in A's runtime closure) must NOT be there.  The recursive
+;; derivationInputs leaks C (and every transitive build-time source) into the
+;; chroot; C++ inputsRealised computeFSClosures only direct selected outputs.
+(record "chroot-closure-no-transitive-source"
+  (guard (c (else (format #t "  chroot-closure error: ~a~%" c) #f))
+    (let* ((c-content (string->utf8 "pr6 closure source payload\n"))
+           (c-script (add-text-to-store store "pr6-c2-builder.sh"
+                       "printf \"pr6 closure source payload\\n\" > $out\n" (list)))
+           (c (derivation store "pr6-ci2-source" bash (list "-e" c-script)
+                          #:inputs (list (list bash) (list c-script))
+                          #:hash-algo 'sha256 #:hash (sha256 c-content)))
+           (c-out (derivation->output-path c))
+           (b-script (add-text-to-store store "pr6-b2-builder.sh"
+                       "printf \"hello-B\\n\" > $out\n" (list)))
+           (b (derivation store "pr6-ci2-b" bash (list "-e" b-script)
+                          #:inputs (list (derivation-input c) (list bash) (list b-script))))
+           (b-out (derivation->output-path b))
+           (a-script (add-text-to-store store "pr6-a2-builder.sh"
+                       (string-append "read -r line < " b-out "\n"
+                                      "for p in \"$NIX_STORE\"/*; do\n"
+                                      "  printf \"%s\\n\" \"${p##*/}\"\n"
+                                      "done > $out\n") (list)))
+           (a (derivation store "pr6-ci2-a" bash (list "-e" a-script)
+                          #:inputs (list (derivation-input b) (list bash) (list a-script))))
+           (a-out (derivation->output-path a)))
+      (build-derivations store (list b))
+      (build-derivations store (list a))
+      (let* ((listing (call-with-input-file a-out get-string-all))
+             (c-base (basename c-out))
+             (b-base (basename b-out)))
+        (format #t "  chroot has B=~s C=~s~%"
+                (string-contains listing b-base) (string-contains listing c-base))
+        (and (string-contains listing b-base)
+             (not (string-contains listing c-base)))))))
 
 (close-connection store)
 (let ((failed (filter (lambda (p) (not (cdr p))) results)))
