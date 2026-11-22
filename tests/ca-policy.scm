@@ -566,5 +566,47 @@ NarSize: 1234\nNarHash: sha256:~a\nReferences: \nSystem: ~a\nDeriver: ~a\n"
                                #~(mkdir #$output)
                                #:addressing #f))))))))
 
+(test-group "an explicit #:addressing #f keeps each policy's own default"
+  ;; Reviewer, 2026-11-22, on 46fc1ed2e41: the no-override guard was applied
+  ;; to EVERY policy, so under 'content and 'full a gexp lowered with
+  ;; #:addressing #f became input-addressed where it had been content.
+  ;; Measured both ways with .scratch/addr-false-probe.scm:
+  ;;   at 9bd5c39487d (before): content -> "content", full -> "content"
+  ;;   at 46fc1ed2e41:          content -> #f,        full -> #f
+  ;; That was not intended.  'content and 'full build everything
+  ;; content-addressed, so "no override" there means the policy's own
+  ;; default, which is content.  Only 'adopted needs the guard, because it
+  ;; is the one policy whose default for a gexp changed.
+  ;;
+  ;; The keyword is matched by walking keyword/value PAIRS, not with memq
+  ;; over the whole list: memq would also find #:addressing sitting in a
+  ;; value position (e.g. #:env-vars '((#:addressing . x))) and treat it as
+  ;; an override that was never passed.
+  (define (addressing-with-false policy)
+    (parameterize ((%package-addressing-policy policy))
+      (addressing
+       (run-with-store store
+         (gexp->derivation "ca-policy-addr-false" #~(mkdir #$output)
+                           #:addressing #f)))))
+  (test-equal "under content, #:addressing #f is still content-addressed"
+    "content" (addressing-with-false 'content))
+  (test-equal "under full, #:addressing #f is still content-addressed"
+    "content" (addressing-with-false 'full))
+  (test-equal "under input, #:addressing #f stays input-addressed"
+    #f (addressing-with-false 'input))
+  (test-equal "under mixed, #:addressing #f stays input-addressed"
+    #f (addressing-with-false 'mixed))
+  ;; A keyword in a VALUE position is not an #:addressing argument.  The
+  ;; decoy is a TOP-LEVEL value, so a plain memq over the argument list finds
+  ;; it: (#:env-vars #:addressing) has #:addressing at an odd index.  A walk
+  ;; over keyword/value pairs does not.
+  (test-equal "a keyword in a value position is not an addressing override"
+    "content"
+    (parameterize ((%package-addressing-policy 'adopted))
+      (addressing
+       (run-with-store store
+         (gexp->derivation "ca-policy-addr-decoy" #~(mkdir #$output)
+                           #:local-build? #:addressing))))))
+
 (close-connection store)
 (test-end)

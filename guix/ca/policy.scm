@@ -161,18 +161,38 @@ source instead."
                    (values adopt store))))))))
 
 (define (keyword-argument arguments keyword)
+  ;; goonix: walk keyword/value PAIRS.  Stepping one element at a time also
+  ;; matches the keyword in a value position (#:local-build? #:addressing),
+  ;; which is not an argument named KEYWORD.
   (let loop ((rest arguments))
     (and (pair? rest)
+         (pair? (cdr rest))
          (if (eq? (car rest) keyword)
              (cadr rest)
-             (loop (cdr rest))))))
+             (loop (cddr rest))))))
+
+(define (addressing-keyword-present? arguments)
+  ;; goonix: whether #:addressing was passed as an ARGUMENT, walking
+  ;; keyword/value pairs.  A plain memq over the list also finds the keyword
+  ;; in a value position (#:local-build? #:addressing), which is not an
+  ;; addressing argument at all.
+  (let loop ((rest arguments))
+    (and (pair? rest)
+         (pair? (cdr rest))
+         (or (eq? (car rest) #:addressing)
+             (loop (cddr rest))))))
 
 (define (strip-keyword arguments keyword)
   "Return ARGUMENTS without KEYWORD and its value."
+  ;; goonix: walk keyword/value PAIRS, as keyword-argument does.  Stepping one
+  ;; element at a time removed a keyword occurring in a VALUE position and
+  ;; then took its neighbour as a value, corrupting the argument list.
   (let loop ((rest arguments) (result '()))
     (cond ((null? rest) (reverse result))
-          ((eq? (car rest) keyword) (loop (cddr rest) result))
-          (else (loop (cdr rest) (cons (car rest) result))))))
+          ((or (not (pair? (cdr rest)))
+               (not (eq? (car rest) keyword)))
+           (loop (cdr rest) (cons (car rest) result)))
+          (else (loop (cddr rest) result)))))
 
 (define (gexp-with-addressing lower name exp . arguments)
   "Apply LOWER with the requested kind for this derivation only.  An explicit
@@ -181,12 +201,18 @@ decided as it would be without it, so a caller that passes #f for an
 input-addressed derivation (a graft, say) leaves its derivation upstream's."
   (let* ((package-name (%package-derivation-name))
          (explicit (keyword-argument arguments #:addressing))
-         ;; goonix: an explicit #:addressing #f is "no override" (a graft over
-         ;; an input-addressed derivation passes it so its derivation stays
-         ;; upstream's).  It is falsy, so it must be recognised by PRESENCE,
-         ;; not by value, or the 'adopted branch below would turn that graft
-         ;; content-addressed and break upstream byte-identity.
-         (no-override? (and (memq #:addressing arguments) (not explicit)))
+         (policy (%package-addressing-policy))
+         ;; goonix: an explicit #:addressing #f is "no override": a graft over
+         ;; an input-addressed derivation passes it (goonix-graft-addressing
+         ;; returns #f) so that graft's derivation stays upstream's.  #f is
+         ;; falsy, so the `explicit' clause below does not catch it.  Only
+         ;; 'adopted honours it: under 'content and 'full everything is
+         ;; content-addressed, so there "no override" IS content, and
+         ;; guarding those policies too changed their result (measured:
+         ;; content and full went from "content" to #f).
+         (no-override? (and (eq? policy 'adopted)
+                            (addressing-keyword-present? arguments)
+                            (not explicit)))
          (requested (cond (explicit explicit)
                           ((and package-name (string=? name package-name))
                            (%package-addressing))
@@ -200,11 +226,10 @@ input-addressed derivation (a graft, say) leaves its derivation upstream's."
                           ;; ... mark the dependent as content-addressed too"
                           ;; -- which stopped the CA-6 boot gate at
                           ;; module-import-compiled.
-                          ((and (not no-override?)
-                                (memq (%package-addressing-policy)
-                                      '(content full adopted)))
+                          ((or (memq policy '(content full))
+                               (and (eq? policy 'adopted) (not no-override?)))
                            'content)
-                          ((eq? (%package-addressing-policy) 'mixed) 'mixed)
+                          ((eq? policy 'mixed) 'mixed)
                           (else 'input)))
          (arguments (if (memq #:addressing arguments)
                         (strip-keyword arguments #:addressing)
