@@ -170,18 +170,33 @@ int goonix_dedup_link(const char *path, const char *link_path,
   for (unsigned int attempt = 0; attempt < 100; ++attempt) {
     struct stat source_stat, link_stat;
     if (lstat(path, &source_stat) < 0) { result = -1; break; }
-    if (lstat(link_path, &link_stat) == 0) {
-      if (source_stat.st_ino == link_stat.st_ino) { result = 1; break; }
-      if (source_stat.st_size != link_stat.st_size) {
-        if (unlink(link_path) < 0) { result = -1; break; }
-        continue;
+    if (lstat(link_path, &link_stat) < 0) {
+      if (errno != ENOENT) { result = -1; break; }
+      /* link_path is missing: create the hard link.  This is the ONLY place
+         link(path, link_path) is tried, as in C++ optimise-store.cc (retry:). */
+      if (link(path, link_path) == 0) { result = 1; break; }
+      if (errno == EEXIST) continue;  /* another process created it; re-stat */
+      if (errno == ENOSPC) {
+        /* ext4 directory index full: skip dedup for this file, as C++ does
+           (printMsg lvlInfo + return), instead of failing the registration. */
+        fprintf(stderr, "cannot link `%s' to `%s': %s\n",
+                link_path, path, strerror(ENOSPC));
+        result = 1;
+        break;
       }
-    } else if (errno != ENOENT) { result = -1; break; }
-    if (link(path, link_path) == 0) { result = 1; break; }
-    if (errno == EEXIST) continue;
-    if (errno == ENOSPC) break;
-    result = -1;
-    break;
+      result = -1;
+      break;
+    }
+    /* link_path exists.  Same inode: already linked.  Different size: the link
+       is corrupt, remove it and retry.  Equal size, different inode: go straight
+       to the temp-link step below — do NOT call link(path, link_path), which
+       would only return EEXIST (the old loop wasted 100 such attempts). */
+    if (source_stat.st_ino == link_stat.st_ino) { result = 1; break; }
+    if (source_stat.st_size != link_stat.st_size) {
+      if (unlink(link_path) < 0) { result = -1; break; }
+      continue;
+    }
+    break;  /* result stays 0: equal-size target exists, run the temp-link step */
   }
   if (result == 0) {
     size_t length = strlen(temp_path);

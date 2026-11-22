@@ -1,26 +1,31 @@
 #!/usr/bin/env bash
-# Deterministic regression for the goonix_dedup_link temp-path heap overflow
-# (the CI stage1/stage2 evacuate+115 segfault, f4e4ab0 and earlier).
+# Deterministic C-level regressions for goonix_dedup_link (daemon/cbits/files.c).
 #
-# The bug: goonix_dedup_link appended a "-<pid>-<attempt>" suffix with
-# snprintf(temp_path + strlen(temp_path), 32, ...), writing up to 32 bytes past
-# the caller's buffer.  The Haskell caller (Files.hs deduplicateTree) passed
-# B.useAsCString, which allocates only strlen+1 bytes, so the suffix overflowed
-# adjacent heap.  When the overflow landed on a GHC closure's info pointer the
-# next GC's evacuate read text bytes (0x302d2e = ".-0") and segfaulted; when it
-# landed on malloc metadata the crash was elsewhere — hence the intermittency.
+# 1. dedup-overflow-test.c — the temp-path heap overflow (CI stage1/stage2
+#    evacuate+115 segfault, f4e4ab0 and earlier).  The shim appended a
+#    "-<pid>-<attempt>" suffix with snprintf(temp_path + strlen(temp_path), 32,
+#    ...), writing up to 32 bytes past the caller's strlen+1 buffer.  The Haskell
+#    caller passes B.useAsCString, whose unfolding (useAsCString1) calls
+#    newPinnedByteArray# — a pinned buffer on GHC's OWN heap, not glibc malloc.
+#    The suffix wrote text over a GHC closure info pointer; the next copying GC's
+#    evacuate read 0x302d2e (".-0") and segfaulted.  valgrind cannot see it (its
+#    redzones are only around malloc blocks) and +RTS -DS usually misses it (10
+#    bytes past a short-lived pinned buffer land in free space / a dead object).
+#    The canary test forces the overflowing branch and checks a canary right
+#    after a strlen+1 buffer: UNFIXED overwrites it (FAIL), FIXED does not (PASS).
+#    Deterministic because it tests the C function alone.
 #
-# This test forces the exact overflowing branch (result==0: link() EEXIST on
-# every attempt with an equal-size existing target) and places a canary right
-# after a strlen+1 buffer.  UNFIXED: the suffix overwrites the canary -> FAIL.
-# FIXED (capacity-bounded snprintf): canary intact -> PASS.  Deterministic — no
-# daemon, no GC-layout luck, no -DS needed (the overflow is in the glibc malloc
-# heap that B.useAsCString uses, which the GHC -DS sanity checker does not scan).
+# 2. dedup-linkcount-test.c — dedup parity with C++ optimise-store.cc (retry:).
+#    When link_path exists with equal size and a different inode, the first loop
+#    must go straight to the temp link, NOT call link(path, link_path) (which can
+#    only return EEXIST) 100 times.  With -Wl,--wrap=link it asserts return 2
+#    after exactly ONE link() call and ZERO link(_, link_path) attempts.  FAILS
+#    on 0871201ce61 (101 calls, 100 wasteful), PASSES with the parity fix.
+#    (Only run for the 4-arg shim; the parity fix sits on top of the capacity fix.)
 #
 # Usage: dedup-overflow.sh [FILES_C]
-#   FILES_C defaults to this tree's daemon/cbits/files.c.  Point it at the
-#   f4e4ab0 files.c (3-arg signature) to demonstrate the failure: the script
-#   auto-detects the signature and compiles the matching call.
+#   FILES_C defaults to this tree's daemon/cbits/files.c.  Point it at an older
+#   files.c to demonstrate the failure; the script auto-detects the signature.
 set -uo pipefail
 root=$(CDPATH= cd -- "$(dirname "$0")/../../.." && pwd)
 files_c=${1:-$root/daemon/cbits/files.c}
@@ -30,24 +35,38 @@ test -n "$cc" || { echo "no C compiler"; exit 2; }
 out=$(mktemp -d /tmp/dedup-overflow.XXXXXX)
 trap 'rm -rf "$out"' EXIT
 # Detect the shim signature: the fixed shim takes a size_t temp_cap (4 args).
-if grep -q 'goonix_dedup_link(const char \*path, const char \*link_path,[[:space:]]*$' "$files_c" \
-   && grep -q 'char \*temp_path, size_t temp_cap' "$files_c"; then
+if grep -q 'char \*temp_path, size_t temp_cap' "$files_c"; then
   flag=""
-  echo "shim: FIXED 4-arg (capacity-bounded) — $files_c"
+  fourarg=1
+  echo "shim: 4-arg (capacity-bounded) — $files_c"
 else
   flag="-DUNFIXED_3ARG"
-  echo "shim: UNFIXED 3-arg (no capacity) — $files_c"
+  fourarg=0
+  echo "shim: 3-arg (no capacity, f4e4ab0) — $files_c"
 fi
+rc=0
+echo "=== test 1: temp-path overflow canary ==="
 if ! "$cc" -O2 -Wall $flag -I "$root/daemon/cbits" \
      -o "$out/dedup-overflow-test" \
      "$root/daemon/test/differential/dedup-overflow-test.c" "$files_c" 2>"$out/cc.err"; then
   echo "COMPILE FAILED:"; cat "$out/cc.err"; exit 2
 fi
-"$out/dedup-overflow-test"
-rc=$?
-if test $rc -eq 0; then
-  echo "PASS: no temp-path overflow (fixed shim)"
+if "$out/dedup-overflow-test"; then
+  echo "PASS: no temp-path overflow"
 else
-  echo "FAIL: temp-path overflow present (unfixed shim, the f4e4ab0 bug)"
+  echo "FAIL: temp-path overflow present"; rc=1
+fi
+if test "$fourarg" = 1; then
+  echo "=== test 2: dedup link-count parity (C++ retry:) ==="
+  if ! "$cc" -O2 -Wall -I "$root/daemon/cbits" -Wl,--wrap=link \
+       -o "$out/dedup-linkcount-test" \
+       "$root/daemon/test/differential/dedup-linkcount-test.c" "$files_c" 2>"$out/cc2.err"; then
+    echo "COMPILE FAILED:"; cat "$out/cc2.err"; exit 2
+  fi
+  if "$out/dedup-linkcount-test"; then
+    echo "PASS: dedup link-count parity"
+  else
+    echo "FAIL: dedup link-count parity (wasteful link() attempts)"; rc=1
+  fi
 fi
 exit $rc
