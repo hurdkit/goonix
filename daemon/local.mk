@@ -122,6 +122,8 @@ EXTRA_DIST += \
   nix/libstore/reserved-probe.cc \
   daemon/test/inverse-mode/Main.hs daemon/test/inverse-mode.sh \
   nix/libstore/inverse-probe.cc \
+  daemon/test/order-mode/Main.hs daemon/test/order-mode.sh \
+  nix/libstore/order-probe.cc \
   daemon/test/deep-scan-timeout.hs daemon/test/deep-scan-timeout.sh \
   daemon/proxy/Main.hs \
   daemon/test/wire-proxy/Main.hs daemon/test/wire-proxy/run.sh \
