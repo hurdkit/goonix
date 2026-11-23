@@ -113,6 +113,8 @@ EXTRA_DIST += \
   daemon/test/vectors/hash-nar.cc daemon/test/vectors/inspect-item.cc \
   daemon/test/vectors/hash-derivations.cc \
   daemon/test/vectors/generate.sh daemon/test/compare-trs.sh \
+  daemon/test/scan-real-store-fixture.sh daemon/test/scan-real-store-fixture.scm \
+  daemon/test/scan-real-store.sh daemon/test/scan-real-store.scm \
   daemon/test/RESULTS.md \
   daemon/test/transcripts/README.md \
   daemon/test/transcripts/inventory.wire.log \
