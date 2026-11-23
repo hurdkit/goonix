@@ -438,6 +438,43 @@ Path resolvedAddressedPath(const string & output, const string & name,
         hashString(htSHA256, resolvedBytes), name);
 }
 
+/* goonix: the rewrite's opaque checks, bounded by where an occurrence STARTS.
+   Every occurrence starting before `limit' must be seen WHOLE, so the caller
+   passes a `haystack' carrying enough lookahead (keep bytes) plus a `limit' of
+   `process'.  Occurrences starting at or after `limit' belong to the next round:
+   checking them here would reject a plain prefix of FROM at the end of the
+   buffer that becomes a whole match in the next read.  `offset' is the file
+   position of haystack[0], so the reported byte offset is the file's. */
+static void checkOpaque(const string & haystack, const string & from,
+    const string & file, size_t offset, size_t limit)
+{
+    /* Compiler-emitted fragments and UTF encodings are opaque, not rewritable.
+       Name the file and the byte offset of the offending fragment (plan 4.2). */
+    for (size_t i = 0; i + 8 <= from.size(); ++i) {
+        auto fragment = from.substr(i, 8);
+        size_t at = 0;
+        while ((at = haystack.find(fragment, at)) != string::npos) {
+            if (at >= limit) break;
+            throw BuildError(std::format(
+                "opaque self-reference fragment `{0}' in `{1}' at byte {2}",
+                fragment, file, offset + at));
+        }
+    }
+    for (unsigned width : {2, 4}) {
+        string encoded;
+        for (char c : from) {
+            encoded.push_back(c);
+            for (unsigned j = 1; j < width; ++j) encoded.push_back(0);
+        }
+        size_t at = 0;
+        while ((at = haystack.find(encoded, at)) != string::npos) {
+            if (at >= limit) break;
+            throw BuildError(std::format("UTF-{} self-reference in `{}' at byte {}",
+                width * 8, file, offset + at));
+        }
+    }
+}
+
 static string replaceWhole(string input, const string & from, const string & to,
     const string & file, bool rejectOpaque = true)
 {
@@ -448,27 +485,7 @@ static string replaceWhole(string input, const string & from, const string & to,
         at += to.size();
     }
     if (!rejectOpaque) return input;
-    /* Compiler-emitted fragments and UTF encodings are opaque, not rewritable.
-       Name the file and the byte offset of the offending fragment (plan 4.2). */
-    for (size_t i = 0; i + 8 <= from.size(); ++i) {
-        auto fragment = from.substr(i, 8);
-        auto at = input.find(fragment);
-        if (at != string::npos)
-            throw BuildError(std::format(
-                "opaque self-reference fragment `{0}' in `{1}' at byte {2}",
-                fragment, file, at));
-    }
-    for (unsigned width : {2, 4}) {
-        string encoded;
-        for (char c : from) {
-            encoded.push_back(c);
-            for (unsigned j = 1; j < width; ++j) encoded.push_back(0);
-        }
-        auto at = input.find(encoded);
-        if (at != string::npos)
-            throw BuildError(std::format("UTF-{} self-reference in `{}' at byte {}",
-                width * 8, file, at));
-    }
+    checkOpaque(input, from, file, 0, input.size());
     return input;
 }
 
@@ -496,26 +513,48 @@ static void rewriteRegularFile(const Path & path, const string & from,
     AutoCloseFD outputFD = output;
     std::vector<unsigned char> buffer(128 * 1024);
     string pending;
+    size_t consumed = 0;
+    /* Keep enough bytes for a UTF-32LE token that crosses the read boundary,
+       not merely a plain token.  This is also the lookahead that lets the
+       opaque checks below see a whole encoding that starts before `process'. */
+    size_t keep = from.size() * 4 - 1;
     while (true) {
         ssize_t n = read(inputFD, buffer.data(), buffer.size());
         if (n < 0) { if (errno == EINTR) continue;
             throw SysError(std::format("reading `{}' for CA rewrite", path)); }
         if (n == 0) break;
         pending.append((const char *) buffer.data(), n);
-        /* Keep enough bytes for a UTF-32LE token that crosses the read
-           boundary, not merely a plain token. */
-        size_t keep = from.size() * 4 - 1;
         size_t process = pending.size() > keep ? pending.size() - keep : 0;
-        /* A prefix of FROM at the end is a potential whole match crossing
-           the next read, not an opaque fragment at this boundary. */
-        for (size_t length = std::min(process, from.size() - 1); length > 0; --length)
-            if (pending.compare(process - length, length, from, 0, length) == 0) {
-                process -= length;
+        /* goonix: hold back only a WHOLE match that straddles the emit point.
+           A PREFIX test is wrong here for the same reason as in inverseTree
+           (c95008b9279): a COMPLETE self-reference ending exactly at `process',
+           whose last character equals the token's first, has its last byte
+           pulled back; the chunk then holds the token minus one byte and the
+           8-byte fragment check REJECTS a valid file with "opaque
+           self-reference fragment".  keep >= from.size()-1, so any match
+           starting in [process-(from.size()-1), process) is fully visible. */
+        size_t scanFrom = process > from.size() - 1 ? process - (from.size() - 1) : 0;
+        for (size_t s = scanFrom; s < process; ++s)
+            if (s + from.size() > process && s + from.size() <= pending.size()
+                && pending.compare(s, from.size(), from) == 0) {
+                process = s;
                 break;
             }
-        string rewritten = replaceWhole(pending.substr(0, process), from, to, path);
-        writeFull(outputFD, rewritten);
+        /* The opaque checks must cover every occurrence STARTING before
+           `process', and must run on the text AFTER the whole matches have been
+           replaced - exactly as replaceWhole does.  Checking the raw buffer
+           first would flag a legitimate whole token as its own 8-byte fragment
+           (measured: "opaque self-reference fragment `zqqqqqqq'" at the token's
+           own start, at every offset).  So replace over the whole `pending'
+           (the lookahead included, so a straddling encoding is intact), check
+           the occurrences that start before `process', then emit only that
+           prefix.  Occurrences starting at or after `process' are the next
+           round's: a plain prefix of FROM there may become a whole match. */
+        string replaced = replaceWhole(pending, from, to, path, false);
+        checkOpaque(replaced, from, path, consumed, process);
+        writeFull(outputFD, replaced.substr(0, process));
         pending.erase(0, process);
+        consumed += process;
     }
     writeFull(outputFD, replaceWhole(pending, from, to, path));
     if (fchmod(outputFD, mode)) throw SysError(std::format("restoring `{}'", path));
@@ -530,6 +569,14 @@ static void rewriteRegularFile(const Path & path, const string & from,
 void checkRewriteForTest(const Path & path, const string & from, const string & to)
 {
     rewriteRegularFile(path, from, to, 0444);
+}
+
+/* goonix: the WHOLE-FILE rewrite, in memory, as the reference for the streaming
+   boundary tests.  Same primitive, no chunking, so the expectation cannot be
+   produced by the loop under test. */
+string replaceWholeForTest(const string & body, const string & from, const string & to)
+{
+    return replaceWhole(body, from, to, "<memory>");
 }
 
 /* goonix: expose the whole-tree rewrite so a test can pin the mode of every
