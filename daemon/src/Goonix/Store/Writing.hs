@@ -52,11 +52,14 @@ addNarToStore rootFd store name recursive algorithm dump = do
       deleteTree destination
       if recursive
         then either (throwIO . storeError) (restoreNar destination) (decodeNar dump)
-        else do
-          writeBytes destination contents
-          case parsed of
-            Regular True _ -> setFileMode destination 0o755
-            _ -> pure ()
+        -- The non-recursive path drops the NAR's executable bit: the C++
+        -- handler collects the contents with RetrieveRegularNARSink, which
+        -- does not override isExecutable() (a no-op in ParseSink), writes
+        -- them with writeFile (0666 & ~umask) and canonicalises to 0444.
+        -- Only the RECURSIVE path restores the NAR, and restorePath honours
+        -- the bit.  Keeping it here made the stored mode 0555 and gave a
+        -- different narHash/narSize for the same input.
+        else writeBytes destination contents
       _ <- canonicaliseAndHash store destination
       deduplicateTree (storeDirectory store) destination
       narHash <- if recursive && algorithm == SHA256 then pure (Hash SHA256 digest) else hashNar destination

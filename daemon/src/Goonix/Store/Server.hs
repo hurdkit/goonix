@@ -213,7 +213,11 @@ dispatch config store client settingsRef rootFd rootPath clientVersion operation
     fixed <- readIntSocket client
     recursiveField <- readIntSocket client
     algorithmField <- readStringSocket client
-    let recursive = recursiveField == 1
+    -- Compatibility hack (nix-daemon.cc wopAddToStore): when the obsolete
+    -- `fixed' field is not 1, C++ forces BOTH sha256 AND recursive = true.
+    -- Overriding only the algorithm leaves recursive false and changes the
+    -- resulting path.
+    let recursive = fixed /= 1 || recursiveField == 1
         algorithmName' = if fixed /= 1 then "sha256" else algorithmField
     algorithm <- either (throwIO . storeError) pure (algorithmFromName algorithmName')
     either (throwIO . storeError) pure (validateStoreName name)
