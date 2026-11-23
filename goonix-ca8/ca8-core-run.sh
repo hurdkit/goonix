@@ -16,7 +16,7 @@
 #
 # The host daemon, the host /gnu/store and /var/guix are never touched.
 set -euo pipefail
-IMPL=/home/wrath/goonix/.worktrees/goonix-implementation
+IMPL=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 cd "$IMPL"
 
 if [ -z "${IN_NIX_SHELL:-}" ]; then
@@ -44,30 +44,54 @@ chmod 700 "$scratch/etc"
 # perform-download refused UID 0.  Map the subordinate ID range next to our
 # own UID so the daemon can drop to a real unprivileged build user.
 #
-# Two host specifics, both measured:
-#   * the setuid newuidmap/newgidmap wrappers live in /run/wrappers/bin,
-#     which is AFTER /run/current-system/sw/bin on PATH; the store binary
-#     there has no setuid bit and answers "write to uid_map failed:
-#     Operation not permitted".
-#   * wrath's gid is 100 (users), not 1000.
-# Namespace UID 0 -> host 1000, UIDs 1..65536 -> host 100000..165535.
-export PATH=/run/wrappers/bin:$PATH
-map_args=(--map-users=0:1000:1 --map-users=1:100000:65536
-          --map-groups=0:100:1 --map-groups=1:100000:65536)
+# The IDs are read from the HOST AT RUN TIME, never hardcoded.  This runner
+# previously hardcoded the laptop's (uid 1000, gid 100, subuid 100000,
+# /run/wrappers/bin) and died silently on zergling2, which is hurdkit
+# (uid 1003, gid 1003) on Ubuntu 24.04 WSL with subuid 231072:65536 AND
+# 100000:65536 but subgid ONLY 231072:65536, and newuidmap/newgidmap in
+# /usr/bin with no /run/wrappers at all.  Same logic as goonix-ca6/run.sh,
+# which is proven on both machines; taking the FIRST entry of each file
+# handles both.
+host_uid=$(id -u)
+host_gid=$(id -g)
+host_user=$(id -un)
+sub_uid=$(awk -F: -v u="$host_user" '$1==u {print $2; exit}' /etc/subuid)
+sub_uid_count=$(awk -F: -v u="$host_user" '$1==u {print $3; exit}' /etc/subuid)
+sub_gid=$(awk -F: -v u="$host_user" '$1==u {print $2; exit}' /etc/subgid)
+sub_gid_count=$(awk -F: -v u="$host_user" '$1==u {print $3; exit}' /etc/subgid)
+: "${sub_uid:?no /etc/subuid entry for $host_user}"
+: "${sub_gid:?no /etc/subgid entry for $host_user}"
+# newuidmap/newgidmap must be the SETUID ones.  NixOS puts the wrappers in
+# /run/wrappers/bin, ahead of the store binary that has no setuid bit and
+# answers "write to uid_map failed: Operation not permitted"; Ubuntu's
+# /usr/bin/newuidmap is already setuid.
+if [ -x /run/wrappers/bin/newuidmap ]; then
+  export PATH=/run/wrappers/bin:$PATH
+fi
+command -v newuidmap >/dev/null || { echo 'newuidmap not on PATH' >&2; exit 1; }
+command -v newgidmap >/dev/null || { echo 'newgidmap not on PATH' >&2; exit 1; }
+echo "MAP: uid=$host_uid gid=$host_gid subuid=$sub_uid:$sub_uid_count subgid=$sub_gid:$sub_gid_count newuidmap=$(command -v newuidmap)"
+map_args=(--map-users=0:"$host_uid":1
+          --map-users=1:"$sub_uid":"$sub_uid_count"
+          --map-groups=0:"$host_gid":1
+          --map-groups=1:"$sub_gid":"$sub_gid_count")
 
 # passwd/group with a guixbuild group and ten build users, at namespace IDs
-# inside the subordinate range (UID 1..10, GID 1).
+# inside the subordinate range (UID 1..10, GID 1).  Their home is a directory
+# in our own scratch tree, not /var/empty: on Ubuntu /var is root-owned and
+# cannot be written even as namespace root (measured, job ca6-z2-counted2).
+mkdir -p "$scratch/var-empty"
 {
   printf 'root:x:0:0:System administrator:/root:/bin/sh\n'
-  printf 'nobody:x:65534:65534:Unprivileged:/var/empty:/bin/false\n'
+  printf 'nobody:x:65534:65534:Unprivileged:%s:/bin/false\n' "$scratch/var-empty"
   for i in $(seq 0 9); do
-    printf 'guixbuilder%d:x:%d:1:Guix build user %d:/var/empty:/bin/false\n' \
-      "$i" "$((i + 1))" "$i"
+    printf 'guixbuilder%d:x:%d:1:Guix build user %d:%s:/bin/false\n' \
+      "$i" "$((i + 1))" "$i" "$scratch/var-empty"
   done
 } > "$scratch/etc/passwd.ns"
 {
   printf 'root:x:0:\n'
-  printf 'users:x:100:\n'
+  printf 'users:x:%d:\n' "$host_gid"
   printf 'guixbuild:x:1:'
   for i in $(seq 0 9); do
     printf 'guixbuilder%d' "$i"
@@ -111,7 +135,10 @@ mount --bind '$scratch/var' /var/guix
 mount --bind '$scratch/etc/passwd.ns' /etc/passwd
 mount --bind '$scratch/etc/group.ns' /etc/group
 mount -t tmpfs tmpfs /run/nscd
-mkdir -p /var/empty
+# `mkdir -p /var/empty` fails with "Permission denied" even as namespace root
+# on Ubuntu, where /var is root-owned on the host filesystem.  The build users'
+# home is $scratch/var-empty instead; this is best-effort only.
+mkdir -p /var/empty 2>/dev/null || true
 export NIX_STORE_DIR=/gnu/store
 export GUIX_STATE_DIRECTORY='$scratch/var'
 export GUIX_DATABASE_DIRECTORY='$scratch/var/db'
