@@ -25,6 +25,11 @@
 #     with pauses) and return; the non-blocking output fd hits EAGAIN between
 #     bursts, which is NOT EOF.  FAILS pre-fix (drainFd treated EAGAIN as EOF ->
 #     bytes lost / hang).  Both compile the daemon sources; run +RTS -A1m -N.
+#   - wait-stack.sh: waitProcessStatusNonBlocking must not accumulate memory per
+#     poll.  alloca OUTSIDE the poll loop (one buffer, tail call), not inside (each
+#     poll's pinned buffer + frame held alive until the child exits).  Waits on a
+#     12s child under -K64k -T, samples live bytes: FAILS pre-fix (live grows ~7KB/s),
+#     PASSES after (flat).  Compiles the daemon's Wait.hs.
 # Fails if ANY of them fails, naming the failing test.
 #
 # export-memory.sh is deliberately NOT here: it needs a running daemon and a
@@ -53,6 +58,7 @@ run delete-hardlink bash "$here/delete-hardlink.sh" "$root"
 run sqlite-contention bash "$here/sqlite-contention.sh" "$root"
 run socket-idle bash "$here/socket-idle.sh" "$root"
 run child-wait bash "$here/child-wait.sh" "$root"
+run wait-stack bash "$here/wait-stack.sh" "$root"
 run offload-idle bash "$here/offload-idle.sh" "$root"
 run offload-eof bash "$here/offload-eof.sh" "$root"
 run offload-flood bash "$here/offload-flood.sh" "$root"

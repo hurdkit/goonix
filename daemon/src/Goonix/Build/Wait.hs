@@ -51,24 +51,33 @@ wnohang = 1
 -- it must be retried, and any other errno is a real error that must surface, not
 -- be swallowed as "no child" (which would spin forever or mask a bug).  Only
 -- ECHILD returns Nothing.
+--
+-- The status buffer is allocated ONCE, OUTSIDE the poll loop.  alloca keeps its
+-- pinned buffer alive (touch#/keepAlive#) until its body returns, so a `go` that
+-- recursed INSIDE alloca's body was not a tail call: every 10 ms poll pushed a new
+-- stack frame and a new pinned buffer, none freed until the child exits (~360,000
+-- per hour of build).  waitForSandbox and finishOffload run for the whole build, so
+-- a multi-hour build grew the daemon's memory steadily in every concurrent build.
+-- With alloca outside, `go` is a real tail call inside one buffer.
 waitProcessStatusNonBlocking :: ProcessID -> IO (Maybe ProcessStatus)
-waitProcessStatusNonBlocking (CPid raw) = go
+waitProcessStatusNonBlocking (CPid raw) = alloca $ \statusPtr ->
+  let go = do
+        r <- c_waitpid (fromIntegral raw) statusPtr wnohang
+        if r == 0
+          then threadDelay 10000 >> go        -- still running; release the capability
+          else if r < 0
+            then do
+              errno <- getErrno
+              if errno == eINTR
+                then go                       -- interrupted; retry
+                else if errno == eCHILD
+                  then pure Nothing           -- no child to wait for
+                  else throwIO (errnoToIOError "waitpid" errno Nothing Nothing)
+            else do
+              status <- peek statusPtr
+              pure (Just (decode (fromIntegral status)))
+  in go
   where
-    go = alloca $ \statusPtr -> do
-      r <- c_waitpid (fromIntegral raw) statusPtr wnohang
-      if r == 0
-        then threadDelay 10000 >> go        -- still running; release the capability
-        else if r < 0
-          then do
-            errno <- getErrno
-            if errno == eINTR
-              then go                       -- interrupted; retry
-              else if errno == eCHILD
-                then pure Nothing           -- no child to wait for
-                else throwIO (errnoToIOError "waitpid" errno Nothing Nothing)
-          else do
-            status <- peek statusPtr
-            pure (Just (decode (fromIntegral status)))
     -- Linux wait status: low 7 bits = terminating signal (0 = exited),
     -- bits 8..15 = exit code, 0x7f = stopped (WIFSTOPPED).
     decode :: Int -> ProcessStatus
