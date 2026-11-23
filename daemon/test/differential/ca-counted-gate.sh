@@ -126,6 +126,7 @@ run_daemon() {
       env -i TMPDIR="$ns/build" LC_ALL=C.UTF-8 PATH=/nonexistent \
         GUIX_SLIRP4NETNS="$slirp_bin" \
         GUIX_ALLOW_UNAUTHENTICATED_SUBSTITUTES=yes \
+        GUIX_STATE_DIRECTORY=/var/guix \
         "$daemon" --build-users-group=guixbuild --max-jobs=2 --substitute-urls="" \
         > "$ns/daemon.log" 2>&1 &
       dpid=$!
