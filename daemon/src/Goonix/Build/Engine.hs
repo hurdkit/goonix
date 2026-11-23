@@ -1236,7 +1236,7 @@ finaliseCaOutput buildUser settings rootFd store drvPath drv allPaths finals out
   let deepTokens = map selfToken (Map.keys (outputs drv))
       deepUser = fmap (\user -> (fromIntegral (buildUserUid user), fromIntegral (buildUserGid user))) buildUser
   checkDeepOutput settings token deepTokens deepUser (pure ())
-  finalised <- finaliseContentOutput storeDir token output name allPaths finals "" (appendTempRoot rootFd)
+  finalised <- finaliseContentOutput store storeDir token output name allPaths finals "" (appendTempRoot rootFd)
   enforceCaReferencePolicy store drv (finalPath finalised) token finals (finalReferences finalised)
   deduplicateTree storeDir (finalPath finalised)
   pure finalised

@@ -42,6 +42,7 @@ import Goonix.Store.Files (directoryEntries, deleteTree, mkdirParents)
 import Goonix.Store.Hash
 import Goonix.Store.Nar (hashNar, dumpNar)
 import Goonix.Store.Path (makeFixedOutputPath, storePathToName, validateStoreName)
+import Goonix.Store.ReadOnly (Store, isValidPath)
 import Goonix.Store.References (scanReferences)
 import System.Posix.ByteString (RawFilePath)
 import System.Posix.Types (FileMode)
@@ -535,10 +536,10 @@ data Finalised = Finalised
 -- scan references, tree-hash, compute the content address, root it, reuse an
 -- identical existing item or refuse a collision, rewrite the self token, rename,
 -- verify the inverse mapping, and return the final path with its NAR facts.
-finaliseContentOutput :: ByteString -> ByteString -> ByteString -> ByteString
+finaliseContentOutput :: Store -> ByteString -> ByteString -> ByteString -> ByteString
   -> [RawFilePath] -> Map.Map ByteString ByteString -> RawFilePath
   -> (ByteString -> IO ()) -> IO Finalised
-finaliseContentOutput store token output name allPaths finalOutputs actualTokenPath addTempRoot = do
+finaliseContentOutput store storeDir token output name allPaths finalOutputs actualTokenPath addTempRoot = do
   let physical = if B.null actualTokenPath then token else actualTokenPath
       referencePaths0 = allPaths ++ Map.elems finalOutputs
   checkReservedTree physical 0 (baseName token)
@@ -548,7 +549,7 @@ finaliseContentOutput store token output name allPaths finalOutputs actualTokenP
   (initialReferences, _) <- scanReferences physical referencePaths0
   built <- treeHash physical
   let namingReferences = Set.delete token initialReferences
-      final = contentAddressedPath store output name built (Set.toList namingReferences)
+      final = contentAddressedPath storeDir output name built (Set.toList namingReferences)
   addTempRoot final
   let referencePaths = final : referencePaths0
       oldHash = hashPart token
@@ -565,16 +566,33 @@ finaliseContentOutput store token output name allPaths finalOutputs actualTokenP
         deleteTree physical
         (references, nar, size) <- scanAndHash final
         pure (Finalised final references nar size False)
+      -- C++ finaliseContentOutput: a final path produced by an earlier output of
+      -- this same build is not registered until the whole output set is checked.
+      stagedSibling = any (\(siblingToken, siblingFinal) ->
+        siblingFinal == final || (physical == siblingToken && final == siblingFinal))
+        (Map.toList finalOutputs)
+      finaliseFresh = do
+        rewriteTree physical oldHash newHash
+        Files.rename physical final
+        good <- sameContent final final token built siblings
+        unless good (deleteTree final >> caError ("CA inverse mapping failed for `" ++ C.unpack final ++ "'"))
+        (references, nar, size) <- scanAndHash final
+        pure (Finalised final references nar size True)
   exists <- Files.fileExist final
-  if exists
-    then reuseExisting
+  if not exists
+    then finaliseFresh
     else do
-      rewriteTree physical oldHash newHash
-      Files.rename physical final
-      good <- sameContent final final token built siblings
-      unless good (deleteTree final >> caError ("CA inverse mapping failed for `" ++ C.unpack final ++ "'"))
-      (references, nar, size) <- scanAndHash final
-      pure (Finalised final references nar size True)
+      valid <- isValidPath store final
+      if not valid && not stagedSibling
+        then do
+          -- A daemon that died between the rename and registration leaves an
+          -- unregistered tree here.  The token lock prevents another build of
+          -- this output from concurrently creating it.  The new token tree has
+          -- independently selected this content address; replace the leftover
+          -- and prove the inverse mapping below (C++ ca.cc).
+          deleteTree final
+          finaliseFresh
+        else reuseExisting
 
 -- | C++ removeGoonixEnvironment: goonix* and __files/__file:* are daemon
 -- metadata, never builder environment.
