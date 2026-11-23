@@ -175,7 +175,15 @@ checkReservedTree path depth logicalName = do
 -- mode and mtime=1 (C++ rewriteRegularFile).
 rewriteRegularFile :: RawFilePath -> ByteString -> ByteString -> FileMode -> IO ()
 rewriteRegularFile path from to mode = do
-  Files.setFileMode path 0o600
+  -- C++ rewriteRegularFile: make the original READABLE if it is not, and NEVER
+  -- CLEAR A BIT.  chmod 0600 here would strip the mode of the ORIGINAL inode,
+  -- which a hard-linked twin outside this tree still shares (the store's .links
+  -- dedup pool, or another store item): the rewrite installs a NEW inode at
+  -- `path`, so the twin keeps whatever this left behind.  Measured against the
+  -- C++ daemon: an 0555 executable's twin stays 0555, and a file whose rewrite
+  -- is refused stays 0555; chmod 0600 made both 0600.
+  original <- Files.fileMode <$> Files.getSymbolicLinkStatus path
+  when (original .&. 0o400 == 0) (Files.setFileMode path ((original .&. 0o7777) .|. 0o400))
   let temporary = path <> ".goonix-rewrite"
   exists <- Files.fileExist temporary
   when exists (caError ("CA temporary file `" ++ C.unpack temporary ++ "' already exists"))
