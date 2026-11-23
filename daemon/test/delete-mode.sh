@@ -67,6 +67,17 @@ echo "=== Haskell ==="; cat "$scratch/hs.txt"
 # the parent made writable (and restored).  C++ leaves the store root
 # group-writable and simply fails on a read-only parent.  Compare the
 # mode-restoration property instead of demanding the same outcome.
+# A probe that produced NOTHING must not read as agreement: two empty files
+# diff equal.  Require both sides to have produced their expected result lines.
+for f in cxx hs; do
+  if ! test -s "$scratch/$f.txt"; then
+    echo "EMPTY_PROBE_OUTPUT: the $f probe produced no result lines"
+    test -f "$scratch/$f-compile.log" && tail -5 "$scratch/$f-compile.log"
+    test -f "$scratch/$f-build.log" && tail -5 "$scratch/$f-build.log"
+    exit 1
+  fi
+done
+
 for f in cxx hs; do
   grep -v '^delete-readonly-parent ' "$scratch/$f.txt" > "$scratch/$f-core.txt"
 done

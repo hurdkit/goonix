@@ -62,6 +62,17 @@ chmod -R u+w "$scratch/hs-run" 2>/dev/null
 
 echo "=== C++ (reference) ==="; cat "$scratch/cxx.txt"
 echo "=== Haskell ==="; cat "$scratch/hs.txt"
+# A probe that produced NOTHING must not read as agreement: two empty files
+# diff equal.  Require both sides to have produced their expected result lines.
+for f in cxx hs; do
+  if ! test -s "$scratch/$f.txt"; then
+    echo "EMPTY_PROBE_OUTPUT: the $f probe produced no result lines"
+    test -f "$scratch/$f-compile.log" && tail -5 "$scratch/$f-compile.log"
+    test -f "$scratch/$f-build.log" && tail -5 "$scratch/$f-build.log"
+    exit 1
+  fi
+done
+
 if diff -u "$scratch/cxx.txt" "$scratch/hs.txt" > "$scratch/diff.txt" 2>&1; then
   echo "DEDUP_MODE_MATCH: Haskell matches C++ on every fixture"
   exit 0

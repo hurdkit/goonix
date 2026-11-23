@@ -70,6 +70,17 @@ echo "=== Haskell ==="; cat "$scratch/hs.txt"
 # Normalise the two things that are legitimately different: the scratch path,
 # and the error WRAPPER (HS shows StoreError{...}, C++ the bare message).  The
 # comparison is on the behaviour and the message text, not the Haskell show.
+# A probe that produced NOTHING must not read as agreement: two empty files
+# diff equal.  Require both sides to have produced their expected result lines.
+for f in cxx hs; do
+  if ! test -s "$scratch/$f.txt"; then
+    echo "EMPTY_PROBE_OUTPUT: the $f probe produced no result lines"
+    test -f "$scratch/$f-compile.log" && tail -5 "$scratch/$f-compile.log"
+    test -f "$scratch/$f-build.log" && tail -5 "$scratch/$f-build.log"
+    exit 1
+  fi
+done
+
 for f in cxx hs; do
   sed -e "s|$scratch/$f-run|SCRATCH|g" "$scratch/$f.txt" > "$scratch/$f-norm.txt"
 done
