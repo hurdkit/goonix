@@ -18,6 +18,9 @@
 # installed package's guile + modules via build-aux/test-driver.scm, capturing
 # .trs.  A common GOONIX_SCAN_REAL_STORE fixture makes ca-scan's real-store count
 # host-independent.  Finally compare-trs.sh HS vs CXX by test name.
+#
+# CA_COUNTED_SUITES overrides the suite list (default: all 16).  A subset run is
+# for diagnosing one suite; only the full 16-suite run counts as the gate.
 set -uo pipefail
 hs_pkg=${1:?usage: ca-counted-gate.sh HS_PKG CXX_PKG WORK}
 cxx_pkg=${2:?}
@@ -28,7 +31,7 @@ hs_daemon=$(readlink -f "$hs_pkg/bin/guix-daemon")
 cxx_daemon=$(readlink -f "$cxx_pkg/bin/guix-daemon")
 uid=$(id -u); gid=$(id -g)
 mkdir -p "$work"
-suites="ca ca-adopt ca-build ca-compiler ca-existing-item ca-files ca-fixed-output ca-full ca-graft-identity ca-grafts ca-opaque ca-policy ca-references ca-rewrite ca-scan ca-sharing"
+suites=${CA_COUNTED_SUITES:-"ca ca-adopt ca-build ca-compiler ca-existing-item ca-files ca-fixed-output ca-full ca-graft-identity ca-grafts ca-opaque ca-policy ca-references ca-rewrite ca-scan ca-sharing"}
 
 # --- dev-shell guile + load paths (the client loads the INSTALLED package's
 #     modules first, then the dev shell's guile-gcrypt/guile-git/etc.) ---
