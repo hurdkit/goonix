@@ -126,6 +126,7 @@ EXTRA_DIST += \
   nix/libstore/order-probe.cc \
   daemon/test/same-mode/Main.hs daemon/test/same-mode.sh \
   nix/libstore/same-probe.cc \
+  daemon/test/inverse-sibling-boundary.hs daemon/test/inverse-sibling-boundary.sh \
   daemon/test/deep-scan-timeout.hs daemon/test/deep-scan-timeout.sh \
   daemon/proxy/Main.hs \
   daemon/test/wire-proxy/Main.hs daemon/test/wire-proxy/run.sh \

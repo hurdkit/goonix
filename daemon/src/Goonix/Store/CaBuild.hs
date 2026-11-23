@@ -280,6 +280,15 @@ inverseTree path final token siblings = go path 0
       let step current (siblingToken, siblingFinal) =
             either error id (replaceWhole current (hashPart siblingFinal) (hashPart siblingToken) path False)
       in foldl step (either error id (replaceWhole value final token path False)) (Map.toDescList siblings)
+    -- Every pattern inverse() replaces, not just `final`.  The streaming
+    -- boundary must retain a partial match of ANY of them: a sibling hash that
+    -- ends within 31 bytes of the end of a file, or that straddles a 128 KiB
+    -- read, was otherwise split across chunks and never inverted.  sameContent
+    -- then reported false for identical content - a spurious CA collision for
+    -- multi-output derivations (e.g. a wrapper whose last line execs a sibling
+    -- output's binary).  Shared with C++ inverseTree, which is being fixed the
+    -- same way.
+    patterns = final : [hashPart siblingFinal | (_, siblingFinal) <- Map.toList siblings]
     go current depth = do
       when (depth > 1024) (caError "CA tree nesting exceeds 1024 directories")
       status <- Files.getSymbolicLinkStatus current
@@ -289,7 +298,26 @@ inverseTree path final token siblings = go path 0
           let executable = if Files.fileMode status .&. 0o100 /= 0 then 1 else 0
           updateHashSink sink (treeDomain <> B.pack [1, executable] <> put64 (fromIntegral (Files.fileSize status)))
           withBinaryFile (C.unpack current) ReadMode $ \handle ->
-            let keep = B.length final - 1
+            let keep = maximum (0 : [B.length p - 1 | p <- patterns])
+                -- Emit up to count0, holding back only a match that STRADDLES
+                -- that point.  `combined` already carries `keep` bytes of
+                -- lookahead, and keep >= every pattern length - 1, so a match
+                -- starting at or after count0-keep is fully visible: test the
+                -- whole pattern, not just its prefix.  A prefix test is wrong
+                -- for a self-overlapping pattern (32 equal characters): its
+                -- 31-byte suffix is also its 31-byte prefix, so a COMPLETE
+                -- match ending at count0 looked like a partial one and was cut
+                -- after its first byte, leaving neither half matchable.
+                retained count0 combined =
+                  let straddling = [s
+                                   | p <- patterns
+                                   , let n = B.length p
+                                   , s <- [max 0 (count0 - keep) .. count0 - 1]
+                                   , s + n > count0
+                                   , B.take n (B.drop s combined) == p]
+                  in case straddling of
+                       [] -> count0
+                       _ -> minimum straddling
                 loop pending = do
                   chunk <- B.hGetSome handle (128 * 1024)
                   if B.null chunk
@@ -297,8 +325,7 @@ inverseTree path final token siblings = go path 0
                     else do
                       let combined = pending <> chunk
                           count0 = if B.length combined > keep then B.length combined - keep else 0
-                          count = head ([count0 - len | len <- [min count0 (B.length final - 1), min count0 (B.length final - 1) - 1 .. 1],
-                                         B.drop (count0 - len) (B.take count0 combined) == B.take len final] ++ [count0])
+                          count = retained count0 combined
                       updateHashSink sink (inverse (B.take count combined))
                       loop (B.drop count combined)
             in loop B.empty
