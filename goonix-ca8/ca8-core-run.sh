@@ -139,7 +139,7 @@ mount --bind '$scratch/etc/group.ns' /etc/group
 if [ -d /run/nscd ] || mkdir -p /run/nscd 2>/dev/null; then
   mount -t tmpfs tmpfs /run/nscd 2>/dev/null || true
 fi
-# `mkdir -p /var/empty` fails with "Permission denied" even as namespace root
+# 'mkdir -p /var/empty' fails with "Permission denied" even as namespace root
 # on Ubuntu, where /var is root-owned on the host filesystem.  The build users'
 # home is $scratch/var-empty instead; this is best-effort only.
 mkdir -p /var/empty 2>/dev/null || true
