@@ -1528,6 +1528,38 @@ int main(int argc, char ** argv)
                         op.name, delta));
             }
         }
+
+        /* (c) A rejection in the FINAL TAIL of a file longer than one read must
+           name the FILE offset, not the offset within the remaining tail.  The
+           final flush used to call replaceWhole directly, which reports from 0
+           of the tail it was handed.  Put an opaque occurrence well past the
+           first read, in what is left when the loop ends, and check the message.
+           The expected offset is computed from the body, not from the code. */
+        for (auto & op : opaques) {
+            /* The occurrence must lie in what is left AFTER the loop's last
+               round, i.e. within the final `keep' bytes of the file, so the
+               flush is what judges it.  At 2 reads + 4096 the UTF-32 case was
+               still caught inside the loop (measured: it passed under both
+               versions), because the loop's last round still had it before its
+               emit point.  Put it near EOF instead, with only a short suffix. */
+            size_t at = 2 * boundary + 4096;
+            std::string body = std::string(at, 'p') + op.bytes;
+            Path dir = createTempDir("", "goonix-rewrite-tail-offset");
+            AutoDelete del(dir, true);
+            Path f = dir + "/f";
+            writeFile(f, body);
+            std::string message;
+            try {
+                checkRewriteForTest(f, from, to);
+            } catch (const Error & e) { message = e.what(); }
+            check(message.find(std::format("at byte {}", at)) != std::string::npos,
+                std::format("{} in the final tail reports the FILE offset {}", op.name, at));
+            /* Measured: only UTF-16LE and the 8-byte fragment go RED without the
+               fix.  A UTF-32LE encoding is 128 bytes and keep is 127, so its
+               START is always < process in the loop's last round - it can never
+               reach the flush, and the loop already reports the file offset
+               correctly.  The case is kept as a control, not as evidence. */
+        }
     }
 
     return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
