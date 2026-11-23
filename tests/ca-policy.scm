@@ -876,5 +876,81 @@ NarSize: 1234\nNarHash: sha256:~a\nReferences: \nSystem: ~a\nDeriver: ~a\n"
                                #~(mkdir #$output)
                                #:addressing #f))))))))
 
+(test-group "a reference list may name an output the dependent does not consume"
+  ;; CA-6 gate run 13 died here, at glibc-2.41 over gcc-cross-boot0:
+  ;;   goonix: unresolved placeholder
+  ;;   `/gnu/store/eotuouutuotottteeeuuetueetootttt-gcc-cross-boot0-14.3.0-lib'
+  ;;   in resolved derivation
+  ;; Measured in the gate's store: glibc takes that derivation as an input but
+  ;; requests ONLY ["out"], while its allowedReferences names the derivation's
+  ;; LIB output.  resolveDerivation (nix/libstore/ca.cc:889) builds its
+  ;; replacement map from input.second, i.e. only the REQUESTED sub-outputs, so
+  ;; lib's placeholder gets no replacement, survives in allowedReferences, and
+  ;; checkResolvedDerivation's scan refuses the derivation at registration.
+  ;;
+  ;; The whole fixture is inside one catch so a refusal reports as failed
+  ;; assertions instead of aborting the group (the ca-policy.scm idiom).
+  (let ((fresh (lambda (prefix)
+                 (string-append prefix "-"
+                                (number->string
+                                 (random 1000000000
+                                         (random-state-from-platform)))))))
+    (let ((multi-name (fresh "ca-reflist-multi"))
+          (user-name  (fresh "ca-reflist-user")))
+    (catch #t
+      (lambda ()
+        (let* ((multi (trivial multi-name
+                        #~(begin
+                            (call-with-output-file #$output
+                              (lambda (p) (display "OUT" p)))
+                            (call-with-output-file #$output:lib
+                              (lambda (p) (display "LIB" p))))
+                        '() '()))
+               (multi (package
+                        (inherit multi)
+                        (outputs '("out" "lib"))))
+               (multi-drv (parameterize ((%package-addressing-policy 'content))
+                            (package-derivation store multi)))
+               (lib-placeholder (derivation->output-path multi-drv "lib")))
+          (test-assert "the non-consumed sibling output really is a placeholder"
+            (placeholder-path? lib-placeholder))
+          ;; The reviewer's required case: lib must NOT be realised before the
+          ;; dependent is built.  A fix that only rewrote placeholders when the
+          ;; item happened to be in the store would pass here by luck and be
+          ;; refused on a machine that substituted only `out', or after a GC of
+          ;; lib.  So assert it is absent, then build the DEPENDENT first.
+          (test-assert "lib is NOT realised before the dependent is built"
+            (not (valid-path? store lib-placeholder)))
+          ;; allowed-references must name BOTH: out is what the builder actually
+          ;; refers to, lib is the non-consumed sibling under test.  Listing lib
+          ;; alone is correctly refused with "is not allowed to refer to path"
+          ;; (measured), which is a different property, not this bug.
+          (let ((drv (parameterize ((%package-addressing-policy 'content))
+                       (run-with-store store
+                         (gexp->derivation user-name
+                           #~(call-with-output-file #$output
+                               (lambda (p) (display #$multi:out p)))
+                           #:allowed-references (list (gexp-input multi "out")
+                                                      (gexp-input multi "lib"))
+                           #:addressing 'content)))))
+            (test-assert "lowering a dependent whose allowed-references names a non-consumed output succeeds"
+              (derivation? drv))
+            ;; The requested outputs must include lib, deterministically from
+            ;; the reference list rather than from store contents.
+            (test-assert "the reference-list output is a REQUESTED input output"
+              (any (lambda (input)
+                     (and (member "lib" (derivation-input-sub-derivations input))
+                          (string=? (derivation-file-name
+                                     (derivation-input-derivation input))
+                                    (derivation-file-name multi-drv))))
+                   (derivation-inputs drv)))
+            (test-assert "and it builds"
+              (begin (build-derivations store (list drv)) #t)))))
+      (lambda (key . args)
+        (format #t "refusal: ~a ~a~%" key args)
+        (test-assert "lowering a dependent whose allowed-references names a non-consumed output succeeds"
+          #f)
+        (test-assert "and it builds" #f))))))
+
 (close-connection store)
 (test-end)

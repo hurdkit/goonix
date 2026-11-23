@@ -1072,6 +1072,45 @@ names and file names suitable for the #:allowed-references argument to
 
     (mapm/accumulate-builds lower lst)))
 
+(define (goonix-reference-inputs allowed disallowed system target)
+  "Return the <derivation-input>s for every derivation output named in the
+reference lists ALLOWED and DISALLOWED, as a store-monadic value.
+
+goonix: an output named in a reference list is a REQUIRED input output, even
+when the builder never mentions it.  CA-6 gate run 13 died on this: glibc-2.41
+takes gcc-cross-boot0 with [\"out\"] only, while its allowedReferences names
+that derivation's LIB output.  resolveDerivation builds its replacement map
+from the REQUESTED outputs, so lib's placeholder had no replacement, survived
+in allowedReferences, and checkResolvedDerivation refused the derivation.
+
+Requesting those outputs here is DETERMINISTIC: it depends only on the gexp's
+own reference lists, never on what happens to be in the store.  A substitute
+that fetched only `out', or a GC of `lib', cannot change how the derivation
+resolves.  It forces no extra build either, because the input derivation's
+builder produces all of its outputs at once.
+
+Bare output names (\"out\", \"static\") name THIS derivation's own outputs and
+are handled by checkGoonixReferences; they are not inputs.  Mirrors
+lower-inputs' shape and native? handling."
+  (with-monad %store-monad
+    (define lower
+      (match-lambda
+        ((? string? _) (return #f))
+        (($ <gexp-input> thing output native?)
+         (mlet %store-monad ((obj (lower-object thing system
+                                                #:target (and (not native?)
+                                                              target))))
+           (return (and (derivation? obj)
+                        (derivation-input obj (list output))))))
+        (thing
+         (mlet %store-monad ((obj (lower-object thing system
+                                                #:target target)))
+           (return (and (derivation? obj) (derivation-input obj)))))))
+    (mlet %store-monad ((inputs (mapm/accumulate-builds
+                                lower (append (or allowed '())
+                                              (or disallowed '())))))
+      (return (filter derivation-input? inputs)))))
+
 (define default-guile-derivation
   ;; Here we break the abstraction by talking to the higher-level layer.
   ;; Thus, do the resolution lazily to hide the circular dependency.
@@ -1337,6 +1376,10 @@ The other arguments are as for 'derivation'."
                                                          #:system system
                                                          #:target target)
                                        (return #f)))
+                       ;; goonix: reference-list outputs are required inputs.
+                       (ref-inputs (goonix-reference-inputs
+                                    allowed-references disallowed-references
+                                    system target))
                        (guile -> (lowered-gexp-guile lowered))
                        (addressing -> ((module-ref (resolve-module '(guix ca policy)) 'gexp-addressing)
                                        addressing (lowered-gexp-guile lowered)
@@ -1376,7 +1419,26 @@ The other arguments are as for 'derivation'."
                                  ,@(match graphs
                                      (((_ . inputs) ...)
                                       (filter derivation-input? inputs))
-                                     (#f '())))
+                                     (#f '()))
+                                 ;; goonix: an output named in a reference list
+                                 ;; is a REQUIRED input output, even when the
+                                 ;; builder never mentions it.  CA-6 gate run 13
+                                 ;; died on this: glibc-2.41 takes
+                                 ;; gcc-cross-boot0 with ["out"] only, while its
+                                 ;; allowedReferences names that derivation's
+                                 ;; lib output.  resolveDerivation builds its
+                                 ;; replacement map from the REQUESTED outputs,
+                                 ;; so lib's placeholder survived and the
+                                 ;; resolved derivation was refused.
+                                 ;;
+                                 ;; Requesting it here is deterministic: it is a
+                                 ;; function of the gexp's own reference lists,
+                                 ;; never of what happens to be in the store, so
+                                 ;; the same derivation resolves identically on
+                                 ;; every machine.  It forces no extra build
+                                 ;; either - that derivation's builder produces
+                                 ;; all its outputs at once.
+                                 ,@ref-inputs)
                       #:sources `(,@(if (eq? addressing 'input) ;goonix: builder embedded for CA
                                         (list builder)
                                         '())
