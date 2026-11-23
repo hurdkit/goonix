@@ -138,11 +138,27 @@ run_daemon CXX "$cxx_daemon" "$cxx_pkg"
 
 echo "=== NAME-BY-NAME COMPARISON (CXX baseline vs HS) ==="
 mkdir -p "$work/cxx-names" "$work/hs-names"
+# Every requested suite must have produced a .trs on BOTH sides.  The copies
+# below tolerate a missing file, so without this a lane that died early would
+# silently drop out of the comparison and the gate could report agreement over
+# a subset (or, with compare-trs.sh's old empty fall-through, over nothing).
+missing=0
 for name in $suites; do
+  for lane in CXX HS; do
+    if test ! -f "$work/$lane/results/$name.trs"; then
+      echo "MISSING_TRS $lane $name"
+      missing=1
+    fi
+  done
   cp "$work/CXX/results/$name.trs" "$work/cxx-names/$name.trs" 2>/dev/null || true
   cp "$work/HS/results/$name.trs" "$work/hs-names/$name.trs" 2>/dev/null || true
 done
+echo "SUITE_COVERAGE_RC=$missing"
 bash "$root/daemon/test/compare-trs.sh" "$work/cxx-names" "$work/hs-names" > "$work/compare.log" 2>&1
-echo "COMPARE_RC=$?"
-grep -E 'CHANGED|MISSING|EXTRA' "$work/compare.log" || echo 'ALL NAMES IDENTICAL'
+compare_rc=$?
+echo "COMPARE_RC=$compare_rc"
+grep -E 'CHANGED|MISSING|EXTRA|EMPTY_COMPARISON' "$work/compare.log" || echo 'ALL NAMES IDENTICAL'
+if test "$missing" -ne 0 || test "$compare_rc" -ne 0; then
+  echo "COUNTED GATE INCOMPLETE: not every suite was compared"
+fi
 echo "=== counted gate done ==="
