@@ -66,7 +66,7 @@ for pair in \
 do
   set -- $pair
   runner="$here/$1"; part="$here/$2"
-  if grep -q 'exec unshare --pid --fork --kill-child -- bash' "$runner"; then
+  if grep -qE 'exec unshare --pid --fork --kill-child -- (bash|"\$part_bash")' "$runner"; then
     echo "ok   $1 enters a private PID namespace"
   else
     echo "FAIL $1 has no exec unshare --pid --fork --kill-child line"
@@ -88,6 +88,28 @@ done
 bash "$here/ca-counted-gate-part.sh" /nonexistent-ns "$root" /nonexistent-daemon \
   regression /nonexistent-guile "" "" "" "" "" "" "ca" > /dev/null 2>&1
 check "the counted gate part refuses to start a daemon outside a PID namespace" 1 $?
+
+# 6. The scratch-/bin hazard (found on WSL by the lanes session): worktree mode
+#    bind-mounts a scratch /bin over /bin, so the runner must exec an ABSOLUTE
+#    bash that survives the mount, and setup must provide bash in that scratch.
+if test -f "$here/root-ci-setup.sh"; then
+  if grep -q 'work/bin/bash' "$here/root-ci-setup.sh"; then
+    echo "ok   root-ci-setup provides bash in the scratch /bin"
+  else
+    echo "FAIL root-ci-setup does not put bash in the scratch /bin"
+    fails=$((fails + 1))
+  fi
+fi
+for pair in "root-ci.sh" "stress-gate.sh"; do
+  runner="$here/$pair"
+  test -f "$runner" || continue
+  if grep -qE 'kill-child -- bash ' "$runner"; then
+    echo "FAIL $pair execs a bare bash, hidden by the scratch /bin mount"
+    fails=$((fails + 1))
+  else
+    echo "ok   $pair execs an absolute bash"
+  fi
+done
 
 if test "$fails" -eq 0; then
   echo "REGRESSION PASS: namespace runners are job-isolated"

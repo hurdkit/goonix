@@ -69,7 +69,13 @@ timeout 300 unshare --user \
     # namespace before the daemon starts.  A daemon kills every process of a
     # build user before a build and those uids come from the host range, so
     # without this the kill(-1) of one job reaches the builders of another.
-    exec unshare --pid --fork --kill-child -- bash "$0" "$@"
+    # Absolute bash: worktree mode bind-mounts a scratch /bin over /bin, which
+    # hides /bin/bash on a merged-usr host (WSL: the real one is /usr/bin/bash).
+    # root-ci-setup.sh links the real bash into that scratch /bin; prefer the
+    # absolute path of the running shell when it is not under the hidden /bin.
+    part_bash=$BASH
+    case "$part_bash" in /bin/*) part_bash=$(command -v bash) ;; esac
+    exec unshare --pid --fork --kill-child -- "$part_bash" "$0" "$@"
   ' "$here/root-ci-part.sh" "$work" "$root" "$daemon" "$mode" "$gitrev" \
     "$payload_hash" "$git_hash" "$dev_glp" "$dev_glcp" "${ROOT_CI_CLIENT:-}"
 rc=$?

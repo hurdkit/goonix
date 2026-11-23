@@ -121,7 +121,12 @@ run_daemon() {
       # users processes before a build, and the build-user uids come from the
       # host range, so without this one jobs kill(-1) reaches another jobs
       # builders.  --kill-child reaps this jobs strays when it exits.
-      exec unshare --pid --fork --kill-child -- bash "$0" "$@"
+      # Absolute bash: a scratch /bin bind-mounted over /bin hides /bin/bash on a
+      # merged-usr host (WSL: the real one is /usr/bin/bash).  Prefer the absolute
+      # path of the running shell when it is not under the hidden /bin.
+      part_bash=$BASH
+      case "$part_bash" in /bin/*) part_bash=$(command -v bash) ;; esac
+      exec unshare --pid --fork --kill-child -- "$part_bash" "$0" "$@"
     ' "$here/ca-counted-gate-part.sh" "$ns" "$root" "$daemon" "$label" \
       "$guile_bin" "$dev_glp" "$dev_glcp" "$pkg_glp" "$pkg_glcp" "$fixture" \
       "$slirp_bin" "$suites"

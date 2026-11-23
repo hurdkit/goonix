@@ -95,7 +95,12 @@ timeout 900 unshare --user \
     # namespace before the daemon starts.  A daemon kills every process of a
     # build user before a build and those uids come from the host range, so
     # without this the kill(-1) of one job reaches the builders of another.
-    exec unshare --pid --fork --kill-child -- bash "$0" "$@"
+    # Absolute bash: a scratch /bin bind-mounted over /bin hides /bin/bash on a
+    # merged-usr host (WSL: the real one is /usr/bin/bash).  Prefer the absolute
+    # path of the running shell when it is not under the hidden /bin.
+    part_bash=$BASH
+    case "$part_bash" in /bin/*) part_bash=$(command -v bash) ;; esac
+    exec unshare --pid --fork --kill-child -- "$part_bash" "$0" "$@"
   ' "$here/ca-deep-scan-installed-part.sh" "$ns" "$root" "$hs_daemon" \
     "$guile_bin" "$dev_glp" "$dev_glcp" "$pkg_glp" "$pkg_glcp"
 run_rc=$?
