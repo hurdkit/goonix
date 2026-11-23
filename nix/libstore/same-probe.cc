@@ -164,14 +164,10 @@ int main(int argc, char ** argv)
             expectedOf(d + "/uses-sib", none), sib);
     }
 
-    /* 8b. The sibling hash INSIDE the retention tail: it MUST still be
-           inverted.  This asserts the CORRECT result, not the old limitation.
+    /* 8b. The sibling hash INSIDE the retention tail must still be inverted.
            The expectation is computed INDEPENDENTLY (substitute in memory, then
-           frame and hash) rather than through inverseTreeForTest, which shares
-           the boundary bug and would otherwise agree with the broken output.
-           Until the C++ inverseTree fix lands on goonix-implementation this
-           case reports false on the C++ side and true on the fixed Haskell
-           side, so the probe DIFFERS.  That is expected (reviewer, 2026-11-23). */
+           frame and hash) rather than through inverseTreeForTest, so a shared
+           boundary bug cannot agree with itself. */
     {
         useFixture(base, "f8b");
         Path d = named(fin, "item");

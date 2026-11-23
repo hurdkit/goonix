@@ -125,14 +125,10 @@ main = do
      e <- expectedOf (d <> "/uses-sib") none
      report "siblings-unapplied" (d <> "/uses-sib") d (named s tok "item") e sib
 
-  -- 8b. The sibling hash INSIDE the retention tail: it MUST still be inverted.
-  --     This asserts the CORRECT result, not the old limitation.  The
+  -- 8b. The sibling hash INSIDE the retention tail must still be inverted.  The
   --     expectation is computed INDEPENDENTLY (substitute in memory, then frame
-  --     and hash) rather than through inverseTree, which shared the boundary
-  --     bug and would otherwise agree with the broken output.  Until the C++
-  --     inverseTree fix lands on goonix-implementation, C++ reports false here
-  --     and the fixed Haskell side true, so the probe DIFFERS - expected
-  --     (reviewer, 2026-11-23).
+  --     and hash) rather than through inverseTree, so a shared boundary bug
+  --     cannot agree with itself.
   do s <- fixture "f8b"
      let d = named s fin "item"
          sibFin = C.pack (replicate 32 's')
