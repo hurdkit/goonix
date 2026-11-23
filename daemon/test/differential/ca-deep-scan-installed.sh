@@ -27,7 +27,18 @@ root=$(CDPATH= cd -- "$(dirname "$0")/../../.." && pwd)
 here="$root/daemon/test/differential"
 hs_daemon=$(readlink -f "$hs_pkg/bin/guix-daemon")
 uid=$(id -u); gid=$(id -g)
-rm -rf "$work"; mkdir -p "$work"
+# A store item is read-only (dirs 0555), so `rm -rf` alone leaves the previous
+# run's store standing (EACCES per entry) and the run would test a leftover
+# tree.  Same defect as ca-counted-gate.sh setup_ns; make it writable first.
+if test -e "$work"; then
+  chmod -R u+rwX "$work" 2>/dev/null || true
+  rm -rf "$work"
+  if test -e "$work"; then
+    echo "SETUP FAILED: could not clear $work; refusing to test a leftover store" >&2
+    exit 1
+  fi
+fi
+mkdir -p "$work"
 
 # The six deep-scan cases that the packaging gap broke (tests/ca-build.scm).
 deep_cases=(
