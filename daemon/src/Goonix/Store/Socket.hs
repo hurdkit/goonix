@@ -44,7 +44,7 @@ data Socket = Socket !Fd !(Maybe (MVar ()))
 
 foreign import ccall unsafe "goonix_listen_unix" c_listen_unix :: CString -> IO CInt
 foreign import ccall unsafe "goonix_socket_errno" c_socket_errno :: IO CInt
-foreign import ccall unsafe "goonix_listen_tcp" c_listen_tcp :: CString -> CString -> IO CInt
+foreign import ccall safe "goonix_listen_tcp" c_listen_tcp :: CString -> CString -> IO CInt
 foreign import ccall safe "goonix_accept" c_accept :: CInt -> IO CInt
 foreign import ccall unsafe "goonix_peer_uid" c_peer_uid :: CInt -> Ptr CUInt -> IO CInt
 foreign import ccall unsafe "goonix_is_tcp" c_is_tcp :: CInt -> IO CInt
