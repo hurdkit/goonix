@@ -103,6 +103,7 @@ EXTRA_DIST += \
   daemon/test/differential/sqlite-contention.sh daemon/test/differential/sqlite-contention.hs \
   daemon/test/differential/socket-idle.sh daemon/test/differential/socket-idle.hs \
   daemon/test/differential/child-wait.sh daemon/test/differential/child-wait.hs \
+  daemon/test/differential/offload-idle.sh daemon/test/differential/offload-idle.hs \
   daemon/test/differential/export-memory.sh daemon/test/differential/export-memory.scm \
   daemon/test/differential/nar-memory.sh daemon/test/differential/nar-memory.scm \
   daemon/test/differential/substitute-log-flood.sh daemon/test/differential/substitute-log-flood.scm \

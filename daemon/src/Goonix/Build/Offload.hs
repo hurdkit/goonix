@@ -13,11 +13,13 @@ module Goonix.Build.Offload
   , acceptOffload
   , finishOffload
   , stopHook
+  , receiveLine
   ) where
 
 import Control.Concurrent (forkFinally)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, newMVar, putMVar, takeMVar)
-import Control.Exception (SomeException, bracketOnError, catch, throwIO)
+import Control.Exception (IOException, SomeException, bracketOnError, catch, throwIO, finally)
+import Control.Concurrent.STM (atomically)
 import Control.Monad (forM_, unless)
 import Data.ByteString (ByteString)
 import System.Exit (ExitCode (..))
@@ -27,7 +29,7 @@ import Goonix.Build.Wait (waitProcessStatusNonBlocking)
 import Goonix.Store.ReadOnly (storeError)
 import System.IO (Handle, hClose, hFlush)
 import System.Posix.IO.ByteString (createPipe, closeFd, fdToHandle, setFdOption, FdOption (CloseOnExec, NonBlockingRead), fdRead)
-import GHC.Conc (threadWaitRead)
+import GHC.Conc (threadWaitReadSTM)
 import GHC.IO.Exception (ioe_errno)
 import Foreign.C.Error (eAGAIN, eWOULDBLOCK, Errno (..))
 import System.Posix.Process (ProcessStatus (Exited, Terminated, Stopped))
@@ -43,7 +45,6 @@ data HookReply = HookDecline | HookPostpone | HookAccept deriving (Eq, Show)
 
 data Hook = Hook
   { hookInput :: !Handle
-  , hookOutput :: !Handle
   , hookOutputFd :: !Fd
   , hookBuilder :: !Handle
   , hookPid :: !ProcessID
@@ -76,12 +77,14 @@ startOffloadHook program system silent trace timeout =
     closeFd builderWrite
     -- Non-blocking so receiveLine waits through the IO manager instead of holding
     -- a capability in a raw blocking read while the offload helper is silent.
+    -- The output stays a RAW fd (no fdToHandle): a Handle registered on the fd
+    -- interferes with the raw-fd threadWaitReadSTM wait (EBADF), as Substitute.hs
+    -- also keeps its reply/log pipes as raw fds.
     setFdOption outputRead NonBlockingRead True
     input <- fdToHandle inputWrite
-    output <- fdToHandle outputRead
     builder <- fdToHandle builderRead
     stopped <- newMVar False
-    pure (Hook input output outputRead builder pid stopped)
+    pure (Hook input outputRead builder pid stopped)
   where
     makePipes = do
       (inputRead, inputWrite) <- createPipe
@@ -123,7 +126,7 @@ finishOffload :: Hook -> (ByteString -> IO ()) -> IO HelperStatus
 finishOffload hook emit = do
   agentDrained <- newEmptyMVar
   builderDrained <- newEmptyMVar
-  _ <- forkFinally (drain (hookOutput hook)) (putMVar agentDrained)
+  _ <- forkFinally (drainFd (hookOutputFd hook)) (putMVar agentDrained)
   _ <- forkFinally (drain (hookBuilder hook)) (putMVar builderDrained)
   status <- waitProcessStatusNonBlocking (hookPid hook)
   agentResult <- takeMVar agentDrained
@@ -140,13 +143,16 @@ finishOffload hook emit = do
     drain handle = do
       bytes <- B.hGetSome handle 32768
       unless (B.null bytes) $ emit bytes >> drain handle
+    drainFd fd = do
+      bytes <- fdRead fd 32768 `catch` \(_ :: IOException) -> pure B.empty
+      unless (B.null bytes) $ emit bytes >> drainFd fd
 
 stopHook :: Hook -> IO ()
 stopHook hook = do
   stopped <- takeMVar (hookStopped hook)
   unless stopped $ do
     closeIgnore (hookInput hook)
-    closeIgnore (hookOutput hook)
+    closeFd (hookOutputFd hook) `catchAny` pure ()
     closeIgnore (hookBuilder hook)
     -- Agent::~Agent uses a separate process group and SIGKILL.
     signalProcessGroup sigKILL (hookPid hook) `catchAny` pure ()
@@ -177,10 +183,14 @@ receiveLine hook = go []
           '\n' -> pure (B.concat (reverse acc))
           _ -> go (byte : acc)
     readByte fd = do
-      r <- (fdRead fd 1) `catch` wouldBlock
+      r <- (Just <$> fdRead fd 1) `catch` wouldBlock
       case r of
         Just bytes -> pure bytes
-        Nothing -> threadWaitRead fd >> readByte fd
+        Nothing -> do
+          (wait, unregister) <- threadWaitReadSTM fd
+          atomically wait `finally` unregister
+          readByte fd
+    wouldBlock :: IOException -> IO (Maybe ByteString)
     wouldBlock e
       | let errno = ioe_errno e
       , errno == Just (case eAGAIN of Errno n -> n)
