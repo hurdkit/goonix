@@ -69,6 +69,16 @@ setup_ns() {
   printf 'passwd: files\ngroup: files\nshadow: files\nhosts: files dns\n' > "$ns/etc/nsswitch.conf"
   "$sqlite3_bin" "$ns/var-guix/db/db.sqlite" < "$root/guix/store/schema.sql"
   printf 7 > "$ns/var-guix/db/schema"
+  # The daemon signs CA build records with /etc/guix/signing-key.sec.  The host
+  # key is root-owned 0600 and the namespace root maps to the caller (uid 1000),
+  # which cannot read it.  Bind-mount a scratch /etc/guix holding the test key
+  # (the established differential-test pattern: archive.sh / fresh-store.sh copy
+  # tests/keys/openpgp/signing-key.sec, chmod 0400).  The key only signs records
+  # within this fresh scratch store; it is not the host substitute key.
+  mkdir -p "$ns/etc-guix"
+  cp "$root/tests/keys/openpgp/signing-key.sec" "$ns/etc-guix/signing-key.sec"
+  cp "$root/tests/keys/openpgp/signing-key.pub" "$ns/etc-guix/signing-key.pub"
+  chmod 0400 "$ns/etc-guix/signing-key.sec"
   # The bootstrap binaries the CA suites add-to-store (gitignored in the tree,
   # present in the worktree).  search-bootstrap-binary maps x86_64->i686.
   mkdir -p "$ns/bootstrap"
@@ -100,6 +110,7 @@ run_daemon() {
       mount --bind "$ns/gnu-store" /gnu/store
       mount --bind "$ns/var-guix" /var/guix
       mount --bind "$ns/log-guix" /var/log/guix
+      mount --bind "$ns/etc-guix" /etc/guix
       # The installed daemon as namespace root: chroot ON (default), build users,
       # env -i (only TMPDIR/LC_ALL/PATH=/nonexistent).  No GUIX_*/GUILE_*, no
       # --no-offload: the package finds its own helpers and sandbox.
