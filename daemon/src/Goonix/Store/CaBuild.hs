@@ -54,17 +54,16 @@ import System.IO (IOMode (..), withBinaryFile, openBinaryFile, hClose)
 caError :: String -> IO a
 caError message = throwIO (userError message)
 
--- | breakOn for the pinned bytestring (which lacks it): the prefix before the
--- first occurrence and the rest starting at it; ("", "") when absent... the
--- whole input and "" when the needle is absent.
+-- | The prefix before the first occurrence and the rest starting at it; the
+-- whole input and "" when the needle is absent.  A wrapper over the library's
+-- B.breakSubstring (already used in Engine.hs and Archive.hs): the pinned
+-- bytestring lacks `breakOn`, not the search.  The previous byte-by-byte
+-- B.take/B.drop/== loop cost ~27 slice comparisons per byte, because
+-- replaceWhole runs one search per 8-byte fragment and per encoding for every
+-- regular file of every CA output.  Measured on an 8 MiB file with no
+-- occurrence: 2.180 s here against 0.016 s for the C++ string::find path.
 breakOn :: ByteString -> ByteString -> (ByteString, ByteString)
-breakOn needle haystack = go 0
-  where
-    go at
-      | at + B.length needle > B.length haystack = (haystack, B.empty)
-      | B.take (B.length needle) (B.drop at haystack) == needle =
-          (B.take at haystack, B.drop at haystack)
-      | otherwise = go (at + 1)
+breakOn = B.breakSubstring
 
 foreign import ccall unsafe "goonix_restore_mtime" c_restore_mtime :: CString -> CInt -> IO CInt
 
@@ -116,15 +115,16 @@ replaceWholeFrom input from to file rejectOpaque limit
         firstJust (x:xs) = case x of
           Just err -> Just err
           Nothing -> firstJust xs
-        -- The first occurrence STARTING before limit.  Scanning the whole
-        -- buffer instead would reject a plain prefix of FROM in the lookahead
-        -- that becomes a whole match in the next read.
-        occurrence needle = go 0
-          where
-            go at
-              | at >= limit || at + B.length needle > B.length value = Nothing
-              | B.take (B.length needle) (B.drop at value) == needle = Just at
-              | otherwise = go (at + 1)
+        -- The first occurrence STARTING before limit.  Searching only the first
+        -- limit + needle length - 1 bytes keeps that property: an occurrence
+        -- starting at limit or later cannot fit, while one straddling limit is
+        -- still seen whole.  Scanning the whole buffer instead would reject a
+        -- plain prefix of FROM in the lookahead that becomes a whole match in
+        -- the next read.  B.breakSubstring does the search (see breakOn).
+        occurrence needle =
+          let window = B.take (limit + B.length needle - 1) value
+              (before, rest) = B.breakSubstring needle window
+          in if B.null rest then Nothing else Just (B.length before)
         fragmentChecks =
           [ case occurrence fragment of
               Just at ->
