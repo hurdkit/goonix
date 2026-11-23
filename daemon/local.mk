@@ -100,6 +100,7 @@ EXTRA_DIST += \
   daemon/test/differential/stale-socket.c daemon/test/differential/socket-connect.c \
   daemon/test/differential/socket-query.c \
   daemon/test/differential/builtin-ci.sh daemon/test/differential/builtin-ci.scm \
+  daemon/test/differential/ca-counted-gate.sh \
   daemon/sandbox/README.md daemon/sandbox/guix-sandbox.cc \
   daemon/sandbox/Makefile daemon/test/lib.sh daemon/test/seed-restore.scm \
   daemon/test/sandbox-helper-cleanup.sh daemon/test/sandbox-helper-cleanup.scm \
