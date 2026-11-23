@@ -35,6 +35,24 @@ script=${2:?scheme file}
 # that can fail on upstream macro hygiene (jq/oniguruma, DECISIONS 37).  Refuse
 # before any daemon starts.  gate-lib.sh lives in goonix-ca6/ and is shared.
 source "$IMPL/goonix-ca6/gate-lib.sh"
+
+# PREPARE first when the tree is not built, exactly as goonix-ca6/z2-counted.sh
+# does.  A DEDICATED per-job worktree (the lanes session's per-job submission) is
+# created fresh at the requested commit, so it has no configure output and no
+# .go files: asserting the precondition alone made every such job refuse with
+# "cannot read GOBJECTS from make" (measured, goonix-ca8-point1-v7).  On a warm
+# mirror this is a no-op, so the laptop path is unchanged.  GOONIX_CA8_PREPARE=0
+# opts out for a caller that has already prepared the tree itself.
+if [ "${GOONIX_CA8_PREPARE:-1}" = 1 ]; then
+  if ! goonix_gate_require_compiled "$IMPL" >/dev/null 2>&1; then
+    echo '=== prepare the tree (fresh worktree: configure + make) ==='
+    if ! bash "$IMPL/goonix-ca6/prepare-tree.sh" \
+         "${Z2_JOB_CORES:-${GOONIX_GATE_JOBS:-4}}" "$IMPL"; then
+      echo 'PREPARE FAILED' >&2
+      exit 1
+    fi
+  fi
+fi
 goonix_gate_require_compiled "$IMPL" || exit 1
 
 if ! unshare --user --map-root-user --mount true 2>/dev/null; then
