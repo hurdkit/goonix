@@ -16,7 +16,7 @@ void checkRewriteForTest(const Path & path, const string & from, const string & 
 using namespace nix;
 
 static const string FROM = "teouteouteouteouteouteouteouteot";
-static const string TO = "0123456789abcdfghijklmnpqrsvwxy0";
+static const string TO = "0123456789abcdfghijklmnpqrsvwxyz";
 
 int main(int argc, char ** argv)
 {

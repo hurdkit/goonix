@@ -57,11 +57,9 @@ caError message = throwIO (userError message)
 -- | The prefix before the first occurrence and the rest starting at it; the
 -- whole input and "" when the needle is absent.  A wrapper over the library's
 -- B.breakSubstring (already used in Engine.hs and Archive.hs): the pinned
--- bytestring lacks `breakOn`, not the search.  The previous byte-by-byte
--- B.take/B.drop/== loop cost ~27 slice comparisons per byte, because
--- replaceWhole runs one search per 8-byte fragment and per encoding for every
--- regular file of every CA output.  Measured on an 8 MiB file with no
--- occurrence: 2.180 s here against 0.016 s for the C++ string::find path.
+-- bytestring lacks `breakOn`, not the search.  A byte-by-byte B.take/B.drop/==
+-- loop here is costly because replaceWhole runs one search per 8-byte fragment
+-- and per encoding, for every regular file of every CA output.
 breakOn :: ByteString -> ByteString -> (ByteString, ByteString)
 breakOn = B.breakSubstring
 
@@ -84,7 +82,7 @@ hashPart = B.take 32 . baseName
 -- survives, and any UTF-16LE/UTF-32LE encoding of it (C++ replaceWhole).
 replaceWhole :: ByteString -> ByteString -> ByteString -> ByteString -> Bool -> Either String ByteString
 replaceWhole input from to file rejectOpaque =
-  replaceWholeFrom input from to file rejectOpaque (B.length input)
+  replaceWholeAt input from to file rejectOpaque (B.length input) 0
 
 -- | As replaceWhole, but the opaque checks cover every occurrence that STARTS
 -- before @limit@, matched against the WHOLE input (which for the streaming
@@ -92,8 +90,11 @@ replaceWhole input from to file rejectOpaque =
 -- therefore seen whole instead of being split across two rounds; one that
 -- starts at or after the point belongs to the next round.  A limit of the input
 -- length checks everything, which is the whole-file behaviour.
-replaceWholeFrom :: ByteString -> ByteString -> ByteString -> ByteString -> Bool -> Int -> Either String ByteString
-replaceWholeFrom input from to file rejectOpaque limit
+--
+-- @offset@ is the FILE position of input[0], so a rejection names the file's
+-- byte rather than the buffer's (C++ checkOpaque's `offset' + `consumed').
+replaceWholeAt :: ByteString -> ByteString -> ByteString -> ByteString -> Bool -> Int -> Int -> Either String ByteString
+replaceWholeAt input from to file rejectOpaque limit offset
   | B.length from /= B.length to = Left "internal CA token length mismatch"
   | otherwise =
       let replaced = substitute input
@@ -129,14 +130,14 @@ replaceWholeFrom input from to file rejectOpaque limit
           [ case occurrence fragment of
               Just at ->
                 Just ("opaque self-reference fragment `" ++ C.unpack fragment ++ "' in `"
-                  ++ C.unpack file ++ "' at byte " ++ show at)
+                  ++ C.unpack file ++ "' at byte " ++ show (offset + at))
               _ -> Nothing
           | i <- [0 .. B.length from - 8], let fragment = B.take 8 (B.drop i from) ]
         utfChecks =
           [ case occurrence encoded of
               Just at ->
                 Just ("UTF-" ++ show (width * 8) ++ " self-reference in `" ++ C.unpack file
-                  ++ "' at byte " ++ show at)
+                  ++ "' at byte " ++ show (offset + at))
               _ -> Nothing
           | width <- [2, 4 :: Int]
           , let encoded = B.concatMap (\c -> c `B.cons` B.replicate (width - 1) 0) from ]
@@ -228,10 +229,15 @@ rewriteRegularFile path from to mode = do
       -- Otherwise an opaque occurrence (a UTF-16LE/UTF-32LE encoding of FROM, or
       -- an 8-byte fragment) that straddles the point is split across two rounds,
       -- neither sees all of it, and the file is ACCEPTED with a hidden reference.
-      rewriteChunk buffer count =
-        either caError pure (replaceWholeFrom buffer from to path True count)
+      -- `consumed' is the FILE offset of buffer[0], so a rejection names the
+      -- file's byte rather than the buffer's (C++ checkOpaque offset+consumed).
+      rewriteChunk buffer count consumed =
+        either caError pure (replaceWholeAt buffer from to path True count consumed)
           >>= pure . B.take count
-      rewrite part = either caError pure (replaceWhole part from to path True)
+      -- The final flush is the last `pending', which starts at file offset
+      -- `consumed'; replaceWhole alone would name the offset WITHIN that tail.
+      rewriteTail part consumed =
+        either caError pure (replaceWholeAt part from to path True (B.length part) consumed)
       -- C++ AutoDelete cleanup(temporary, false): remove the temporary on any
       -- failure (cancelled only after the rename succeeds), so a rejected
       -- output does not leave a .goonix-rewrite that poisons the next build.
@@ -240,16 +246,16 @@ rewriteRegularFile path from to mode = do
         when present (Files.removeLink temporary)
   (bracket (openBinaryFile (C.unpack path) ReadMode) (hClose) $ \input ->
     bracket (openBinaryFile (C.unpack temporary) WriteMode) (\output -> hClose output) $ \output -> do
-      let loop pending = do
+      let loop pending consumed = do
             chunk <- B.hGetSome input (128 * 1024)
             if B.null chunk
-              then rewrite pending >>= B.hPut output
+              then rewriteTail pending consumed >>= B.hPut output
               else do
                 let combined = pending <> chunk
                     count = process combined
-                rewriteChunk combined count >>= B.hPut output
-                loop (B.drop count combined)
-      loop B.empty)
+                rewriteChunk combined count consumed >>= B.hPut output
+                loop (B.drop count combined) (consumed + count)
+      loop B.empty 0)
     `onException` removeTemporary
   Files.setFileMode temporary mode
   restoreMtime temporary False

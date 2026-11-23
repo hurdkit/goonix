@@ -131,6 +131,8 @@ EXTRA_DIST += \
   daemon/test/rewrite-boundary.hs daemon/test/rewrite-boundary.sh \
   daemon/test/rewrite-speed/Main.hs daemon/test/rewrite-speed.sh \
   nix/libstore/rewrite-speed-probe.cc \
+  daemon/test/rewrite-boundary-mode/Main.hs daemon/test/rewrite-boundary-mode.sh \
+  nix/libstore/rewrite-boundary-probe.cc \
   daemon/test/gcroot-mode/Main.hs daemon/test/gcroot-mode.sh \
   nix/libstore/gcroot-probe.cc \
   daemon/test/deep-scan-timeout.hs daemon/test/deep-scan-timeout.sh \
