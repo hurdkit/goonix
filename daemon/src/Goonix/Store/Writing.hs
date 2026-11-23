@@ -12,9 +12,8 @@ module Goonix.Store.Writing
   , clearFailedPaths
   ) where
 
-import Control.Exception (finally, throwIO, try)
+import Control.Exception (finally, throwIO)
 import Control.Monad (forM_, unless, when)
-import Control.Concurrent (threadDelay)
 import Data.Char (toUpper)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as B
@@ -100,7 +99,7 @@ canonicaliseAndHash store path = do
 registerPath :: Store -> ByteString -> Hash -> Word64 -> [ByteString] -> ByteString -> IO ()
 registerPath store path (Hash algorithm digest) size references deriver = do
   when (algorithm /= SHA256) (throwIO (storeError "store registration requires SHA-256"))
-  retryRegistration $ withTransaction (database store) $ do
+  retryBusy $ withTransaction (database store) $ do
     existing <- queryValues (database store) "select id from ValidPaths where path = ?;" [Bytes path]
     case existing of
       [] -> do
@@ -135,17 +134,6 @@ registerPath store path (Hash algorithm digest) size references deriver = do
               [Integer identifier, Bytes name, Bytes (outputPath output)]
       _ -> throwIO (storeError "registered path has no database id")
 
-retryRegistration :: IO a -> IO a
-retryRegistration action = go (0 :: Int)
-  where
-    go attempt = do
-      result <- try action
-      case result of
-        Right value -> pure value
-        Left (exception :: DatabaseBusy)
-          | attempt < 200 -> threadDelay (1000 + attempt * 100) >> go (attempt + 1)
-          | otherwise -> throwIO exception
-
 addIndirectRoot :: Store -> ByteString -> IO ()
 addIndirectRoot store link = do
   let state = storeStateDirectory store
@@ -162,10 +150,10 @@ epochTimeSeconds = floor <$> getPOSIXTime
 registerFailedPath :: Store -> ByteString -> IO ()
 registerFailedPath store path = do
   now <- epochTimeSeconds
-  execute (database store) "insert or replace into FailedPaths(path,time) values (?,?);"
+  retryBusy $ execute (database store) "insert or replace into FailedPaths(path,time) values (?,?);"
     [Bytes path, Integer now]
 
 clearFailedPaths :: Store -> [ByteString] -> IO ()
-clearFailedPaths store paths = withTransaction (database store) $
+clearFailedPaths store paths = retryBusy $ withTransaction (database store) $
   forM_ paths $ \path ->
     execute (database store) "delete from FailedPaths where path = ?;" [Bytes path]

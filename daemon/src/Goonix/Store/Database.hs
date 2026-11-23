@@ -19,6 +19,7 @@ module Goonix.Store.Database
   , withReadWrite
   , execute
   , DatabaseBusy (..)
+  , retryBusy
   , withTransaction
   , prepare
   , closeStatement
@@ -30,8 +31,8 @@ module Goonix.Store.Database
   , databaseError
   ) where
 
-import Control.Exception (Exception, bracket, bracketOnError, onException, throwIO)
-import Control.Concurrent (ThreadId, myThreadId)
+import Control.Exception (Exception, bracket, bracketOnError, onException, throwIO, try)
+import Control.Concurrent (ThreadId, myThreadId, threadDelay)
 import Control.Concurrent.MVar (MVar, newMVar, withMVar)
 import Control.Concurrent.STM (TVar, atomically, newTVarIO, readTVar, retry, writeTVar)
 import Control.Monad (unless, when)
@@ -236,6 +237,35 @@ withTransaction database action = withDatabaseLock database $ do
   execute database "begin;" []
   (action >>= \result -> execute database "commit;" [] >> pure result)
     `onException` execute database "rollback;" []
+
+-- | Retry a database action for as long as it fails with SQLITE_BUSY/LOCKED, as
+-- the C++ daemon's retrySQLite (sqlite.hh) does: `while (true) { try ... catch
+-- (SQLiteBusy &) {} }`.  Each client connection and each build goal opens its OWN
+-- handle, and WAL permits one writer, so concurrent registrations and GC
+-- invalidations routinely meet a busy database; the busy_timeout bounds each
+-- sqlite3_step, and a transaction that still returns BUSY (e.g. a WAL snapshot
+-- conflict the busy handler cannot wait out) must be retried, not surfaced to the
+-- client as DatabaseBusy.  C++ sleeps a random <= 0.1s before retrying
+-- (throwSQLiteError, sqlite.cc) so competing writers do not retry in lockstep;
+-- without a random package we vary the sleep by attempt and thread id for the
+-- same effect.  The retry is unbounded exactly as C++: a writer that holds the
+-- lock forever is a bug elsewhere, and giving up here turns normal contention
+-- (two clients registering paths at once, a GC running during builds) into a
+-- spurious client error.  Only DatabaseBusy is retried; any other exception
+-- propagates.
+retryBusy :: IO a -> IO a
+retryBusy action = go (0 :: Int)
+  where
+    go attempt = do
+      result <- try action
+      case result of
+        Right value -> pure value
+        Left (_ :: DatabaseBusy) -> do
+          tid <- myThreadId
+          let jitter = (attempt * 37 + hashThreadId tid) `mod` 100
+          threadDelay (1000 + jitter * 1000)   -- 1..100 ms, as C++ <= 0.1s
+          go (attempt + 1)
+    hashThreadId tid = length (show tid) * 17
 
 prepare :: Database -> ByteString -> IO Statement
 prepare database@(Database handle lock) sql = withDatabaseLock database $
