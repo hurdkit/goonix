@@ -84,7 +84,17 @@ hashPart = B.take 32 . baseName
 -- opaque fragments are allowed, refuse any 8-byte fragment of `from' that
 -- survives, and any UTF-16LE/UTF-32LE encoding of it (C++ replaceWhole).
 replaceWhole :: ByteString -> ByteString -> ByteString -> ByteString -> Bool -> Either String ByteString
-replaceWhole input from to file rejectOpaque
+replaceWhole input from to file rejectOpaque =
+  replaceWholeFrom input from to file rejectOpaque (B.length input)
+
+-- | As replaceWhole, but the opaque checks cover every occurrence that STARTS
+-- before @limit@, matched against the WHOLE input (which for the streaming
+-- rewrite carries the lookahead).  An occurrence straddling the emit point is
+-- therefore seen whole instead of being split across two rounds; one that
+-- starts at or after the point belongs to the next round.  A limit of the input
+-- length checks everything, which is the whole-file behaviour.
+replaceWholeFrom :: ByteString -> ByteString -> ByteString -> ByteString -> Bool -> Int -> Either String ByteString
+replaceWholeFrom input from to file rejectOpaque limit
   | B.length from /= B.length to = Left "internal CA token length mismatch"
   | otherwise =
       let replaced = substitute input
@@ -106,18 +116,27 @@ replaceWhole input from to file rejectOpaque
         firstJust (x:xs) = case x of
           Just err -> Just err
           Nothing -> firstJust xs
+        -- The first occurrence STARTING before limit.  Scanning the whole
+        -- buffer instead would reject a plain prefix of FROM in the lookahead
+        -- that becomes a whole match in the next read.
+        occurrence needle = go 0
+          where
+            go at
+              | at >= limit || at + B.length needle > B.length value = Nothing
+              | B.take (B.length needle) (B.drop at value) == needle = Just at
+              | otherwise = go (at + 1)
         fragmentChecks =
-          [ case breakOn fragment value of
-              (_, rest) | not (B.null rest) ->
+          [ case occurrence fragment of
+              Just at ->
                 Just ("opaque self-reference fragment `" ++ C.unpack fragment ++ "' in `"
-                  ++ C.unpack file ++ "' at byte " ++ show (B.length value - B.length rest))
+                  ++ C.unpack file ++ "' at byte " ++ show at)
               _ -> Nothing
           | i <- [0 .. B.length from - 8], let fragment = B.take 8 (B.drop i from) ]
         utfChecks =
-          [ case breakOn encoded value of
-              (_, rest) | not (B.null rest) ->
+          [ case occurrence encoded of
+              Just at ->
                 Just ("UTF-" ++ show (width * 8) ++ " self-reference in `" ++ C.unpack file
-                  ++ "' at byte " ++ show (B.length value - B.length rest))
+                  ++ "' at byte " ++ show at)
               _ -> Nothing
           | width <- [2, 4 :: Int]
           , let encoded = B.concatMap (\c -> c `B.cons` B.replicate (width - 1) 0) from ]
@@ -188,14 +207,30 @@ rewriteRegularFile path from to mode = do
   exists <- Files.fileExist temporary
   when exists (caError ("CA temporary file `" ++ C.unpack temporary ++ "' already exists"))
   let keep = B.length from * 4 - 1
+      -- The emit point: hold back only a WHOLE match of FROM that straddles it.
+      -- A prefix test is wrong (the same trap as inverseTree, 057b2a097b9): a
+      -- COMPLETE match ending exactly at the point whose last character equals
+      -- FROM's first looks like a partial one, loses its last byte, and the
+      -- 8-byte fragment check then REJECTS a valid file.  `pending' carries
+      -- `keep' >= FROM length - 1 bytes of lookahead, so any match starting in
+      -- [count-keep, count) is fully visible: test the whole pattern.
       process pending =
         let count = if B.length pending > keep then B.length pending - keep else 0
-            -- A prefix of FROM at the end is a potential whole match crossing
-            -- the next read, not an opaque fragment at this boundary.
-            adjusted = adjust count
-            adjust n = head ([n - len | len <- [min n (B.length from - 1), min n (B.length from - 1) - 1 .. 1],
-                              B.drop (n - len) (B.take n pending) == B.take len from] ++ [n])
-        in adjusted
+            n = B.length from
+            straddling = [s | s <- [max 0 (count - keep) .. count - 1]
+                         , s + n > count
+                         , B.take n (B.drop s pending) == from]
+        in case straddling of
+             [] -> count
+             _ -> minimum straddling
+      -- Replace the whole matches in the emitted part, but run the opaque checks
+      -- over the WHOLE buffer for occurrences STARTING before the emit point.
+      -- Otherwise an opaque occurrence (a UTF-16LE/UTF-32LE encoding of FROM, or
+      -- an 8-byte fragment) that straddles the point is split across two rounds,
+      -- neither sees all of it, and the file is ACCEPTED with a hidden reference.
+      rewriteChunk buffer count =
+        either caError pure (replaceWholeFrom buffer from to path True count)
+          >>= pure . B.take count
       rewrite part = either caError pure (replaceWhole part from to path True)
       -- C++ AutoDelete cleanup(temporary, false): remove the temporary on any
       -- failure (cancelled only after the rename succeeds), so a rejected
@@ -212,7 +247,7 @@ rewriteRegularFile path from to mode = do
               else do
                 let combined = pending <> chunk
                     count = process combined
-                rewrite (B.take count combined) >>= B.hPut output
+                rewriteChunk combined count >>= B.hPut output
                 loop (B.drop count combined)
       loop B.empty)
     `onException` removeTemporary

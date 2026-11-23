@@ -128,6 +128,7 @@ EXTRA_DIST += \
   nix/libstore/same-probe.cc \
   daemon/test/inverse-sibling-boundary.hs daemon/test/inverse-sibling-boundary.sh \
   daemon/test/symlink-concurrent.hs daemon/test/symlink-concurrent.sh \
+  daemon/test/rewrite-boundary.hs daemon/test/rewrite-boundary.sh \
   daemon/test/gcroot-mode/Main.hs daemon/test/gcroot-mode.sh \
   nix/libstore/gcroot-probe.cc \
   daemon/test/deep-scan-timeout.hs daemon/test/deep-scan-timeout.sh \
