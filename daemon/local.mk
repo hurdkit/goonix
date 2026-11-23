@@ -118,6 +118,8 @@ EXTRA_DIST += \
   nix/libstore/delete-probe.cc \
   daemon/test/register-mode/Main.hs daemon/test/register-mode.sh \
   nix/libstore/register-probe.cc \
+  daemon/test/reserved-mode/Main.hs daemon/test/reserved-mode.sh \
+  nix/libstore/reserved-probe.cc \
   daemon/test/deep-scan-timeout.hs daemon/test/deep-scan-timeout.sh \
   daemon/proxy/Main.hs \
   daemon/test/wire-proxy/Main.hs daemon/test/wire-proxy/run.sh \

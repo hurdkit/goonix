@@ -536,6 +536,10 @@ void checkRewriteForTest(const Path & path, const string & from, const string & 
    entry, including hard-linked twins.  Defined after rewriteTree itself. */
 void rewriteTreeForTest(const Path & path, const string & from, const string & to);
 
+/* goonix: expose the reserved-placeholder tree scan for the same reason - the
+   read-boundary retention is only observable through the whole walk. */
+void checkReservedTreeForTest(const Path & path);
+
 string encodeReservedForTest(const Hash & digest, bool token)
 {
     return encodeReserved(digest, token);
@@ -669,6 +673,11 @@ static void rewriteTree(const Path & path, const string & from, const string & t
 void rewriteTreeForTest(const Path & path, const string & from, const string & to)
 {
     rewriteTree(path, from, to);
+}
+
+void checkReservedTreeForTest(const Path & path)
+{
+    checkReservedTree(path);
 }
 
 static string inverseTree(const Path & path, const string & final,
