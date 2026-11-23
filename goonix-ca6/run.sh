@@ -8,6 +8,13 @@ IMPL=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 HERE="$IMPL/goonix-ca6"
 cd "$IMPL"
 
+# goonix: a gate must run on a COMPILED tree.  The runner starts guile with
+# --no-auto-compile, so an unbuilt tree is interpreted, which is a different
+# load path and can fail on upstream macro hygiene (jq/oniguruma, DECISIONS 37).
+# Refuse before anything is wiped or any daemon starts.
+source "$HERE/gate-lib.sh"
+goonix_gate_require_compiled "$IMPL" || exit 1
+
 if ! unshare --user --map-root-user --mount true 2>/dev/null; then
   printf 'SKIP: user/mount namespaces are unavailable\n'
   exit 77
@@ -261,3 +268,18 @@ echo '=== policy-boot.out ==='
 cat "$scratch/policy-boot.out" 2>/dev/null | tail -25
 echo '=== policy-boot.err tail ==='
 tail -20 "$scratch/policy-boot.err" 2>/dev/null || true
+
+# goonix: exit with the GATE'S verdict, not with the status of the last `tail`.
+# Counted run 18c recorded BOOT_EXIT=1 and still returned 0 to the z2run unit,
+# because this script ended with a diagnostic tail; a reader could mistake that
+# for a pass (reviewer, DECISIONS 37).  The part script appends
+# "BOOT_EXIT=<status>" to policy-boot-result; take the LAST such line.  No
+# result line at all means the gate never produced a verdict, which is a
+# failure, not a pass.
+boot_exit=$(grep -o '^BOOT_EXIT=[0-9]*' "$scratch/policy-boot-result" 2>/dev/null \
+            | tail -1 | cut -d= -f2 || true)
+if [ -z "$boot_exit" ]; then
+  echo 'GATE: no BOOT_EXIT recorded - the gate produced no verdict' >&2
+  boot_exit=1
+fi
+goonix_gate_exit "$boot_exit"

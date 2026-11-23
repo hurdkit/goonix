@@ -30,6 +30,13 @@ fi
 stage=${1:?stage name}
 script=${2:?scheme file}
 
+# goonix: a gate must run on a COMPILED tree.  This runner starts guile with
+# --no-auto-compile, so an unbuilt tree is interpreted - a different load path
+# that can fail on upstream macro hygiene (jq/oniguruma, DECISIONS 37).  Refuse
+# before any daemon starts.  gate-lib.sh lives in goonix-ca6/ and is shared.
+source "$IMPL/goonix-ca6/gate-lib.sh"
+goonix_gate_require_compiled "$IMPL" || exit 1
+
 if ! unshare --user --map-root-user --mount true 2>/dev/null; then
   printf 'SKIP: user/mount namespaces are unavailable\n'
   exit 77
@@ -231,8 +238,12 @@ newuidmap "$ns_pid" 0 "$host_uid" 1 1 "$sub_uid" "$sub_uid_count"
 newgidmap "$ns_pid" 0 "$host_gid" 1 1 "$sub_gid" "$sub_gid_count"
 echo "MAPS INSTALLED for pid $ns_pid"
 : > "$scratch/ns-go"
-wait "$ns_job"
-status=$?
+# goonix: `wait` must not abort the script under `set -e`.  A FAILING stage is
+# the normal way a gate reports a failure, and a bare `wait` returned its status
+# straight to set -e, so the script died here - before the diagnostic tails and
+# before the explicit exit below.  Capture the status instead.
+status=0
+wait "$ns_job" || status=$?
 
 echo "=== $stage result ==="
 grep "STAGE=$stage" "$scratch/results" 2>/dev/null | tail -1 || echo 'no result line'
@@ -245,4 +256,17 @@ cat "$scratch/watchdog-$stage.log" 2>/dev/null || echo 'not triggered'
 echo "=== disk after ==="
 du -sh "$scratch/store" 2>/dev/null || true
 df -h / | tail -1
-exit $status
+
+# goonix: exit with the STAGE'S OWN verdict, so a failed gate fails the unit
+# that ran it (reviewer, DECISIONS 37).  The part script appends
+# "STAGE=<name> EXIT=<status>" to results; prefer that recorded verdict over the
+# namespace child's status, and treat a missing verdict as a failure.
+stage_exit=$(grep -o "^STAGE=$stage EXIT=[0-9]*" "$scratch/results" 2>/dev/null \
+             | tail -1 | sed 's/.*EXIT=//' || true)
+if [ -n "$stage_exit" ]; then
+  status=$stage_exit
+elif [ "$status" -eq 0 ]; then
+  echo "GATE: no STAGE=$stage EXIT line recorded - no verdict" >&2
+  status=1
+fi
+goonix_gate_exit "$status"

@@ -30,12 +30,13 @@ printf 'HOST=%s uid=%s\n' "$(hostname)" "$(id -u)"
 printf 'DOWNLOAD_CACHE=%s\n' "${GOONIX_DOWNLOAD_CACHE:-http://10.0.30.4:8480}"
 
 echo '=== build the implementation ==='
-if ! nix develop '.#default' -c bash -c '
-  set -e
-  if [ ! -x ./configure ]; then ./bootstrap; fi
-  ./configure --localstatedir=/var --sysconfdir=/etc ac_cv_guix_test_root=/tmp/gxv-test
-  nice -n 10 make -j8
-' > "$V/build.log" 2>&1; then
+# goonix: one shared prepare step, so the laptop half of a calibration builds
+# exactly like this one (reviewer, DECISIONS 37).  It bootstraps/configures only
+# when needed, builds the schema header first, makes at the lane's CPU cap, and
+# asserts the compiled-module precondition before returning.  -j8 here used to
+# exceed zergling2's cap of 6 (the user's CPU rule).
+if ! bash "$C/goonix-ca6/prepare-tree.sh" "${GOONIX_GATE_JOBS:-6}" "$C" \
+     > "$V/build.log" 2>&1; then
   echo 'BUILD FAILED'; tail -n 25 "$V/build.log"; exit 1
 fi
 echo 'build ok'
