@@ -26,6 +26,11 @@ scratch=${GOONIX_CA6_SCRATCH:-$HERE/work}
 # this same scratch tree - the download seed the earlier runs started from.
 if [ "${GOONIX_CA6_FRESH:-0}" = 1 ]; then
   echo "FRESH: wiping $scratch/store and $scratch/var, then restoring the seed"
+  # Store items are mode 555 (read-only, as the daemon leaves them), so a plain
+  # `rm -rf' cannot unlink their children and fails with "Permission denied"
+  # even though we own them (measured, counted run 15).  Make the tree writable
+  # first.  This touches only our own scratch tree, never the host store.
+  chmod -R u+w "$scratch/store" "$scratch/var" "$scratch/log" 2>/dev/null || true
   rm -rf "$scratch/store" "$scratch/var" "$scratch/log"
   mkdir -p "$scratch/store" "$scratch/var" "$scratch/log"
   GOONIX_CA6_SCRATCH="$scratch" bash "$HERE/seed.sh" \
