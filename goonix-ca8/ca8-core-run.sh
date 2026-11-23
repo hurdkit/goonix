@@ -61,6 +61,27 @@ if ! unshare --user --map-root-user --mount true 2>/dev/null; then
 fi
 
 scratch=${GOONIX_CA8_SCRATCH:-$IMPL/.scratch/ca8-core}
+
+# GOONIX_CA8_FRESH=1 makes this the COUNTED run: the gate's claim is that the
+# seeds and the ladder build content-addressed FROM A WIPED STORE, so a run
+# that finds items already present proves only the tail (DECISIONS 57).
+# Same wipe as goonix-ca6/run.sh:34-48, whose recipe is proven: store items are
+# mode 555, so a plain `rm -rf' cannot unlink their children and fails with
+# "Permission denied" even though we own them (measured, CA-6 counted run 15).
+# Make the tree writable first.  This touches only our own scratch tree.
+#
+# No seed restore step, unlike CA-6: stage1's PASS 1 realises every fixed-output
+# derivation of the chain itself, with substitutes on, so the wipe IS the
+# reseed.  etc/ (the signing keys and the ACL) is deliberately NOT wiped: it is
+# harness configuration, not store state, and the daemon needs it to start.
+if [ "${GOONIX_CA8_FRESH:-0}" = 1 ]; then
+  echo "FRESH: wiping $scratch/store, $scratch/var and $scratch/log (counted run)"
+  chmod -R u+w "$scratch/store" "$scratch/var" "$scratch/log" 2>/dev/null || true
+  rm -rf "$scratch/store" "$scratch/var" "$scratch/log"
+  mkdir -p "$scratch/store" "$scratch/var" "$scratch/log"
+  echo "FRESH: store items after wipe: $(ls "$scratch/store" | wc -l)"
+fi
+
 mkdir -p "$scratch/store" "$scratch/var" "$scratch/etc" "$scratch/log"
 chmod 700 "$scratch/etc"
 
