@@ -101,6 +101,7 @@ EXTRA_DIST += \
   daemon/test/differential/dedup-overflow.sh daemon/test/differential/dedup-overflow-test.c \
   daemon/test/differential/dedup-linkcount-test.c \
   daemon/test/differential/sqlite-contention.sh daemon/test/differential/sqlite-contention.hs \
+  daemon/test/differential/socket-idle.sh daemon/test/differential/socket-idle.hs \
   daemon/test/differential/export-memory.sh daemon/test/differential/export-memory.scm \
   daemon/test/differential/nar-memory.sh daemon/test/differential/nar-memory.scm \
   daemon/test/differential/substitute-log-flood.sh daemon/test/differential/substitute-log-flood.scm \

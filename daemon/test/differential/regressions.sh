@@ -10,6 +10,9 @@
 #     daemon when one holds the WAL write lock and the other's sqlite3_step sleeps
 #     in the busy handler (the lock-taking sqlite calls must be `ccall safe').
 #     Compiles the daemon's Database.hs with the probe; runs +RTS -A1m -N.
+#   - socket-idle.sh: an idle client (sends nothing) must not freeze the daemon's
+#     other threads; readSocket must wait through the IO manager, not a raw
+#     blocking fdRead.  Compiles the daemon's Socket.hs; runs +RTS -A1m -N.
 # Fails if ANY of them fails, naming the failing test.
 #
 # export-memory.sh is deliberately NOT here: it needs a running daemon and a
@@ -35,6 +38,7 @@ run() { # name script...
 run cabal-modules bash "$here/cabal-modules.sh" "$root"
 run dedup-overflow bash "$here/dedup-overflow.sh" "$root/daemon/cbits/files.c"
 run sqlite-contention bash "$here/sqlite-contention.sh" "$root"
+run socket-idle bash "$here/socket-idle.sh" "$root"
 if test $rc -eq 0; then
   echo "ALL REGRESSIONS PASS"
 else
