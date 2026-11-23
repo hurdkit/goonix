@@ -556,7 +556,15 @@ static void rewriteRegularFile(const Path & path, const string & from,
         pending.erase(0, process);
         consumed += process;
     }
-    writeFull(outputFD, replaceWhole(pending, from, to, path));
+    /* The final flush is the last `pending', which starts at file offset
+       `consumed'.  replaceWhole would report the offset WITHIN that tail, so a
+       rejection in the tail of a multi-read file named the wrong byte.  Check
+       with the file offset, exactly as the loop does, then emit. */
+    {
+        string replaced = replaceWhole(pending, from, to, path, false);
+        checkOpaque(replaced, from, path, consumed, replaced.size());
+        writeFull(outputFD, replaced);
+    }
     if (fchmod(outputFD, mode)) throw SysError(std::format("restoring `{}'", path));
     if (futimens(outputFD, (const timespec[2]) {{0, UTIME_OMIT}, {1, 0}}))
         throw SysError(std::format("restoring timestamp of `{}'", path));
