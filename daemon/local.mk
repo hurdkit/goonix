@@ -115,7 +115,10 @@ EXTRA_DIST += \
   daemon/test/differential/substitute-log-flood-helper.sh \
   daemon/test/differential/substitute-silent.sh daemon/test/differential/substitute-silent.scm \
   daemon/test/differential/substitute-silent-helper.sh \
-  daemon/test/differential/stress-gate.sh daemon/test/differential/stress-noisy-helper.sh \
+  daemon/test/differential/stress-gate.sh daemon/test/differential/stress-gate-part.sh \
+  daemon/test/differential/stress-noisy-helper.sh \
+  daemon/test/differential/root-ci-part.sh \
+  daemon/test/differential/pidns-guard.sh daemon/test/differential/pidns-isolation.sh \
   daemon/test/differential/stress-build.scm daemon/test/differential/stress-substitute.scm \
   daemon/test/differential/stress-gc.scm daemon/test/differential/stress-roots.scm \
   daemon/test/differential/stress-watchdog.scm daemon/test/differential/stress-verify.scm \
