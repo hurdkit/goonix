@@ -138,6 +138,18 @@ mkdir -p "$scratch/var-empty"
 # result file only ever holds this run's outcome.
 rm -f "$scratch/policy-boot-result"
 
+# CPU budget (lanes USAGE.md): a command that starts a Guix build daemon must
+# give it an explicit --cores and --max-jobs within the job's budget.
+# guix-daemon does NOT read NIX_CONFIG (verified: no reference in nix/), and its
+# defaults are max-jobs UNLIMITED and cores AUTO-DETECTED, so on zergling2 it
+# would see 24 host cores under a 4-core quota and thrash.  z2run exports
+# Z2_JOB_CORES; GOONIX_GATE_JOBS is this gate's own cap.
+daemon_cores=${Z2_JOB_CORES:-${GOONIX_GATE_JOBS:-4}}
+daemon_jobs=${GOONIX_DAEMON_MAX_JOBS:-1}
+case "$daemon_cores" in ''|*[!0-9]*) echo "bad core count: $daemon_cores" >&2; exit 1;; esac
+[ "$daemon_cores" -ge 1 ] || { echo 'core count must be >= 1' >&2; exit 1; }
+echo "DAEMON_BUDGET cores=$daemon_cores max-jobs=$daemon_jobs"
+
 cat > "$scratch/policy-boot-part.sh" <<EOF
 set -euo pipefail
 # Job isolation check, BEFORE any mount and before the daemon starts.  The
@@ -197,6 +209,7 @@ export GOONIX_DOWNLOAD_CACHE='${GOONIX_DOWNLOAD_CACHE:-http://10.0.30.4:8480}'
 cd '$IMPL'
 ./pre-inst-env ./guix-daemon --disable-chroot \\
   --build-users-group=guixbuild \\
+  --cores=$daemon_cores --max-jobs=$daemon_jobs \\
   --listen='$scratch/socket' \\
   --substitute-urls='http://10.0.30.4:8480/substitutes/bordeaux https://bordeaux.guix.gnu.org' \\
   >'$scratch/policy-boot-daemon.log' 2>&1 &

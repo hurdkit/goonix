@@ -128,6 +128,18 @@ chmod 400 "$scratch/etc/signing-key.sec"
 cap_kb=$((150 * 1024 * 1024))
 floor_kb=$((40 * 1024 * 1024))
 
+# CPU budget (lanes USAGE.md): "A command which starts a Nix/Guix build daemon
+# must also give it an explicit --cores and --max-jobs within the same budget."
+# guix-daemon does NOT read NIX_CONFIG (verified: no reference in nix/), and its
+# defaults are max-jobs UNLIMITED and cores AUTO-DETECTED, so on zergling2 it
+# would see 24 host cores under a 4-core quota and thrash.  z2run exports
+# Z2_JOB_CORES; on the laptop the build lane's own cap applies.
+daemon_cores=${Z2_JOB_CORES:-${GOONIX_GATE_JOBS:-4}}
+daemon_jobs=${GOONIX_DAEMON_MAX_JOBS:-1}
+case "$daemon_cores" in ''|*[!0-9]*) echo "bad core count: $daemon_cores" >&2; exit 1;; esac
+[ "$daemon_cores" -ge 1 ] || { echo 'core count must be >= 1' >&2; exit 1; }
+echo "DAEMON_BUDGET cores=$daemon_cores max-jobs=$daemon_jobs"
+
 cat > "$scratch/part-$stage.sh" <<EOF
 set -uo pipefail
 # Job isolation check, BEFORE any mount and before the daemon starts.  The
@@ -184,6 +196,7 @@ export TMPDIR=/tmp
 cd '$IMPL'
 ./pre-inst-env ./guix-daemon --disable-chroot \\
   --build-users-group=guixbuild \\
+  --cores=$daemon_cores --max-jobs=$daemon_jobs \\
   --listen='$scratch/socket' \\
   --substitute-urls=https://bordeaux.guix.gnu.org \\
   >'$scratch/daemon-$stage.log' 2>&1 &
