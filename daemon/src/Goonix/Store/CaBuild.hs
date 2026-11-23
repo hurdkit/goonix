@@ -34,7 +34,7 @@ import qualified Data.ByteString as B (hGetSome, hPut)
 import Data.List (sortBy)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
-import Data.Word (Word64)
+import Data.Word (Word64, Word8)
 import Goonix.Store.Base32 (base32Alphabet)
 import Goonix.Store.Ca
 import Goonix.Store.Derivation
@@ -48,20 +48,36 @@ import System.Posix.ByteString (RawFilePath)
 import System.Posix.Types (FileMode)
 import qualified System.Posix.Files.ByteString as Files
 import Foreign.C.String (CString)
-import Foreign.C.Types (CInt (..))
+import Foreign.C.Types (CInt (..), CSize (..))
+import Foreign.Ptr (Ptr, castPtr, nullPtr, minusPtr)
+import System.IO.Unsafe (unsafePerformIO)
 import System.IO (IOMode (..), withBinaryFile, openBinaryFile, hClose)
 
 caError :: String -> IO a
 caError message = throwIO (userError message)
 
 -- | The prefix before the first occurrence and the rest starting at it; the
--- whole input and "" when the needle is absent.  A wrapper over the library's
--- B.breakSubstring (already used in Engine.hs and Archive.hs): the pinned
--- bytestring lacks `breakOn`, not the search.  A byte-by-byte B.take/B.drop/==
--- loop here is costly because replaceWhole runs one search per 8-byte fragment
--- and per encoding, for every regular file of every CA output.
+-- whole input and "" when the needle is absent.  glibc memmem through an unsafe
+-- FFI call: its result maps directly onto this pair (returned pointer minus
+-- haystack pointer is the split offset).  replaceWhole runs one search per
+-- 8-byte fragment and per encoding, for every regular file of every CA output,
+-- so the per-search cost dominates; memmem is glibc's two-way/SIMD search, the
+-- same class as the C++ side's string::find.
 breakOn :: ByteString -> ByteString -> (ByteString, ByteString)
-breakOn = B.breakSubstring
+breakOn needle haystack
+  | B.null needle = (B.empty, haystack)
+  | B.length needle > B.length haystack = (haystack, B.empty)
+  | otherwise = unsafePerformIO $
+      B.useAsCStringLen haystack $ \(hp, hl) ->
+        B.useAsCStringLen needle $ \(np, nl) -> do
+          p <- c_memmem (castPtr hp) (fromIntegral hl) (castPtr np) (fromIntegral nl)
+          pure $ if p == nullPtr
+            then (haystack, B.empty)
+            else let at = p `minusPtr` hp in (B.take at haystack, B.drop at haystack)
+{-# NOINLINE breakOn #-}
+
+foreign import ccall unsafe "memmem"
+  c_memmem :: Ptr Word8 -> CSize -> Ptr Word8 -> CSize -> IO (Ptr Word8)
 
 foreign import ccall unsafe "goonix_restore_mtime" c_restore_mtime :: CString -> CInt -> IO CInt
 
@@ -121,10 +137,10 @@ replaceWholeAt input from to file rejectOpaque limit offset
         -- starting at limit or later cannot fit, while one straddling limit is
         -- still seen whole.  Scanning the whole buffer instead would reject a
         -- plain prefix of FROM in the lookahead that becomes a whole match in
-        -- the next read.  B.breakSubstring does the search (see breakOn).
+        -- the next read.  The window is unchanged; only the search is faster.
         occurrence needle =
           let window = B.take (limit + B.length needle - 1) value
-              (before, rest) = B.breakSubstring needle window
+              (before, rest) = breakOn needle window
           in if B.null rest then Nothing else Just (B.length before)
         fragmentChecks =
           [ case occurrence fragment of
