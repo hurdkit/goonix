@@ -26,7 +26,9 @@ module Goonix.Build.Wait
   ) where
 
 import Control.Concurrent (threadDelay)
+import Control.Exception (throwIO)
 import Data.Bits ((.&.), shiftR)
+import Foreign.C.Error (eCHILD, eINTR, errnoToIOError, getErrno)
 import Foreign.C.Types (CInt(..))
 import Foreign.Marshal.Alloc (alloca)
 import Foreign.Ptr (Ptr)
@@ -44,6 +46,11 @@ wnohang = 1
 -- | Wait for a child to exit or stop, polling without blocking a capability.
 -- Returns the ProcessStatus once the child changes state; Nothing if there is no
 -- such child (ECHILD).  Never holds the capability while the child runs.
+--
+-- waitpid -1 is NOT always ECHILD: EINTR means a signal interrupted the call and
+-- it must be retried, and any other errno is a real error that must surface, not
+-- be swallowed as "no child" (which would spin forever or mask a bug).  Only
+-- ECHILD returns Nothing.
 waitProcessStatusNonBlocking :: ProcessID -> IO (Maybe ProcessStatus)
 waitProcessStatusNonBlocking (CPid raw) = go
   where
@@ -52,7 +59,13 @@ waitProcessStatusNonBlocking (CPid raw) = go
       if r == 0
         then threadDelay 10000 >> go        -- still running; release the capability
         else if r < 0
-          then pure Nothing                  -- ECHILD: no child to wait for
+          then do
+            errno <- getErrno
+            if errno == eINTR
+              then go                       -- interrupted; retry
+              else if errno == eCHILD
+                then pure Nothing           -- no child to wait for
+                else throwIO (errnoToIOError "waitpid" errno Nothing Nothing)
           else do
             status <- peek statusPtr
             pure (Just (decode (fromIntegral status)))

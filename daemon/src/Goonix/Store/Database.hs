@@ -47,6 +47,7 @@ import Foreign.C.Types (CInt (..), CLLong (..), CUChar (..))
 import Foreign.Marshal.Alloc (free, mallocBytes)
 import Foreign.Ptr (FunPtr, Ptr, castPtr, castPtrToFunPtr, intPtrToPtr, nullPtr)
 import Foreign.Storable (peek)
+import GHC.Clock (getMonotonicTimeNSec)
 
 data Database = Database (Ptr ()) !(TVar (Maybe (ThreadId, Int)))
 data Statement = Statement ByteString (Ptr ()) (TVar (Maybe (ThreadId, Int)))
@@ -246,26 +247,27 @@ withTransaction database action = withDatabaseLock database $ do
 -- sqlite3_step, and a transaction that still returns BUSY (e.g. a WAL snapshot
 -- conflict the busy handler cannot wait out) must be retried, not surfaced to the
 -- client as DatabaseBusy.  C++ sleeps a random <= 0.1s before retrying
--- (throwSQLiteError, sqlite.cc) so competing writers do not retry in lockstep;
--- without a random package we vary the sleep by attempt and thread id for the
--- same effect.  The retry is unbounded exactly as C++: a writer that holds the
--- lock forever is a bug elsewhere, and giving up here turns normal contention
--- (two clients registering paths at once, a GC running during builds) into a
--- spurious client error.  Only DatabaseBusy is retried; any other exception
--- propagates.
+-- (throwSQLiteError, sqlite.cc) so competing writers do not retry in lockstep.
+-- Without a random package we take the low bits of the monotonic nanosecond clock
+-- (GHC.Clock.getMonotonicTimeNSec): they differ on every call and between threads,
+-- unlike a thread-id hash (nearly constant) or attempt*37 (identical at the same
+-- attempt), which would still let competing writers retry in lockstep.  The retry
+-- is unbounded exactly as C++: a writer that holds the lock forever is a bug
+-- elsewhere, and giving up here turns normal contention (two clients registering
+-- paths at once, a GC running during builds) into a spurious client error.  Only
+-- DatabaseBusy is retried; any other exception propagates.
 retryBusy :: IO a -> IO a
-retryBusy action = go (0 :: Int)
+retryBusy action = go
   where
-    go attempt = do
+    go = do
       result <- try action
       case result of
         Right value -> pure value
         Left (_ :: DatabaseBusy) -> do
-          tid <- myThreadId
-          let jitter = (attempt * 37 + hashThreadId tid) `mod` 100
-          threadDelay (1000 + jitter * 1000)   -- 1..100 ms, as C++ <= 0.1s
-          go (attempt + 1)
-    hashThreadId tid = length (show tid) * 17
+          now <- getMonotonicTimeNSec
+          let jitter = fromIntegral (now `mod` 100)   -- 0..99, varied per call
+          threadDelay (1000 + jitter * 1000)          -- 1..100 ms, as C++ <= 0.1s
+          go
 
 prepare :: Database -> ByteString -> IO Statement
 prepare database@(Database handle lock) sql = withDatabaseLock database $
