@@ -53,6 +53,19 @@ run_one() {
 }
 run_one cxx "$cxx"
 run_one hs "$hs"
+# A differential that captured NOTHING must not read as agreement: the three
+# comparisons below diff equal when both sides are empty, and this script would
+# print PASS with no evidence.  Measured before the guard: empty cxx/hs .out/.db/
+# .files -> "HS-7 collector differential: PASS", rc 0.  Require both sides to have
+# produced rows in every captured stream before comparing them.
+for name in cxx hs; do
+  for suffix in out db files; do
+    if ! test -s "$out/$name.$suffix"; then
+      echo "EMPTY_PROBE_OUTPUT: the $name probe produced no $suffix rows" >&2
+      exit 1
+    fi
+  done
+done
 for suffix in out db files; do
   sed -E -e "s#$out/cxx/store#STORE#g" -e "s#$out/cxx/var#STATE#g" -e "s#$out/cxx#ROOT#g" -e 's#(STORE/|^[[:space:]]*)[[:alnum:]]{32}-#\1HASH-#g' "$out/cxx.$suffix" >"$out/cxx.$suffix.norm"
   sed -E -e "s#$out/hs/store#STORE#g" -e "s#$out/hs/var#STATE#g" -e "s#$out/hs#ROOT#g" -e 's#(STORE/|^[[:space:]]*)[[:alnum:]]{32}-#\1HASH-#g' "$out/hs.$suffix" >"$out/hs.$suffix.norm"
