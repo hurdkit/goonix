@@ -114,6 +114,8 @@ EXTRA_DIST += \
   nix/libstore/rewrite-mode-probe.cc \
   daemon/test/dedup-mode/Main.hs daemon/test/dedup-mode.sh \
   nix/libstore/dedup-probe.cc \
+  daemon/test/delete-mode/Main.hs daemon/test/delete-mode.sh \
+  nix/libstore/delete-probe.cc \
   daemon/test/deep-scan-timeout.hs daemon/test/deep-scan-timeout.sh \
   daemon/proxy/Main.hs \
   daemon/test/wire-proxy/Main.hs daemon/test/wire-proxy/run.sh \

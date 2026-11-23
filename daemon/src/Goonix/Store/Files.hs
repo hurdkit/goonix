@@ -600,7 +600,12 @@ deleteTree path = do
           let directory = parent path
           parentStatus <- Files.getSymbolicLinkStatus directory
           Files.setFileMode directory 0o755
-          (unless (Files.isSymbolicLink status) (Files.setFileMode path 0o644) >> Files.removeLink path)
+          -- C++ _deletePathAt never chmods the FILE it unlinks: unlink needs
+          -- write permission on the PARENT DIRECTORY, not on the file.  A store
+          -- file deduplicated into .links shares ONE inode with its twin, so
+          -- chmod here would strip the exec bit from a link another build is
+          -- about to exec (the GC-vs-build EACCES race, 00a5faa26db).
+          Files.removeLink path
             `finally` Files.setFileMode directory (Files.fileMode parentStatus)
 
 directoryEntries :: RawFilePath -> IO [RawFilePath]
