@@ -6,6 +6,11 @@
 #     (a clean `nix build .#guix-daemon-hs` would otherwise fail to find it).
 #   - dedup-overflow.sh: the dedup temp-path heap overflow canary AND the dedup
 #     link-count parity harness (two C tests compiled against daemon/cbits/files.c).
+#   - delete-hardlink.sh: deleteTree must not chmod the file it unlinks.  A
+#     deduplicated store file is hard-linked into .links (one inode, several
+#     paths); the GC deleting one link while a build execs another must not strip
+#     the shared inode's exec bit (the sandbox EACCES race).  Compiles the daemon's
+#     Files.hs; FAILS pre-fix (mode 0555 -> 0644), PASSES after.
 #   - sqlite-contention.sh: two SQLite handles in one process must not freeze the
 #     daemon when one holds the WAL write lock and the other's sqlite3_step sleeps
 #     in the busy handler (the lock-taking sqlite calls must be `ccall safe').
@@ -37,6 +42,7 @@ run() { # name script...
 }
 run cabal-modules bash "$here/cabal-modules.sh" "$root"
 run dedup-overflow bash "$here/dedup-overflow.sh" "$root/daemon/cbits/files.c"
+run delete-hardlink bash "$here/delete-hardlink.sh" "$root"
 run sqlite-contention bash "$here/sqlite-contention.sh" "$root"
 run socket-idle bash "$here/socket-idle.sh" "$root"
 run child-wait bash "$here/child-wait.sh" "$root"

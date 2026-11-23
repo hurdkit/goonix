@@ -100,6 +100,7 @@ EXTRA_DIST += \
   daemon/test/differential/cabal-modules.sh \
   daemon/test/differential/dedup-overflow.sh daemon/test/differential/dedup-overflow-test.c \
   daemon/test/differential/dedup-linkcount-test.c \
+  daemon/test/differential/delete-hardlink.sh daemon/test/differential/delete-hardlink.hs \
   daemon/test/differential/sqlite-contention.sh daemon/test/differential/sqlite-contention.hs \
   daemon/test/differential/socket-idle.sh daemon/test/differential/socket-idle.hs \
   daemon/test/differential/child-wait.sh daemon/test/differential/child-wait.hs \
