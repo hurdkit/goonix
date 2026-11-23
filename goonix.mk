@@ -8,6 +8,7 @@ MODULES +=					\
   guix/ca.scm					\
   guix/ca/derivation.scm				\
   guix/ca/policy.scm				\
+  guix/ca/references.scm			\
   guix/ca/sharing.scm				\
   guix/ca/records.scm				\
   guix/ca/graft.scm				\

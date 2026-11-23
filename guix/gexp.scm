@@ -1341,6 +1341,10 @@ The other arguments are as for 'derivation'."
                        (addressing -> ((module-ref (resolve-module '(guix ca policy)) 'gexp-addressing)
                                        addressing (lowered-gexp-guile lowered)
                                        (lowered-gexp-inputs lowered) graphs allowed disallowed)) ;goonix: actual inputs and references
+                       ;; goonix: reference-list outputs are required inputs (CA only).
+                       (ref-inputs (if (eq? addressing 'input) (return '())
+                                       ((module-ref (resolve-module '(guix ca references)) 'reference-inputs)
+                                        allowed-references disallowed-references system target)))
                        (builder-text -> (sexp->string
                                          (lowered-gexp-sexp lowered))) ;goonix: builder text
                        (builder  (if (eq? addressing 'input)
@@ -1373,6 +1377,7 @@ The other arguments are as for 'derivation'."
                       #:system system
                       #:inputs `(,guile
                                  ,@(lowered-gexp-inputs lowered)
+                                 ,@ref-inputs ;goonix: reference-list outputs
                                  ,@(match graphs
                                      (((_ . inputs) ...)
                                       (filter derivation-input? inputs))

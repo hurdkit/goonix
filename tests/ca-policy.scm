@@ -876,5 +876,149 @@ NarSize: 1234\nNarHash: sha256:~a\nReferences: \nSystem: ~a\nDeriver: ~a\n"
                                #~(mkdir #$output)
                                #:addressing #f))))))))
 
+(test-group "a reference list may name an output the dependent does not consume"
+  ;; CA-6 gate run 13 died here, at glibc-2.41 over gcc-cross-boot0:
+  ;;   goonix: unresolved placeholder
+  ;;   `/gnu/store/eotuouutuotottteeeuuetueetootttt-gcc-cross-boot0-14.3.0-lib'
+  ;;   in resolved derivation
+  ;; Measured in the gate's store: glibc takes that derivation as an input but
+  ;; requests ONLY ["out"], while its allowedReferences names the derivation's
+  ;; LIB output.  resolveDerivation (nix/libstore/ca.cc:889) builds its
+  ;; replacement map from input.second, i.e. only the REQUESTED sub-outputs, so
+  ;; lib's placeholder gets no replacement, survives in allowedReferences, and
+  ;; checkResolvedDerivation's scan refuses the derivation at registration.
+  ;;
+  ;; The whole fixture is inside one catch so a refusal reports as failed
+  ;; assertions instead of aborting the group (the ca-policy.scm idiom).
+  (let ((fresh (lambda (prefix)
+                 (string-append prefix "-"
+                                (number->string
+                                 (random 1000000000
+                                         (random-state-from-platform)))))))
+    (let ((multi-name (fresh "ca-reflist-multi"))
+          (user-name  (fresh "ca-reflist-user")))
+    (catch #t
+      (lambda ()
+        (let* ((multi (trivial multi-name
+                        #~(begin
+                            (call-with-output-file #$output
+                              (lambda (p) (display "OUT" p)))
+                            (call-with-output-file #$output:lib
+                              (lambda (p) (display "LIB" p))))
+                        '() '()))
+               (multi (package
+                        (inherit multi)
+                        (outputs '("out" "lib"))))
+               (multi-drv (parameterize ((%package-addressing-policy 'content))
+                            (package-derivation store multi)))
+               (lib-placeholder (derivation->output-path multi-drv "lib")))
+          (test-assert "the non-consumed sibling output really is a placeholder"
+            (placeholder-path? lib-placeholder))
+          ;; The reviewer's required case: lib must NOT be realised before the
+          ;; dependent is built.  A fix that only rewrote placeholders when the
+          ;; item happened to be in the store would pass here by luck and be
+          ;; refused on a machine that substituted only `out', or after a GC of
+          ;; lib.  So assert it is absent, then build the DEPENDENT first.
+          (test-assert "lib is NOT realised before the dependent is built"
+            (not (valid-path? store lib-placeholder)))
+          ;; allowed-references must name BOTH: out is what the builder actually
+          ;; refers to, lib is the non-consumed sibling under test.  Listing lib
+          ;; alone is correctly refused with "is not allowed to refer to path"
+          ;; (measured), which is a different property, not this bug.
+          (let ((drv (parameterize ((%package-addressing-policy 'content))
+                       (run-with-store store
+                         (gexp->derivation user-name
+                           #~(call-with-output-file #$output
+                               (lambda (p) (display #$multi:out p)))
+                           #:allowed-references (list (gexp-input multi "out")
+                                                      (gexp-input multi "lib"))
+                           #:addressing 'content)))))
+            (test-assert "lowering a dependent whose allowed-references names a non-consumed output succeeds"
+              (derivation? drv))
+            ;; The requested outputs must include lib, deterministically from
+            ;; the reference list rather than from store contents.
+            (test-assert "the reference-list output is a REQUESTED input output"
+              (any (lambda (input)
+                     (and (member "lib" (derivation-input-sub-derivations input))
+                          (string=? (derivation-file-name
+                                     (derivation-input-derivation input))
+                                    (derivation-file-name multi-drv))))
+                   (derivation-inputs drv)))
+            (test-assert "and it builds"
+              (begin (build-derivations store (list drv)) #t)))))
+      (lambda (key . args)
+        (format #t "refusal: ~a ~a~%" key args)
+        (test-assert "lowering a dependent whose allowed-references names a non-consumed output succeeds"
+          #f)
+        (test-assert "and it builds" #f))))))
+
+(test-group "an input-addressed derivation's inputs stay exactly upstream's"
+  ;; The blocking regression the reviewer measured on 4ec5f3b1273: adding
+  ;; reference-list outputs unconditionally changed INPUT-ADDRESSED graphs.
+  ;; glibc-final's drv moved from upstream's w189hhbh… to 256qrzh1…, because
+  ;; gcc-cross-boot0 went "out" -> "lib","out" and bash-static "out" ->
+  ;; "doc","out".  glibc-final is under everything, so every input-addressed
+  ;; package got a new .drv and output path and lost upstream substitutes.
+  ;;
+  ;; Structural, no hard-coded hashes: lower the SAME gexp twice, once with a
+  ;; reference list naming a non-consumed sibling and once without, under the
+  ;; DEFAULT (input) policy, and require identical inputs.  An input-addressed
+  ;; derivation has real paths in its reference lists, so it needs nothing.
+  (let ((fresh (lambda (prefix)
+                 (string-append prefix "-"
+                                (number->string
+                                 (random 1000000000
+                                         (random-state-from-platform)))))))
+    (catch #t
+      (lambda ()
+        (let* ((multi (trivial (fresh "ca-ia-reflist-multi")
+                        #~(begin
+                            (call-with-output-file #$output
+                              (lambda (p) (display "OUT" p)))
+                            (call-with-output-file #$output:lib
+                              (lambda (p) (display "LIB" p))))))
+               (multi (package (inherit multi) (outputs '("out" "lib"))))
+               (lower (lambda (refs)
+                        (run-with-store store
+                          (gexp->derivation "ca-ia-reflist-user"
+                            #~(call-with-output-file #$output
+                                (lambda (p) (display #$multi:out p)))
+                            #:allowed-references refs))))
+               (plain (lower #f))
+               (with-sibling (lower (list (gexp-input multi "out")
+                                        (gexp-input multi "lib")))))
+          (define (input-key drv)
+            (sort (map (lambda (i)
+                         (cons (derivation-file-name
+                                (derivation-input-derivation i))
+                               (sort (derivation-input-sub-derivations i)
+                                     string<?)))
+                       (derivation-inputs drv))
+                  (lambda (a b) (string<? (car a) (car b)))))
+          (test-assert "the default policy really lowers this input-addressed"
+            (not (assoc-ref (derivation-builder-environment-vars with-sibling)
+                            "goonixAddressing")))
+          (test-equal "a non-consumed sibling in allowed-references adds NO input under the default policy"
+            (input-key plain) (input-key with-sibling))
+          ;; Pin the bug directly: "lib" must NOT become a requested output of
+          ;; multi.  Before the fix it did ("out" -> "lib","out"), which moved
+          ;; glibc-final's drv off upstream's path.
+          (test-assert "the non-consumed sibling is NOT a requested output"
+            (not (any (lambda (i)
+                        (member "lib" (derivation-input-sub-derivations i)))
+                      (derivation-inputs with-sibling))))
+          ;; NOTE: the .drv file AND the output path do differ between these two
+          ;; lowerings, and that is correct upstream behaviour: allowedReferences
+          ;; is part of an input-addressed derivation's hash.  Measured:
+          ;; pw29hnfs… vs z9xy0la6….  The property that matters is that the
+          ;; INPUTS are unchanged, so the same reference list yields the same
+          ;; graph as upstream - checked by hand on glibc-final, which is back
+          ;; to the host's w189hhbh1r33l2h37qr772rijklxqqxg-glibc-2.41.drv.
+          ))
+      (lambda (key . args)
+        (format #t "refusal: ~a ~a~%" key args)
+        (test-assert "a non-consumed sibling in allowed-references adds NO input under the default policy"
+          #f)))))
+
 (close-connection store)
 (test-end)
