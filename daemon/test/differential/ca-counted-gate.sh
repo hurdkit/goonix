@@ -78,7 +78,8 @@ setup_ns() {
 
 # --- run one daemon's 16 suites inside its namespace ---
 run_daemon() {
-  local label=$1 daemon=$2 pkg=$3 ns="$work/$label"
+  local label=$1 daemon=$2 pkg=$3
+  local ns="$work/$label"
   setup_ns "$label"
   local pkg_glp="$pkg/share/guile/site/3.0"
   local pkg_glcp="$pkg/lib/guile/3.0/site-ccache"
@@ -140,9 +141,9 @@ run_daemon() {
       for name in $suites; do
         client_env "$guile_bin" --no-auto-compile -e main \
           "$root/build-aux/test-driver.scm" \
-          --test-name="$name" --log-file="$ns/results/$name.log" \
+          --test-name="tests/$name" --log-file="$ns/results/$name.log" \
           --trs-file="$ns/results/$name.trs" --brief=yes --color-tests=no \
-          "$root/tests/$name.scm" > "$ns/results/$name.out" 2>&1
+          -- "$root/tests/$name.scm" > "$ns/results/$name.out" 2>&1
         rc=$?
         pass=$(grep -c ":test-result: PASS" "$ns/results/$name.trs" 2>/dev/null || echo 0)
         fail=$(grep -c ":test-result: FAIL" "$ns/results/$name.trs" 2>/dev/null || echo 0)
