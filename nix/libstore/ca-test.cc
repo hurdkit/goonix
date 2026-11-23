@@ -21,6 +21,11 @@ namespace nix {
 void checkRewriteForTest(const Path & path, const string & from, const string & to);
 void rewriteTreeForTest(const Path & path, const string & from, const string & to);
 string encodeReservedForTest(const Hash & digest, bool token);
+string inverseTreeForTest(const Path & path, const string & final,
+    const string & token, const std::map<Path, Path> & siblings);
+bool sameContentForTest(const Path & path, const string & final,
+    const string & token, const Hash & expected,
+    const std::map<Path, Path> & siblings);
 }
 
 static unsigned failures = 0;
@@ -1157,5 +1162,106 @@ int main(int argc, char ** argv)
             "its hard-linked twin stays executable across two rewrite passes");
     }
 
+    /* goonix: a sibling hash at the END of a file, and across the 128 KiB read
+       boundary.  inverseTree's streaming loop used to retain only `final.size()
+       - 1' bytes and scan prefixes of `final' alone, so a SIBLING hash crossing
+       the cut was split between two inverse() calls and never mapped back to its
+       token.  sameContent then reported false for identical content - a spurious
+       CA collision / verification failure for multi-output derivations whose
+       outputs reference each other.  Found by the Haskell session's sameContent
+       probe.
+
+       THE PROPERTY.  inverse() undoes a realisation: it maps this output's final
+       hash back to its token, and each sibling's final hash back to that
+       sibling's token.  So two realisations of the SAME content, carrying
+       different final hashes, must invert to the SAME canonical tree - both
+       end up expressed in tokens.  (Inverting A to B's hashes and B to A's would
+       produce two SWAPPED trees, which are legitimately different; that was my
+       first, wrong, expectation.)
+
+       Each fixture builds the token-form tree once as the reference, then two
+       realisations of it, and requires both inversions to equal the reference. */
+    {
+        std::string selfTok(32, 't'), sibTok(32, 's');
+        std::string selfA(32, 'a'), selfB(32, 'b');
+        std::string sibA(32, 'c'), sibB(32, 'd');
+
+        /* Build one tree in a given spelling of the two hashes. */
+        auto build = [&](const std::string & self, const std::string & sib,
+                         const std::string & suffix, size_t pad) {
+            Path root = createTempDir("", "goonix-sibling-boundary");
+            createDirs(root + "/bin");
+            writeFile(root + "/bin/w",
+                std::string(pad, 'p')
+                + "#! /bin/sh\nexec /gnu/store/" + sib + "-foo-bin/bin/x \"$@\""
+                + suffix);
+            writeFile(root + "/bin/self", "/gnu/store/" + self + "-foo\n");
+            return root;
+        };
+        /* The sibling map is TOKEN -> FINAL, as finalisation builds it
+           (rewriteTree(physical, sibling.first, sibling.second)); inverse()
+           replaces it->second with it->first. */
+        auto siblings = [&](const std::string & sibFinal) {
+            std::map<Path, Path> m;
+            m["/gnu/store/" + sibTok + "-foo-bin"] =
+                "/gnu/store/" + sibFinal + "-foo-bin";
+            return m;
+        };
+
+        /* (1) The sibling hash ends 0, 1 and 30 bytes before EOF - all inside
+           the old 31-byte retained tail, so the old code split it. */
+        for (unsigned tail : {0u, 1u, 30u}) {
+            std::string suffix(tail, 'x');
+            Path ref = build(selfTok, sibTok, suffix, 0);
+            Path ra = build(selfA, sibA, suffix, 0);
+            Path rb = build(selfB, sibB, suffix, 0);
+            AutoDelete d1(ref, true), d2(ra, true), d3(rb, true);
+            string want = inverseTreeForTest(ref, selfTok, selfTok, {});
+            string gotA = inverseTreeForTest(ra, selfA, selfTok, siblings(sibA));
+            string gotB = inverseTreeForTest(rb, selfB, selfTok, siblings(sibB));
+            check(gotA == want && gotB == want,
+                std::format("a sibling hash {} bytes from EOF inverts to the token tree", tail));
+        }
+
+        /* (2) A sibling hash STRADDLING the 128 KiB read boundary.  The padding
+           places the hash so the read cut falls inside it. */
+        for (unsigned straddle : {1u, 16u, 31u, 32u}) {
+            /* The prefix before the sibling hash is the padding plus the fixed
+               shebang/exec text; shift the padding so the hash spans the cut. */
+            std::string lead = "#! /bin/sh\nexec /gnu/store/";
+            size_t boundary = 128 * 1024;
+            size_t pad = boundary - straddle - lead.size();
+            Path ref = build(selfTok, sibTok, "", pad);
+            Path ra = build(selfA, sibA, "", pad);
+            Path rb = build(selfB, sibB, "", pad);
+            AutoDelete d1(ref, true), d2(ra, true), d3(rb, true);
+            string want = inverseTreeForTest(ref, selfTok, selfTok, {});
+            string gotA = inverseTreeForTest(ra, selfA, selfTok, siblings(sibA));
+            string gotB = inverseTreeForTest(rb, selfB, selfTok, siblings(sibB));
+            check(gotA == want && gotB == want,
+                std::format("a sibling hash straddling the read boundary ({}) inverts to the token tree",
+                    straddle));
+        }
+
+        /* (3) The VERDICT, not just the digest: sameContent must accept a
+           realisation whose sibling reference sits at EOF.  This is the
+           observable a multi-output finalisation consults.  The expected hash is
+           the TOKEN tree's, computed independently of the call under test. */
+        {
+            Path ref = build(selfTok, sibTok, "", 0);
+            Path ra = build(selfA, sibA, "", 0);
+            AutoDelete d1(ref, true), d2(ra, true);
+            Hash expected = parseHash(htSHA256,
+                inverseTreeForTest(ref, selfTok, selfTok, {}));
+            check(sameContentForTest(ra, "/gnu/store/" + selfA + "-foo",
+                    "/gnu/store/" + selfTok + "-foo", expected, siblings(sibA)),
+                "sameContent accepts a sibling reference at EOF");
+            /* And it must still REJECT genuinely different content. */
+            writeFile(ra + "/bin/self", "/gnu/store/" + selfA + "-foo CHANGED\n");
+            check(!sameContentForTest(ra, "/gnu/store/" + selfA + "-foo",
+                    "/gnu/store/" + selfTok + "-foo", expected, siblings(sibA)),
+                "sameContent still rejects a real content change");
+        }
+    }
     return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
