@@ -3,7 +3,7 @@
 (define socket (cadr (command-line)))
 (define rounds (string->number (caddr (command-line))))
 (define s (open-connection socket))
-(set-build-options s #:use-substitutes? #f)
+(set-build-options s #:use-substitutes? #f #:offload? #f)
 (let loop ((i 0))
   (when (< i rounds)
     (collect-garbage s)

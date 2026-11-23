@@ -115,6 +115,9 @@ EXTRA_DIST += \
   daemon/test/differential/stress-build.scm daemon/test/differential/stress-substitute.scm \
   daemon/test/differential/stress-gc.scm daemon/test/differential/stress-roots.scm \
   daemon/test/differential/stress-watchdog.scm daemon/test/differential/stress-verify.scm \
+  daemon/test/differential/build-probe.scm daemon/test/differential/build-probe-nons.sh \
+  daemon/test/differential/build-probe-diag.sh \
+  daemon/test/differential/nar-import-probe.scm daemon/test/differential/nar-import-probe.sh \
   daemon/test/differential/root-ci.sh daemon/test/differential/root-ci-setup.sh \
   daemon/test/differential/root-ci-client.scm daemon/test/differential/root-ci-http.sh \
   daemon/test/differential/root-ci-killuser.scm daemon/test/differential/root-ci-substitute.sh \

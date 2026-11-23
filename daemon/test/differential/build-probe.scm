@@ -7,7 +7,7 @@
 (%graft? #f)
 (format #t "build-probe: connecting~%") (force-output)
 (define s (open-connection socket))
-(set-build-options s #:use-substitutes? #f)
+(set-build-options s #:use-substitutes? #f #:offload? #f)
 (format #t "build-probe: adding bash~%") (force-output)
 (define bash (add-to-store s "bash" #t "sha256"
                            (search-bootstrap-binary "bash" (%current-system))))

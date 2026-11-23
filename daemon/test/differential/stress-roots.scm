@@ -5,7 +5,7 @@
 (define socket (cadr (command-line)))
 (define rounds (string->number (caddr (command-line))))
 (define s (open-connection socket))
-(set-build-options s #:use-substitutes? #f)
+(set-build-options s #:use-substitutes? #f #:offload? #f)
 (define bash (add-to-store s "bash" #t "sha256"
                            (search-bootstrap-binary "bash" (%current-system))))
 (define drv (derivation s "stress-rooted" bash '("-c" "echo rooted > $out")

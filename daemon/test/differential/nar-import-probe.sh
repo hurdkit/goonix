@@ -13,13 +13,21 @@ devinfo=$(cd "$root" && nix develop .#default -c bash -c 'echo "GLP=$GUILE_LOAD_
 dev_glp=$(echo "$devinfo" | grep '^GLP=' | sed 's/^GLP=//')
 dev_glcp=$(echo "$devinfo" | grep '^GLCP=' | sed 's/^GLCP=//')
 timeout_abs=$(command -v timeout)
+# Wrap the noisy helper with an absolute bash + dev PATH (daemon spawns it with
+# PATH=/nonexistent), as root-ci-substitute.sh does.  Done OUTSIDE the namespace
+# block so the single quotes do not conflict with the outer bash -c quoting.
+bash_abs=$(command -v bash); dev_path="$PATH"
+helper="$work/noisy-helper.wrapper"
+{ printf '#!%s\n' "$bash_abs"; printf 'export PATH=%s\n' "$dev_path";
+  cat "$here/stress-noisy-helper.sh"; } > "$helper"
+chmod +x "$helper"
 export PATH=/run/wrappers/bin:$PATH
 timeout 150 unshare --user \
   --map-users=0:"$uid":1 --map-users=1:100000:65536 \
   --map-groups=0:"$gid":1 --map-groups=1:100000:65536 \
   --mount -- bash -c '
     set -uo pipefail
-    work="'"$work"'"; root="'"$root"'"; dev_glp="'"$dev_glp"'"; dev_glcp="'"$dev_glcp"'"; timeout_abs="'"$timeout_abs"'"
+    work="'"$work"'"; root="'"$root"'"; dev_glp="'"$dev_glp"'"; dev_glcp="'"$dev_glcp"'"; timeout_abs="'"$timeout_abs"'"; helper="'"$helper"'"
     mount --bind "$work/etc/passwd" /etc/passwd
     mount --bind "$work/etc/group" /etc/group
     mount --bind "$work/etc/nsswitch.conf" /etc/nsswitch.conf
@@ -28,13 +36,6 @@ timeout 150 unshare --user \
     mount --bind "$work/log-guix" /var/log/guix
     mount --bind "$HOME" "$HOME"; chmod 755 "$HOME"
     mount --bind "$work/bin" /bin
-    # Wrap the noisy helper with an absolute bash + dev PATH (daemon spawns it with
-    # PATH=/nonexistent), as root-ci-substitute.sh does.
-    bash_abs=$(command -v bash); dev_path="$PATH"
-    helper="$work/noisy-helper.wrapper"
-    { printf '#!%s\n' "$bash_abs"; printf 'export PATH=%s\n' "$dev_path";
-      cat "$root/daemon/test/differential/stress-noisy-helper.sh"; } > "$helper"
-    chmod +x "$helper"
     env -i TMPDIR="$work/build" LC_ALL=C.UTF-8 PATH=/nonexistent GUIX="$helper" \
       GUILE_LOAD_PATH="$root:$dev_glp" GUIX_UNINSTALLED=1 GUIX_SANDBOX="$root/guix-sandbox" \
       "$root/guix-daemon" --build-users-group=guixbuild --max-jobs=2 --substitute-urls="" \

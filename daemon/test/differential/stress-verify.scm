@@ -1,7 +1,7 @@
 ;;; goonix stress gate: store verification afterwards.  The rooted output is still
 ;;; alive (the GC kept a rooted path) and appears among the store's roots.
 ;;; Args: SOCKET WORK-DIR
-(use-modules (guix store) (ice-9 match))
+(use-modules (guix store) (ice-9 match) (srfi srfi-1))
 (define socket (cadr (command-line)))
 (define work (caddr (command-line)))
 (define s (open-connection socket))
