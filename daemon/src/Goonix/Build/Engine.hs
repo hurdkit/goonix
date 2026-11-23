@@ -53,7 +53,7 @@ import System.IO (Handle, hClose, hPutStrLn, stderr)
 import System.Process (CreateProcess (..), CmdSpec (..), StdStream (..), createProcess, getPid, proc, waitForProcess)
 import System.IO.Unsafe (unsafePerformIO)
 import System.Posix.Files (fileOwner, fileGroup, stdFileMode)
-import System.Posix.Process (getProcessID, getProcessStatus, ProcessStatus (Exited, Terminated, Stopped))
+import System.Posix.Process (getProcessID, ProcessStatus (Exited, Terminated, Stopped))
 import System.Posix.Signals (sigKILL, signalProcessGroup)
 import System.Posix.IO.ByteString (createPipe, fdToHandle, closeFd, openFd, fdRead, fdWrite, OpenMode (ReadOnly, WriteOnly), defaultFileFlags, OpenFileFlags (trunc, creat))
 import System.Posix.User (getEffectiveGroupID, getEffectiveUserID)
@@ -74,6 +74,7 @@ import Goonix.Build.Runtime (JobSpec (..), Outcome (..), runScheduled, runSchedu
 import Goonix.Build.Scheduler (JobKind (..))
 import Goonix.Build.Shared (raiseLimit, withGoal)
 import Goonix.Build.Offload
+import Goonix.Build.Wait (waitProcessStatusNonBlocking)
 import Goonix.Build.Users (BuildUser (..), UserPool, loadUserPool, withBuildUser)
 import Goonix.Build.Seccomp (nativeArchitecture, slirpSeccompFilter)
 import System.Environment (getEnvironment, getExecutablePath, lookupEnv)
@@ -836,7 +837,7 @@ waitForBuilder settings pid wait lastOutput = do
 
 waitForSandbox :: Int -> IO ExitCode
 waitForSandbox pid = do
-  status <- getProcessStatus True False (fromIntegral pid)
+  status <- waitProcessStatusNonBlocking (fromIntegral pid)
   case status of
     Just (Exited code) -> pure code
     Just (Terminated _ _) -> pure (ExitFailure 1)
@@ -952,7 +953,7 @@ buildLogPath settings store drvPath = do
 
 data LogWriter = LogWriter CInt (Ptr ())
 
-foreign import ccall unsafe "goonix_open_log"
+foreign import ccall safe "goonix_open_log"
   c_open_log :: CString -> CInt -> IO (Ptr ())
 foreign import ccall safe "goonix_write_log"
   c_write_log :: Ptr () -> CInt -> Ptr a -> CSize -> IO CInt

@@ -1,0 +1,23 @@
+;;; goonix: minimal build probe.  Args: SOCKET
+;;; add-to-store passes (nar-import-probe); isolate whether build-derivations hangs.
+(use-modules (guix store) (guix derivations) (guix utils) (guix tests)
+             (gnu packages bootstrap) (ice-9 match))
+(format #t "build-probe: modules loaded~%") (force-output)
+(define socket (cadr (command-line)))
+(%graft? #f)
+(format #t "build-probe: connecting~%") (force-output)
+(define s (open-connection socket))
+(set-build-options s #:use-substitutes? #f #:offload? #f)
+(format #t "build-probe: adding bash~%") (force-output)
+(define bash (add-to-store s "bash" #t "sha256"
+                           (search-bootstrap-binary "bash" (%current-system))))
+(format #t "build-probe: bash=~a deriving~%" bash) (force-output)
+(define drv (derivation s "build-probe" bash '("-c" "echo built > $out") #:sources (list bash)))
+(define out (derivation->output-path drv))
+(format #t "build-probe: building ~a~%" out) (force-output)
+(build-derivations s (list drv))
+(format #t "build-probe: built~%") (force-output)
+(close-connection s)
+(if (file-exists? out)
+    (begin (format #t "build-probe: PASS ~a~%" out) (primitive-exit 0))
+    (begin (format #t "build-probe: FAIL~%") (primitive-exit 1)))

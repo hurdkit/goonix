@@ -6,10 +6,30 @@
 #     (a clean `nix build .#guix-daemon-hs` would otherwise fail to find it).
 #   - dedup-overflow.sh: the dedup temp-path heap overflow canary AND the dedup
 #     link-count parity harness (two C tests compiled against daemon/cbits/files.c).
+#   - delete-hardlink.sh: deleteTree must not chmod the file it unlinks.  A
+#     deduplicated store file is hard-linked into .links (one inode, several
+#     paths); the GC deleting one link while a build execs another must not strip
+#     the shared inode's exec bit (the sandbox EACCES race).  Compiles the daemon's
+#     Files.hs; FAILS pre-fix (mode 0555 -> 0644), PASSES after.
 #   - sqlite-contention.sh: two SQLite handles in one process must not freeze the
 #     daemon when one holds the WAL write lock and the other's sqlite3_step sleeps
 #     in the busy handler (the lock-taking sqlite calls must be `ccall safe').
 #     Compiles the daemon's Database.hs with the probe; runs +RTS -A1m -N.
+#   - socket-idle.sh: an idle client (sends nothing) must not freeze the daemon's
+#     other threads; readSocket must wait through the IO manager, not a raw
+#     blocking fdRead.  Compiles the daemon's Socket.hs; runs +RTS -A1m -N.
+#   - offload-eof.sh: a hook that closes its output before replying must make
+#     requestOffload raise a storeError within a bounded time, not spin flooding
+#     newlines (receiveLine throws at EOF, as C++ readLine).  FAILS pre-fix.
+#   - offload-flood.sh: finishOffload must drain ALL of a hook's output (>64 KiB
+#     with pauses) and return; the non-blocking output fd hits EAGAIN between
+#     bursts, which is NOT EOF.  FAILS pre-fix (drainFd treated EAGAIN as EOF ->
+#     bytes lost / hang).  Both compile the daemon sources; run +RTS -A1m -N.
+#   - wait-stack.sh: waitProcessStatusNonBlocking must not accumulate memory per
+#     poll.  alloca OUTSIDE the poll loop (one buffer, tail call), not inside (each
+#     poll's pinned buffer + frame held alive until the child exits).  Waits on a
+#     12s child under -K64k -T, samples live bytes: FAILS pre-fix (live grows ~7KB/s),
+#     PASSES after (flat).  Compiles the daemon's Wait.hs.
 # Fails if ANY of them fails, naming the failing test.
 #
 # export-memory.sh is deliberately NOT here: it needs a running daemon and a
@@ -34,7 +54,14 @@ run() { # name script...
 }
 run cabal-modules bash "$here/cabal-modules.sh" "$root"
 run dedup-overflow bash "$here/dedup-overflow.sh" "$root/daemon/cbits/files.c"
+run delete-hardlink bash "$here/delete-hardlink.sh" "$root"
 run sqlite-contention bash "$here/sqlite-contention.sh" "$root"
+run socket-idle bash "$here/socket-idle.sh" "$root"
+run child-wait bash "$here/child-wait.sh" "$root"
+run wait-stack bash "$here/wait-stack.sh" "$root"
+run offload-idle bash "$here/offload-idle.sh" "$root"
+run offload-eof bash "$here/offload-eof.sh" "$root"
+run offload-flood bash "$here/offload-flood.sh" "$root"
 if test $rc -eq 0; then
   echo "ALL REGRESSIONS PASS"
 else

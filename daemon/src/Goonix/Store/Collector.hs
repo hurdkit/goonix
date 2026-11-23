@@ -18,7 +18,7 @@ import qualified Data.ByteString.Char8 as C
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
 import qualified Data.Set as Set
 import Data.Word (Word64)
-import Goonix.Store.Database (Value (Bytes, Integer), execute, withTransaction)
+import Goonix.Store.Database (Value (Bytes, Integer), execute, retryBusy, withTransaction)
 import Goonix.Store.Hash (HashAlgorithm (SHA256))
 import Goonix.Store.Files (deleteTree, withGCLock, announcedRoots, storeGcLockPathOf)
 import Goonix.Store.Hash (hashDigest)
@@ -149,7 +149,7 @@ gcPathOf :: Store -> ByteString
 gcPathOf store = storeGcLockPathOf (storeDirectory store) (storeStateDirectory store)
 
 invalidatePath :: Store -> ByteString -> IO ()
-invalidatePath store = withTransaction (database store) . invalidatePathSQL store
+invalidatePath store = retryBusy . withTransaction (database store) . invalidatePathSQL store
 
 invalidatePathSQL :: Store -> ByteString -> IO ()
 invalidatePathSQL store path = do
@@ -157,7 +157,7 @@ invalidatePathSQL store path = do
   execute (database store) "delete from ValidPaths where path = ?;" [Bytes path]
 
 invalidatePathChecked :: Store -> ByteString -> IO ()
-invalidatePathChecked store path = withTransaction (database store) $ do
+invalidatePathChecked store path = retryBusy $ withTransaction (database store) $ do
   valid <- isValidPath store path
   when valid $ do
     referrers <- filter (/= path) <$> queryReferrers store path
