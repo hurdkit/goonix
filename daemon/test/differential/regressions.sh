@@ -18,6 +18,13 @@
 #   - socket-idle.sh: an idle client (sends nothing) must not freeze the daemon's
 #     other threads; readSocket must wait through the IO manager, not a raw
 #     blocking fdRead.  Compiles the daemon's Socket.hs; runs +RTS -A1m -N.
+#   - offload-eof.sh: a hook that closes its output before replying must make
+#     requestOffload raise a storeError within a bounded time, not spin flooding
+#     newlines (receiveLine throws at EOF, as C++ readLine).  FAILS pre-fix.
+#   - offload-flood.sh: finishOffload must drain ALL of a hook's output (>64 KiB
+#     with pauses) and return; the non-blocking output fd hits EAGAIN between
+#     bursts, which is NOT EOF.  FAILS pre-fix (drainFd treated EAGAIN as EOF ->
+#     bytes lost / hang).  Both compile the daemon sources; run +RTS -A1m -N.
 # Fails if ANY of them fails, naming the failing test.
 #
 # export-memory.sh is deliberately NOT here: it needs a running daemon and a
@@ -47,6 +54,8 @@ run sqlite-contention bash "$here/sqlite-contention.sh" "$root"
 run socket-idle bash "$here/socket-idle.sh" "$root"
 run child-wait bash "$here/child-wait.sh" "$root"
 run offload-idle bash "$here/offload-idle.sh" "$root"
+run offload-eof bash "$here/offload-eof.sh" "$root"
+run offload-flood bash "$here/offload-flood.sh" "$root"
 if test $rc -eq 0; then
   echo "ALL REGRESSIONS PASS"
 else

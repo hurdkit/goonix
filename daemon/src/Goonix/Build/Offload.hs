@@ -28,13 +28,14 @@ import qualified Data.ByteString.Char8 as C
 import Goonix.Build.Wait (waitProcessStatusNonBlocking)
 import Goonix.Store.ReadOnly (storeError)
 import System.IO (Handle, hClose, hFlush)
+import System.IO.Error (isEOFError)
 import System.Posix.IO.ByteString (createPipe, closeFd, fdToHandle, setFdOption, FdOption (CloseOnExec, NonBlockingRead), fdRead)
 import GHC.Conc (threadWaitReadSTM)
 import GHC.IO.Exception (ioe_errno)
 import Foreign.C.Error (eAGAIN, eWOULDBLOCK, Errno (..))
 import System.Posix.Process (ProcessStatus (Exited, Terminated, Stopped))
 import System.Posix.Signals (sigKILL, signalProcessGroup)
-import System.Posix.Types (Fd (..), ProcessID)
+import System.Posix.Types (Fd (..), ProcessID, ByteCount)
 import Foreign.C.String (CString, withCString)
 import Foreign.C.Types (CInt (..))
 import Foreign.Marshal.Alloc (alloca)
@@ -143,8 +144,16 @@ finishOffload hook emit = do
     drain handle = do
       bytes <- B.hGetSome handle 32768
       unless (B.null bytes) $ emit bytes >> drain handle
+    -- The output fd is NON-BLOCKING (startOffloadHook), so fdRead throws EAGAIN
+    -- whenever the pipe is momentarily empty — that is NOT EOF.  Treating it as
+    -- EOF (the old `catch \_ -> pure B.empty`) stopped the drain early: everything
+    -- the helper wrote afterwards was lost, and once it wrote more than the pipe
+    -- buffer (64 KiB) it blocked in write(), waitProcessStatusNonBlocking never
+    -- returned, and the build hung — the very deadlock this drain prevents.  Wait
+    -- through the IO manager on EAGAIN/EWOULDBLOCK (finally-unregister, as
+    -- receiveLine) and read again; only a 0-byte read is EOF.
     drainFd fd = do
-      bytes <- fdRead fd 32768 `catch` \(_ :: IOException) -> pure B.empty
+      bytes <- readSomeNonBlocking fd 32768
       unless (B.null bytes) $ emit bytes >> drainFd fd
 
 stopHook :: Hook -> IO ()
@@ -171,34 +180,54 @@ sendLine hook line = do
 -- this thread's capability while the helper is silent, and the next GC needs every
 -- capability to stop, freezing the other clients.  threadWaitRead releases the
 -- capability while parked.  (The builder pipe is drained separately by finishOffload.)
+--
+-- EOF (a 0-byte read) means the helper closed its output before sending a complete
+-- reply line: throw, as the C++ readLine (util.cc, "unexpected EOF reading a line")
+-- and Substitute.receiveLine ("`guix substitute' died unexpectedly") do.  Returning
+-- the partial line ("" when nothing was read) would make requestOffload's replyLine
+-- see no "# " prefix, emit "\n" and call receiveLine again, which returns "" again —
+-- an endless full-CPU spin flooding the client with newlines when a hook dies or
+-- closes fd 4 before replying.  A complete line still ends at its newline.
 receiveLine :: Hook -> IO ByteString
 receiveLine hook = go []
   where
     fd = hookOutputFd hook
     go acc = do
-      byte <- readByte fd
+      byte <- readSomeNonBlocking fd 1
       if B.null byte
-        then pure (B.concat (reverse acc))   -- EOF: return what we have
+        then throwIO (storeError "offload hook closed its output")
         else case C.head byte of
           '\n' -> pure (B.concat (reverse acc))
           _ -> go (byte : acc)
-    readByte fd = do
-      r <- (Just <$> fdRead fd 1) `catch` wouldBlock
+
+fdNumber :: Fd -> CInt
+fdNumber (Fd fd) = fd
+
+-- | Read up to n bytes from a NON-BLOCKING fd through the GHC IO manager.
+-- EAGAIN/EWOULDBLOCK (the pipe is momentarily empty) is NOT EOF: wait with
+-- threadWaitReadSTM (finally-unregister) and read again, releasing the capability
+-- while parked.  EOF is reported by fdRead as an IOException with isEOFError (it
+-- does NOT return an empty ByteString), so catch it and return B.empty — the
+-- caller decides what EOF means (receiveLine: the hook died; drainFd: done).  Any
+-- other error propagates.
+readSomeNonBlocking :: Fd -> ByteCount -> IO ByteString
+readSomeNonBlocking fd n = go
+  where
+    go = do
+      r <- (Just <$> fdRead fd n) `catch` handle
       case r of
         Just bytes -> pure bytes
         Nothing -> do
           (wait, unregister) <- threadWaitReadSTM fd
           atomically wait `finally` unregister
-          readByte fd
-    wouldBlock :: IOException -> IO (Maybe ByteString)
-    wouldBlock e
+          go
+    handle :: IOException -> IO (Maybe ByteString)
+    handle e
+      | isEOFError e = pure (Just B.empty)
       | let errno = ioe_errno e
       , errno == Just (case eAGAIN of Errno n -> n)
         || errno == Just (case eWOULDBLOCK of Errno n -> n) = pure Nothing
       | otherwise = throwIO e
-
-fdNumber :: Fd -> CInt
-fdNumber (Fd fd) = fd
 
 closeIgnore :: Handle -> IO ()
 closeIgnore handle = hClose handle `catchAny` pure ()
