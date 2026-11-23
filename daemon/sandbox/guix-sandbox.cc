@@ -598,14 +598,16 @@ void slirpChild(Plan & plan, int tap, int readyFd)
     const Bytes oldRoot = plan.root;
     plan.root += "/slirp";
     /* The slirp child starts in the daemon's namespaces.  Create its own
-       user namespace first, with the host identity mapped, before creating
-       the mount/PID/IPC/UTS namespaces.  This is the C++ cloneFlags plus
-       lockMounts ordering. */
+       user namespace first, with the CURRENT identity mapped (C++
+       initializeUserNamespace(slirpPid, getuid(), getgid(), getuid(), getgid())),
+       before creating the mount/PID/IPC/UTS namespaces.  Mapping the build
+       user's uid here would leave the daemon's own uid unmapped, stripping
+       CAP_SYS_ADMIN and failing the tmpfs mount with EOVERFLOW. */
     Plan initialIdentity = plan;
-    initialIdentity.uidMapInside = plan.uidMapOutside;
-    initialIdentity.uidMapOutside = plan.uidMapOutside;
-    initialIdentity.gidMapInside = plan.gidMapOutside;
-    initialIdentity.gidMapOutside = plan.gidMapOutside;
+    initialIdentity.uidMapInside = geteuid();
+    initialIdentity.uidMapOutside = geteuid();
+    initialIdentity.gidMapInside = getegid();
+    initialIdentity.gidMapOutside = getegid();
     unshareAndInitUserns(initialIdentity);
     if (unshare(CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWIPC | CLONE_NEWUTS) == -1)
         sysError("creating slirp namespaces");
@@ -656,20 +658,22 @@ void slirpChild(Plan & plan, int tap, int readyFd)
         sysError("preparing slirp root");
     if (prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0) == -1 ||
         prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == -1) sysError("dropping slirp privileges");
-    /* Match remapIdsTo0Action: map the requested slirp uid/gid to root in
-       a fresh user namespace.  setgroups must remain enabled for slirp's
-       --enable-sandbox parent setup. */
+    /* Match remapIdsTo0Action: map the CURRENT uid/gid to root in a fresh
+       user namespace (C++ remapIdsTo0Action uses getuid()/getgid() when not
+       setuid).  setgroups must remain enabled for slirp's --enable-sandbox
+       parent setup.  Mapping the build user's uid here would leave the
+       current uid unmapped and strip the capabilities needed to finish. */
     Plan lockIdentity = plan;
-    lockIdentity.uidMapInside = plan.uidMapOutside;
-    lockIdentity.uidMapOutside = plan.uidMapOutside;
-    lockIdentity.gidMapInside = plan.gidMapOutside;
-    lockIdentity.gidMapOutside = plan.gidMapOutside;
+    lockIdentity.uidMapInside = geteuid();
+    lockIdentity.uidMapOutside = geteuid();
+    lockIdentity.gidMapInside = getegid();
+    lockIdentity.gidMapOutside = getegid();
     unshareAndInitUserns(lockIdentity);
     Plan identity = plan;
     identity.uidMapInside = 0;
-    identity.uidMapOutside = plan.uidMapOutside;
+    identity.uidMapOutside = geteuid();
     identity.gidMapInside = 0;
-    identity.gidMapOutside = plan.gidMapOutside;
+    identity.gidMapOutside = getegid();
     identity.allowSetgroups = geteuid() == 0;
     unshareAndInitUserns(identity);
     if (setgid(0) == -1)
