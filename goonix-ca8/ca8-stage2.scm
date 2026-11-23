@@ -36,7 +36,8 @@
              (ice-9 textual-ports)
              (ice-9 exceptions)
              (ice-9 ftw)
-             (srfi srfi-1))
+             (srfi srfi-1)
+             (srfi srfi-13))
 
 (define commencement (resolve-module '(gnu packages commencement)))
 (define (stage name) (false-if-exception (module-ref commencement name)))
@@ -68,10 +69,25 @@
 ;;; need beyond stage 1's ladder.  A name that does not resolve in this tree is
 ;;; reported as MISSING and fails the stage rather than being skipped quietly:
 ;;; a chain with a hole in it is not a pass.
+;;;
+;;; GOONIX_CA8_STAGE2_CHAIN selects a SMALLER chain of the same shape, so this
+;;; script can be verified end to end (both passes, the relocation step, the
+;;; verdict) in minutes on a fixture instead of hours on the real toolchain.
+;;; It is a comma-separated list of VARIABLE names resolved in the same module,
+;;; e.g. "hello-minimal" or "gash-boot,make-mesboot0".  The DEFAULT is unchanged:
+;;; the three toolchain items.  A selected chain is printed, and the verdict
+;;; names it, so a small-chain run can never be mistaken for the toolchain gate.
+(define chain-names
+  (let ((env (getenv "GOONIX_CA8_STAGE2_CHAIN")))
+    (if (or (not env) (string-null? env))
+        '(glibc-final gcc-final guile-final)
+        (map (lambda (s) (string->symbol (string-trim-both s)))
+             (string-split env #\,)))))
 (define chain
-  `(("stage: glibc-final"           ,(stage 'glibc-final))
-    ("stage: gcc-final"             ,(stage 'gcc-final))
-    ("stage: guile-final"           ,(stage 'guile-final))))
+  (map (lambda (name)
+         (list (string-append "stage: " (symbol->string name)) (stage name)))
+       chain-names))
+(format #t "STAGE2 CHAIN ~a~%" chain-names)
 
 (define missing
   (filter-map (match-lambda ((label package) (and (not package) label))) chain))
@@ -145,15 +161,24 @@
 (for-each
  (match-lambda
    ((label . drv)
-    (let ((kind (addressing drv))
-          (out (derivation->output-path drv)))
-      (let ((before (valid-path? store out)))
+    (let ((kind (addressing drv)))
+      ;; goonix: a CONTENT-ADDRESSED derivation's derivation->output-path is the
+      ;; PLACEHOLDER (a reserved 'eout' token), not the realised item.  Ask the
+      ;; daemon which path it chose, before AND after the build, exactly as
+      ;; relocation-two-builds.scm does.  Using the token here made the
+      ;; relocation step fail with "invalid replacement" on a path that is not a
+      ;; store item at all (measured on gash-boot:
+      ;; /gnu/store/etuteotoouooutuuoototeuouuuueteo-gash-boot-0.3.1).
+      (define (realised)
+        (false-if-exception (realised-output-path store drv "out")))
+      (let ((before-path (realised)))
         (catch #t
           (lambda ()
             (let* ((result (elapsed (lambda ()
                                       (build-derivations store (list drv)))))
-                   (secs (cdr result)))
-              (if before
+                   (secs (cdr result))
+                   (out (or (realised) (derivation->output-path drv))))
+              (if before-path
                   (begin (set! substituted (+ substituted 1))
                          (format #t "~a\tALREADY-PRESENT\t~a\t~a\t~,1fs~%"
                                  label kind out secs))
@@ -227,5 +252,5 @@
 
 (close-connection store)
 (if (and (zero? failed) (zero? reloc-fail) (> (length built) 0))
-    (format #t "STAGE2 VERDICT PASS~%")
-    (begin (format #t "STAGE2 VERDICT FAIL~%") (exit 1)))
+    (format #t "STAGE2 VERDICT PASS chain=~a~%" chain-names)
+    (begin (format #t "STAGE2 VERDICT FAIL chain=~a~%" chain-names) (exit 1)))
