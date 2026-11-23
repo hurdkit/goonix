@@ -772,6 +772,16 @@ static bool sameContent(const Path & path, const string & final,
         baseNameOf(token).substr(0, 32), siblings) == printHash(expected);
 }
 
+/* goonix: expose sameContent so a test can compare the VERDICT, not just the
+   digest: the hash-part extraction from the final/token paths and the equality
+   against printHash(expected) are its own logic on top of inverseTree. */
+bool sameContentForTest(const Path & path, const string & final,
+    const string & token, const Hash & expected,
+    const std::map<Path, Path> & siblings)
+{
+    return sameContent(path, final, token, expected, siblings);
+}
+
 Path finaliseContentOutput(LocalStore & store, const Path & token,
     const string & output, const string & name, const PathSet & allPaths,
     PathSet & references, Hash & narHash, uint64_t & narSize,
