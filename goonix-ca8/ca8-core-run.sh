@@ -71,10 +71,8 @@ fi
 command -v newuidmap >/dev/null || { echo 'newuidmap not on PATH' >&2; exit 1; }
 command -v newgidmap >/dev/null || { echo 'newgidmap not on PATH' >&2; exit 1; }
 echo "MAP: uid=$host_uid gid=$host_gid subuid=$sub_uid:$sub_uid_count subgid=$sub_gid:$sub_gid_count newuidmap=$(command -v newuidmap)"
-map_args=(--map-users=0:"$host_uid":1
-          --map-users=1:"$sub_uid":"$sub_uid_count"
-          --map-groups=0:"$host_gid":1
-          --map-groups=1:"$sub_gid":"$sub_gid_count")
+# The ranges are written by explicit newuidmap/newgidmap on the parked child
+# below, not by unshare --map-users: that flag alone left the child unmapped.
 
 # passwd/group with a guixbuild group and ten build users, at namespace IDs
 # inside the subordinate range (UID 1..10, GID 1).  Their home is a directory
@@ -134,7 +132,13 @@ mount --bind '$scratch/var' /var/guix
 # getent return gid 1 / uid 1 from the files above.
 mount --bind '$scratch/etc/passwd.ns' /etc/passwd
 mount --bind '$scratch/etc/group.ns' /etc/group
-mount -t tmpfs tmpfs /run/nscd
+# Mask nscd only when the host has it.  NixOS runs nscd; Ubuntu 24.04 on
+# zergling2 has no /run/nscd and the mount fails with "mount point does not
+# exist" (measured, job ca8-core-fresh3).  Create it when absent so the mask
+# still applies if nscd appears later.
+if [ -d /run/nscd ] || mkdir -p /run/nscd 2>/dev/null; then
+  mount -t tmpfs tmpfs /run/nscd 2>/dev/null || true
+fi
 # `mkdir -p /var/empty` fails with "Permission denied" even as namespace root
 # on Ubuntu, where /var is root-owned on the host filesystem.  The build users'
 # home is $scratch/var-empty instead; this is best-effort only.
@@ -196,8 +200,37 @@ stop_daemon
 exit \$status
 EOF
 
-unshare --user "${map_args[@]}" --mount bash "$scratch/part-$stage.sh" \
-  > "$scratch/run-$stage.log" 2>&1
+# Enter the namespace with a PARK-AND-MAP handshake, as goonix-ca6/run.sh does.
+# `unshare --map-users=...` alone left the child UNMAPPED on zergling2: every
+# mount in the part script failed with "must be superuser to use mount" and
+# /run/nscd did not exist (job ca8-core-fresh3, measured in run-stage1.log).
+# The child parks until explicit newuidmap/newgidmap have written BOTH ranges,
+# then runs the part script; without the handshake it mounts as an unmapped uid.
+rm -f "$scratch/ns-go" "$scratch/ns-pid"
+unshare --user --mount bash -c '
+  echo "$$" > "$1"
+  for i in $(seq 1 600); do [ -e "$2" ] && break; sleep .1; done
+  [ -e "$2" ] || { echo "no maps go-ahead" >&2; exit 1; }
+  exec bash "$3"
+' _ "$scratch/ns-pid" "$scratch/ns-go" "$scratch/part-$stage.sh" \
+  > "$scratch/run-$stage.log" 2>&1 &
+ns_job=$!
+ns_pid=''
+for i in $(seq 1 300); do
+  ns_pid=$(cat "$scratch/ns-pid" 2>/dev/null | head -1)
+  [ -n "$ns_pid" ] && break
+  sleep .1
+done
+if [ -z "$ns_pid" ]; then
+  echo "namespace child did not start; see run-$stage.log" >&2
+  cat "$scratch/run-$stage.log" >&2
+  exit 1
+fi
+newuidmap "$ns_pid" 0 "$host_uid" 1 1 "$sub_uid" "$sub_uid_count"
+newgidmap "$ns_pid" 0 "$host_gid" 1 1 "$sub_gid" "$sub_gid_count"
+echo "MAPS INSTALLED for pid $ns_pid"
+: > "$scratch/ns-go"
+wait "$ns_job"
 status=$?
 
 echo "=== $stage result ==="
