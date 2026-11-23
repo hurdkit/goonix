@@ -608,9 +608,12 @@ makeSymlinkAtomic target link = do
             renamed <- withCStringBytes temporary $ \from ->
               withCStringBytes link $ \to -> c_rename from to
             when (renamed < 0) $ do
-              -- Clean up OUR OWN temp, then report.
+              -- Read errno NOW: the cleanup below is another syscall and would
+              -- overwrite it, so the message could report the unlink's errno
+              -- (e.g. ENOENT) instead of the rename's.
+              Errno number <- getErrno
               Files.removeLink temporary `catchMissing` pure ()
-              errnoIO "cannot rename symbolic link"
+              ioError (userError ("cannot rename symbolic link: errno=" ++ show number))
   attempt 0
 
 mkdirParents :: RawFilePath -> IO ()
