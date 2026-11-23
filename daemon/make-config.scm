@@ -11,7 +11,7 @@
   (write text (current-output-port)))
 
 (match (command-line)
-  ((_ output store state log config bin locale system substitutes schema)
+  ((_ output store state log config bin libexec locale system substitutes schema)
    (call-with-output-file output
      (lambda (port)
        (set-current-output-port port)
@@ -24,8 +24,8 @@
           (write-literal value)
           (newline))
         (list "storeDirectory" "stateDirectory" "logDirectory"
-              "configurationDirectory" "binaryDirectory" "localeDirectory"
-              "systemType" "defaultSubstituteUrls" "schemaSql")
-        (append (list store state log config bin locale system substitutes)
+              "configurationDirectory" "binaryDirectory" "libexecDirectory"
+              "localeDirectory" "systemType" "defaultSubstituteUrls" "schemaSql")
+        (append (list store state log config bin libexec locale system substitutes)
                 (list (call-with-input-file schema get-string-all)))))))
   (_ (error "invalid generated-config arguments")))

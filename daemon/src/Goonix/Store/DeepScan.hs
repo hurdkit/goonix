@@ -23,6 +23,7 @@ import Foreign.Marshal.Alloc (alloca)
 import Foreign.Ptr (Ptr, nullPtr)
 import Foreign.Storable (peek)
 import Goonix.Store.Settings (Settings, setting, settingBool, settingInt)
+import qualified Goonix.Config as Config
 import System.Posix.ByteString (RawFilePath)
 import System.Posix.Files (fileExist, isRegularFile, getFileStatus, fileAccess)
 import System.Posix.IO.ByteString (createPipe, fdToHandle, closeFd)
@@ -49,7 +50,7 @@ deepScanHelperPath settings = do
       chosen = case override of
         Just value | not (B.null value) -> value
         _ | not (B.null configured) -> configured
-        _ -> "/goonix-ca-scan"
+        _ -> C.pack (Config.libexecDirectory ++ "/goonix-ca-scan")
   pure chosen
 
 -- | C++ checkDeepOutput: a no-op unless goonix-deep-scan is set; otherwise run

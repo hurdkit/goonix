@@ -13,7 +13,27 @@ bin_PROGRAMS =
 noinst_LIBRARIES =
 BUILT_SOURCES += daemon/src/Goonix/Config.hs
 CLEANFILES += daemon/src/Goonix/Config.hs guix-daemon guix-sandbox \
-  guix-daemon.tmp guix-sandbox.tmp
+  guix-daemon.tmp guix-sandbox.tmp goonix-ca-scan goonix-ca-scan.tmp
+
+# goonix: the out-of-process CA decoder must ship in the Haskell package too.
+# The C++ target graph (nix/local.mk, nix/goonix.mk) is not included in this
+# mode, so build the helper here from the same sources, against the same
+# libutil objects and libarchive, and install it into libexec.  The daemon's
+# default helper path is the make-expanded libexecdir (Goonix.Config), so the
+# installed package finds it with no GOONIX_DEEP_SCAN_HELPER override.
+if HAVE_LIBARCHIVE
+BUILT_SOURCES += goonix-ca-scan
+goonix-ca-scan: $(top_srcdir)/nix/goonix-ca-scan.cc \
+    $(top_srcdir)/nix/libutil/util.cc $(top_srcdir)/nix/libutil/affinity.cc \
+    nix/config.h
+	$(AM_V_CXX)$(CXX) $(DEFS) $(DEFAULT_INCLUDES) \
+	  -I$(top_srcdir)/nix/libutil $(LIBARCHIVE_CFLAGS) \
+	  $(CPPFLAGS) -std=c++20 -O2 -Wall $(CXXFLAGS) $(LDFLAGS) \
+	  -o $@.tmp $(top_srcdir)/nix/goonix-ca-scan.cc \
+	  $(top_srcdir)/nix/libutil/util.cc $(top_srcdir)/nix/libutil/affinity.cc \
+	  -lz $(LIBARCHIVE_LIBS); \
+	  mv $@.tmp $@
+endif HAVE_LIBARCHIVE
 
 # The sandbox helper is built in the source tree with the daemon, so Guix's
 # existing GUIX_SANDBOX override and tests can select this exact binary.
@@ -48,17 +68,24 @@ install-exec-local: guix-daemon guix-sandbox
 	$(MKDIR_P) "$(DESTDIR)$(bindir)"
 	$(INSTALL_PROGRAM) guix-daemon "$(DESTDIR)$(bindir)/guix-daemon"
 	$(INSTALL_PROGRAM) guix-sandbox "$(DESTDIR)$(bindir)/guix-sandbox"
+if HAVE_LIBARCHIVE
+	$(MKDIR_P) "$(DESTDIR)$(libexecdir)"
+	$(INSTALL_PROGRAM) goonix-ca-scan "$(DESTDIR)$(libexecdir)/goonix-ca-scan"
+endif HAVE_LIBARCHIVE
 
 uninstall-local: uninstall-haskell-daemon
 uninstall-haskell-daemon:
 	rm -f "$(DESTDIR)$(bindir)/guix-daemon" "$(DESTDIR)$(bindir)/guix-sandbox"
+if HAVE_LIBARCHIVE
+	rm -f "$(DESTDIR)$(libexecdir)/goonix-ca-scan"
+endif HAVE_LIBARCHIVE
 
 daemon/src/Goonix/Config.hs: Makefile guix/store/schema.sql
 	$(AM_V_GEN)$(MKDIR_P) daemon/src/Goonix; \
 	$(GUILE) --no-auto-compile $(top_srcdir)/daemon/make-config.scm \
 	  "$@" "$(storedir)" "$(localstatedir)/guix" \
 	  "$(localstatedir)/log/guix" "$(sysconfdir)/guix" "$(bindir)" \
-	  "$(localedir)" "$(guix_system)" "$(GUIX_SUBSTITUTE_URLS)" \
+	  "$(libexecdir)" "$(localedir)" "$(guix_system)" "$(GUIX_SUBSTITUTE_URLS)" \
 	  "$(top_srcdir)/guix/store/schema.sql"
 
 else !BUILD_HASKELL_DAEMON
@@ -101,6 +128,7 @@ EXTRA_DIST += \
   daemon/test/differential/socket-query.c \
   daemon/test/differential/builtin-ci.sh daemon/test/differential/builtin-ci.scm \
   daemon/test/differential/ca-counted-gate.sh \
+  daemon/test/differential/ca-deep-scan-installed.sh \
   daemon/sandbox/README.md daemon/sandbox/guix-sandbox.cc \
   daemon/sandbox/Makefile daemon/test/lib.sh daemon/test/seed-restore.scm \
   daemon/test/sandbox-helper-cleanup.sh daemon/test/sandbox-helper-cleanup.scm \

@@ -61,13 +61,33 @@
               drvAttrs = {
                 nativeBuildInputs = [ nixpkgs.legacyPackages.${system}.guile nixpkgs.legacyPackages.${system}.gcc ];
                 postInstall = ''
+                  # goonix: the out-of-process CA decoder ships in libexec, as in
+                  # the make build (daemon/local.mk).  The daemon's default helper
+                  # path is the make-expanded libexecdir (Goonix.Config).  The
+                  # libutil sources include config.h; the Cabal build has no
+                  # configure run, so provide the few macros they read.
+                  mkdir -p $out/libexec ca-scan-build
+                  printf '%s\n' \
+                    '#define HAVE_SCHED_H 1' \
+                    '#define HAVE_SCHED_SETAFFINITY 1' \
+                    '#define HAVE_STATX 1' \
+                    '#define HAVE_CLOSE_RANGE 1' \
+                    '#define HAVE_LINUX_CLOSE_RANGE_H 1' \
+                    '#define HAVE_STRSIGNAL 1' \
+                    '#define HAVE_POSIX_FALLOCATE 1' \
+                    > ca-scan-build/config.h
+                  g++ -O2 -std=c++20 -DHAVE_CONFIG_H \
+                    -Ica-scan-build -I${./nix/libutil} \
+                    ${./nix/goonix-ca-scan.cc} ${./nix/libutil/util.cc} \
+                    ${./nix/libutil/affinity.cc} \
+                    -lz -larchive -o $out/libexec/goonix-ca-scan
                   g++ -O2 -std=c++17 ${./daemon/sandbox/guix-sandbox.cc} -o $out/bin/guix-sandbox
                 '';
                 preConfigure = ''
                   mkdir -p src/Goonix
                   guile --no-auto-compile make-config.scm \
                     src/Goonix/Config.hs /gnu/store /var/guix /var/log/guix \
-                    /etc/guix /bin /share/locale x86_64-linux \
+                    /etc/guix /bin /libexec /share/locale x86_64-linux \
                     'https://bordeaux.guix.gnu.org https://ci.guix.gnu.org' \
                     ${./guix/store/schema.sql}
                 '';
@@ -77,6 +97,7 @@
                 nixpkgs.legacyPackages.${system}.sqlite
                 nixpkgs.legacyPackages.${system}.zlib
                 nixpkgs.legacyPackages.${system}.bzip2
+                nixpkgs.legacyPackages.${system}.libarchive
               ];
             };
             autoWire = [ ];
