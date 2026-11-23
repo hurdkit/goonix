@@ -30,6 +30,7 @@ import Data.Bits ((.&.), (.|.))
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as C
+import qualified Data.ByteString.Unsafe as BU
 import qualified Data.ByteString as B (hGetSome, hPut)
 import Data.List (sortBy)
 import qualified Data.Map.Strict as Map
@@ -58,18 +59,18 @@ caError message = throwIO (userError message)
 
 -- | The prefix before the first occurrence and the rest starting at it; the
 -- whole input and "" when the needle is absent.  glibc memmem through an unsafe
--- FFI call: its result maps directly onto this pair (returned pointer minus
--- haystack pointer is the split offset).  replaceWhole runs one search per
--- 8-byte fragment and per encoding, for every regular file of every CA output,
--- so the per-search cost dominates; memmem is glibc's two-way/SIMD search, the
--- same class as the C++ side's string::find.
+-- FFI call: it takes explicit lengths, so the buffers are passed as they are
+-- with unsafeUseAsCStringLen (no copy, the ByteString stays alive across the
+-- call).  The returned pointer minus the haystack pointer is the split offset.
+-- replaceWhole runs one search per 8-byte fragment and per encoding, for every
+-- regular file of every CA output, so the per-search cost dominates.
 breakOn :: ByteString -> ByteString -> (ByteString, ByteString)
 breakOn needle haystack
   | B.null needle = (B.empty, haystack)
   | B.length needle > B.length haystack = (haystack, B.empty)
   | otherwise = unsafePerformIO $
-      B.useAsCStringLen haystack $ \(hp, hl) ->
-        B.useAsCStringLen needle $ \(np, nl) -> do
+      BU.unsafeUseAsCStringLen haystack $ \(hp, hl) ->
+        BU.unsafeUseAsCStringLen needle $ \(np, nl) -> do
           p <- c_memmem (castPtr hp) (fromIntegral hl) (castPtr np) (fromIntegral nl)
           pure $ if p == nullPtr
             then (haystack, B.empty)
