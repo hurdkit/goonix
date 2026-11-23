@@ -56,7 +56,22 @@ echo "FIXTURE_RC=$? $(tail -1 "$work/fixture.log")"
 # --- per-daemon namespace setup (root-ci-setup.sh pattern) ---
 setup_ns() {
   local label=$1 ns="$work/$label"
-  rm -rf "$ns"; mkdir -p "$ns"/{gnu-store,var-guix,log-guix,etc,build,cache,substituter-data}
+  # A store item is read-only (dirs 0555), so a plain `rm -rf` CANNOT remove it:
+  # it fails with EACCES per entry and leaves the previous run's store in place.
+  # Measured: gate runs v3 and v4 each logged ~5900 "rm: cannot remove ...
+  # Permission denied" and then seeded and tested the LEFTOVER store, so their
+  # ca-policy "collision" compared an item built by an earlier daemon.  Make the
+  # tree writable first (the pattern every other runner uses), and treat a
+  # failed wipe as fatal rather than testing a store we did not create.
+  if test -e "$ns"; then
+    chmod -R u+rwX "$ns" 2>/dev/null || true
+    rm -rf "$ns"
+    if test -e "$ns"; then
+      echo "SETUP FAILED: could not clear $ns; refusing to test a leftover store" >&2
+      exit 1
+    fi
+  fi
+  mkdir -p "$ns"/{gnu-store,var-guix,log-guix,etc,build,cache,substituter-data}
   mkdir -p "$ns/var-guix"/{db,gcroots,profiles,temproots,daemon-socket}
   {
     printf 'root:x:0:0:root:/root:/bin/sh\n'
