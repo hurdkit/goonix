@@ -164,18 +164,41 @@ int main(int argc, char ** argv)
             expectedOf(d + "/uses-sib", none), sib);
     }
 
-    /* 8b. The sibling hash INSIDE the retained tail: the map cannot apply, so
-           the digest equals the no-map digest and the verdict is true.  Pinned
-           because it is shared behaviour, not an HS defect. */
+    /* 8b. The sibling hash INSIDE the retention tail: it MUST still be
+           inverted.  This asserts the CORRECT result, not the old limitation.
+           The expectation is computed INDEPENDENTLY (substitute in memory, then
+           frame and hash) rather than through inverseTreeForTest, which shares
+           the boundary bug and would otherwise agree with the broken output.
+           Until the C++ inverseTree fix lands on goonix-implementation this
+           case reports false on the C++ side and true on the fixed Haskell
+           side, so the probe DIFFERS.  That is expected (reviewer, 2026-11-23). */
     {
         useFixture(base, "f8b");
         Path d = named(fin, "item");
         Path sibFinal = named(std::string(32, 's'), "sib");
         Path sibToken = named(std::string(32, 'u'), "sib");
-        put(d + "/uses-sib", sibFinal);
+        string contents = sibFinal;
+        put(d + "/uses-sib", contents);
         std::map<Path, Path> sib{{sibToken, sibFinal}};
-        report("sibling-in-tail", d + "/uses-sib", d, named(tok, "item"),
-            expectedOf(d + "/uses-sib", none), sib);
+        /* substitute sibling final -> sibling token, then final -> token */
+        string substituted = contents;
+        string sf = baseNameOf(sibFinal).substr(0, 32);
+        string st = baseNameOf(sibToken).substr(0, 32);
+        for (size_t at = 0; (at = substituted.find(sf, at)) != string::npos; at += st.size())
+            substituted.replace(at, sf.size(), st);
+        /* The canonical regular-file framing, written out here rather than
+           through a new hook: treeDomain is the fixed domain string
+           "goonix-tree-v1\0" (ca.cc) and put64 is little-endian.  Keeping the
+           expectation independent of inverseTree is the point - the shared
+           boundary bug must not be able to agree with itself. */
+        string header("goonix-tree-v1\0", 15);
+        header.push_back(1);
+        header.push_back(0);
+        uint64_t size = substituted.size();
+        for (unsigned i = 0; i < 8; ++i)
+            header.push_back(char((size >> (8 * i)) & 0xff));
+        Hash expected = hashString(htSHA256, header + substituted);
+        report("sibling-in-tail", d + "/uses-sib", d, named(tok, "item"), expected, sib);
     }
 
     /* 9. An executable file: the execute bit is part of the NAR, so a digest

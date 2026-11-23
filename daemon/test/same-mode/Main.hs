@@ -8,6 +8,7 @@
 module Main (main) where
 
 import Control.Exception (SomeException, try)
+import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as C
 import qualified Data.Map.Strict as Map
 import System.Directory (createDirectoryIfMissing)
@@ -17,8 +18,9 @@ import System.Posix.ByteString (RawFilePath)
 import qualified System.Posix.Files.ByteString as Files
 
 import Goonix.Store.Base32 (decodeBase16)
+import Goonix.Store.Ca (put64, treeDomain)
 import Goonix.Store.CaBuild (inverseTree, sameContent)
-import Goonix.Store.Hash (Hash (..), HashAlgorithm (..))
+import Goonix.Store.Hash (Hash (..), HashAlgorithm (..), sha256)
 
 main :: IO ()
 main = do
@@ -123,16 +125,31 @@ main = do
      e <- expectedOf (d <> "/uses-sib") none
      report "siblings-unapplied" (d <> "/uses-sib") d (named s tok "item") e sib
 
-  -- 8b. The sibling hash INSIDE the retained tail: the map cannot apply, so the
-  --     digest equals the no-map digest and the verdict is true.  Shared
-  --     behaviour, pinned rather than "fixed".
+  -- 8b. The sibling hash INSIDE the retention tail: it MUST still be inverted.
+  --     This asserts the CORRECT result, not the old limitation.  The
+  --     expectation is computed INDEPENDENTLY (substitute in memory, then frame
+  --     and hash) rather than through inverseTree, which shared the boundary
+  --     bug and would otherwise agree with the broken output.  Until the C++
+  --     inverseTree fix lands on goonix-implementation, C++ reports false here
+  --     and the fixed Haskell side true, so the probe DIFFERS - expected
+  --     (reviewer, 2026-11-23).
   do s <- fixture "f8b"
      let d = named s fin "item"
-         sibFinal = named s (C.pack (replicate 32 's')) "sib"
-         sibToken = named s (C.pack (replicate 32 'u')) "sib"
+         sibFin = C.pack (replicate 32 's')
+         sibTok = C.pack (replicate 32 'u')
+         sibFinal = named s sibFin "sib"
+         sibToken = named s sibTok "sib"
          sib = Map.fromList [(sibToken, sibFinal)]
+         substitute from to = go
+           where go bs = case C.breakSubstring from bs of
+                   (before, rest)
+                     | B.null rest -> before
+                     | otherwise -> before <> to <> go (B.drop (B.length from) rest)
+         substituted = substitute sibFin sibTok sibFinal
+         framed = treeDomain <> B.pack [1, 0]
+           <> put64 (fromIntegral (B.length substituted)) <> substituted
+         e = Hash SHA256 (sha256 framed)
      put (d <> "/uses-sib") sibFinal
-     e <- expectedOf (d <> "/uses-sib") none
      report "sibling-in-tail" (d <> "/uses-sib") d (named s tok "item") e sib
 
   -- 9. An executable file: the execute bit is part of the NAR.
