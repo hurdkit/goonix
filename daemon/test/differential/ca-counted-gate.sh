@@ -33,13 +33,14 @@ suites="ca ca-adopt ca-build ca-compiler ca-existing-item ca-files ca-fixed-outp
 # --- dev-shell guile + load paths (the client loads the INSTALLED package's
 #     modules first, then the dev shell's guile-gcrypt/guile-git/etc.) ---
 devinfo=$(cd "$root" && nix develop .#default -c bash -c '
-  command -v guile; command -v sqlite3
+  command -v guile; command -v sqlite3; command -v slirp4netns
   echo "GLP=$GUILE_LOAD_PATH"; echo "GLCP=$GUILE_LOAD_COMPILED_PATH"')
 guile_bin=$(echo "$devinfo" | sed -n 1p)
 sqlite3_bin=$(echo "$devinfo" | sed -n 2p)
+slirp_bin=$(echo "$devinfo" | sed -n 3p)
 dev_glp=$(echo "$devinfo" | grep '^GLP=' | sed 's/^GLP=//')
 dev_glcp=$(echo "$devinfo" | grep '^GLCP=' | sed 's/^GLCP=//')
-echo "guile=$guile_bin sqlite3=$sqlite3_bin"
+echo "guile=$guile_bin sqlite3=$sqlite3_bin slirp4netns=$slirp_bin"
 echo "hs_daemon=$hs_daemon"
 echo "cxx_daemon=$cxx_daemon"
 
@@ -102,6 +103,7 @@ run_daemon() {
       ns="'"$ns"'"; root="'"$root"'"; daemon="'"$daemon"'"; label="'"$label"'"
       guile_bin="'"$guile_bin"'"; dev_glp="'"$dev_glp"'"; dev_glcp="'"$dev_glcp"'"
       pkg_glp="'"$pkg_glp"'"; pkg_glcp="'"$pkg_glcp"'"; fixture="'"$fixture"'"
+      slirp_bin="'"$slirp_bin"'"
       suites="'"$suites"'"
       mount --bind "$ns/etc/passwd" /etc/passwd
       mount --bind "$ns/etc/group" /etc/group
@@ -114,7 +116,16 @@ run_daemon() {
       # The installed daemon as namespace root: chroot ON (default), build users,
       # env -i (only TMPDIR/LC_ALL/PATH=/nonexistent).  No GUIX_*/GUILE_*, no
       # --no-offload: the package finds its own helpers and sandbox.
+      # GUIX_SLIRP4NETNS: the HS daemon resolves slirp4netns via findExecutable
+      # (PATH), which is /nonexistent here; point it at the dev-shell binary so
+      # fixed-output builds get network access (C++ uses its baked absolute path).
+      # GUIX_ALLOW_UNAUTHENTICATED_SUBSTITUTES: the daemon spawns the guix
+      # substitute helper inheriting ITS environment, so the file:// test cache
+      # is only accepted as a substitute URI when the DAEMON (not just the
+      # client) allows unsafe URIs.
       env -i TMPDIR="$ns/build" LC_ALL=C.UTF-8 PATH=/nonexistent \
+        GUIX_SLIRP4NETNS="$slirp_bin" \
+        GUIX_ALLOW_UNAUTHENTICATED_SUBSTITUTES=yes \
         "$daemon" --build-users-group=guixbuild --max-jobs=2 --substitute-urls="" \
         > "$ns/daemon.log" 2>&1 &
       dpid=$!
