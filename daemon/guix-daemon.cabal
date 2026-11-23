@@ -43,6 +43,7 @@ library
         Goonix.Build.Scheduler
         Goonix.Build.Shared
         Goonix.Build.Users
+        Goonix.Build.Wait
     c-sources: cbits/sockets.c cbits/files.c cbits/helpers.c cbits/logs.c
     extra-libraries: gcrypt sqlite3 z bz2
     build-depends:

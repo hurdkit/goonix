@@ -39,6 +39,7 @@ run cabal-modules bash "$here/cabal-modules.sh" "$root"
 run dedup-overflow bash "$here/dedup-overflow.sh" "$root/daemon/cbits/files.c"
 run sqlite-contention bash "$here/sqlite-contention.sh" "$root"
 run socket-idle bash "$here/socket-idle.sh" "$root"
+run child-wait bash "$here/child-wait.sh" "$root"
 if test $rc -eq 0; then
   echo "ALL REGRESSIONS PASS"
 else

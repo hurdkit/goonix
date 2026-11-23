@@ -76,7 +76,7 @@ EXTRA_DIST += \
   daemon/src/Goonix/Store/Settings.hs daemon/src/Goonix/Store/Server.hs \
   daemon/src/Goonix/Store/Config.hs daemon/src/Goonix/Store/Socket.hs \
   daemon/src/Goonix/Store/GuixProgram.hs \
-  daemon/src/Goonix/Store/Substitute.hs daemon/src/Goonix/Store/Archive.hs daemon/src/Goonix/Build/Engine.hs daemon/src/Goonix/Build/Offload.hs daemon/src/Goonix/Build/Scheduler.hs daemon/src/Goonix/Build/Shared.hs daemon/cbits/sockets.c daemon/cbits/files.c \
+  daemon/src/Goonix/Store/Substitute.hs daemon/src/Goonix/Store/Archive.hs daemon/src/Goonix/Build/Engine.hs daemon/src/Goonix/Build/Offload.hs daemon/src/Goonix/Build/Scheduler.hs daemon/src/Goonix/Build/Shared.hs daemon/src/Goonix/Build/Wait.hs daemon/cbits/sockets.c daemon/cbits/files.c \
   daemon/src/Goonix/Store/Path.hs daemon/src/Goonix/Store/Derivation.hs \
   daemon/src/Goonix/Store/Nar.hs daemon/src/Goonix/Store/References.hs \
   daemon/proxy/Main.hs \
@@ -102,6 +102,7 @@ EXTRA_DIST += \
   daemon/test/differential/dedup-linkcount-test.c \
   daemon/test/differential/sqlite-contention.sh daemon/test/differential/sqlite-contention.hs \
   daemon/test/differential/socket-idle.sh daemon/test/differential/socket-idle.hs \
+  daemon/test/differential/child-wait.sh daemon/test/differential/child-wait.hs \
   daemon/test/differential/export-memory.sh daemon/test/differential/export-memory.scm \
   daemon/test/differential/nar-memory.sh daemon/test/differential/nar-memory.scm \
   daemon/test/differential/substitute-log-flood.sh daemon/test/differential/substitute-log-flood.scm \
