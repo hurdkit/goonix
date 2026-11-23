@@ -19,6 +19,7 @@
 using namespace nix;
 namespace nix {
 void checkRewriteForTest(const Path & path, const string & from, const string & to);
+string replaceWholeForTest(const string & body, const string & from, const string & to);
 void rewriteTreeForTest(const Path & path, const string & from, const string & to);
 string encodeReservedForTest(const Hash & digest, bool token);
 string inverseTreeForTest(const Path & path, const string & final,
@@ -1397,5 +1398,137 @@ int main(int argc, char ** argv)
                 "sameContent still rejects a real content change");
         }
     }
+    /* goonix: the FORWARD rewrite's streaming boundary must give the WHOLE-FILE
+       result, whatever read() did.  Two defects, both from the same prefix rule
+       that inverseTree had (reviewer; c95008b9279 fixed the inverse side):
+
+       (a) A COMPLETE plain self-reference ending exactly at `process' - keep
+           bytes before EOF or before a read end - whose last character equals
+           the token's first, had its last byte held back.  The chunk then held
+           the token minus one byte and the 8-byte fragment check REJECTED a
+           valid file with "opaque self-reference fragment".
+       (b) An opaque occurrence STARTING before `process' and ending after it was
+           split, so neither chunk saw it whole and the file was ACCEPTED with a
+           hidden self reference, while the same file read in one piece was
+           rejected.
+
+       THE EXPECTATION IS COMPUTED FROM THE WHOLE FILE, never from
+       rewriteRegularFile: a reference copy is rewritten in ONE call on a file
+       small enough to be read whole, and the streaming file must agree with it -
+       same bytes, or both rejected.  A test that asked the streaming code what
+       it does would agree with itself. */
+    {
+        /* A token whose last character equals its first: the self-overlap that
+           makes the prefix rule bite.  32 chars, nix-base32-shaped. */
+        std::string from = "z" + std::string(30, 'q') + "z";
+        std::string to   = "y" + std::string(30, 'w') + "y";
+        const size_t keep = from.size() * 4 - 1;      /* 127, as in the code */
+
+        /* Whole-file reference: rewrite a SMALL file in one call. */
+        auto wholeFile = [&](const std::string & body, std::string & out) {
+            Path dir = createTempDir("", "goonix-rewrite-ref");
+            AutoDelete del(dir, true);
+            Path f = dir + "/f";
+            writeFile(f, body);
+            try {
+                checkRewriteForTest(f, from, to);
+                out = readFile(f);
+                return true;
+            } catch (const Error &) { return false; }
+        };
+        /* Streaming: the same body, padded so the interesting occurrence sits at
+           the emit point of a real multi-read file. */
+        auto streaming = [&](const std::string & body, std::string & out) {
+            Path dir = createTempDir("", "goonix-rewrite-stream");
+            AutoDelete del(dir, true);
+            Path f = dir + "/f";
+            writeFile(f, body);
+            try {
+                checkRewriteForTest(f, from, to);
+                out = readFile(f);
+                return true;
+            } catch (const Error &) { return false; }
+        };
+        /* Compare the FULL rewritten output against the same body rewritten in
+           ONE call.  `small' is only used to build the reference when the body
+           itself is small; for a padded body the reference is the SAME body
+           rewritten with a single read, which is what "must equal the whole-file
+           result" means.  Comparing trailing `small.size()' bytes was wrong: the
+           padded body ends in the 4 KiB tail, not in `small', so the comparison
+           was meaningless and failed under both rules (measured). */
+        auto agree = [&](const std::string & body, const std::string & name) {
+            std::string wantBytes, gotBytes;
+            /* Reference: the whole body in memory, rewritten by the same
+               primitive but with no streaming - one replaceWhole call. */
+            bool want = true;
+            try { wantBytes = replaceWholeForTest(body, from, to); }
+            catch (const Error &) { want = false; }
+            bool got = streaming(body, gotBytes);
+            check(want == got && (!want || wantBytes == gotBytes), name);
+        };
+        /* Keep a small-file path too: it proves the reference itself agrees with
+           the on-disk rewrite when there is only one read. */
+        auto agreeSmall = [&](const std::string & body, const std::string & name) {
+            std::string wantBytes, gotBytes;
+            bool want = wholeFile(body, wantBytes);
+            bool got = streaming(body, gotBytes);
+            check(want == got && (!want || wantBytes == gotBytes), name);
+        };
+
+        /* (a) A plain self-reference ending exactly `keep' bytes before EOF, and
+           before the first read's end.  Sweep: the window is one byte wide. */
+        for (unsigned after = keep - 2; after <= keep + 2; ++after) {
+            std::string body = "/gnu/store/" + from + "-p" + std::string(after, 'x');
+            /* Small reference: the same body, no padding, one read. */
+            agreeSmall(body,
+                std::format("a complete self-reference {} bytes from EOF rewrites like the whole file", after));
+        }
+        {
+            /* At the first read's end the file MUST extend past 128 KiB, or
+               read() returns it whole and there is no boundary (the trap I hit
+               on the inverse side). */
+            size_t boundary = 128 * 1024;
+            for (unsigned after = keep - 2; after <= keep + 2; ++after) {
+                size_t pad = boundary - after - 11 - from.size();
+                std::string lead = "/gnu/store/";
+                std::string body = std::string(pad, 'p') + lead + from + "-p"
+                                 + std::string(4096, 'z');
+                agree(body,
+                    std::format("a complete self-reference {} bytes before the first read end rewrites whole", after));
+            }
+        }
+
+        /* (b) Opaque occurrences straddling the emit point: UTF-32LE, UTF-16LE
+           and an 8-byte fragment.  Each must be REJECTED, exactly as the whole
+           file is. */
+        auto encode = [&](unsigned width) {
+            std::string e;
+            for (char c : from) {
+                e.push_back(c);
+                for (unsigned j = 1; j < width; ++j) e.push_back(0);
+            }
+            return e;
+        };
+        struct Opaque { const char * name; std::string bytes; };
+        std::vector<Opaque> opaques = {
+            {"UTF-32LE", encode(4)},
+            {"UTF-16LE", encode(2)},
+            {"8-byte fragment", from.substr(4, 8)},
+        };
+        size_t boundary = 128 * 1024;
+        for (auto & op : opaques) {
+            /* Sweep the START offset around the emit point. */
+            for (int delta = -2; delta <= 2; ++delta) {
+                size_t start = boundary - keep + delta;
+                if (start < 8) continue;
+                std::string body = std::string(start, 'p') + op.bytes
+                                 + std::string(4096, 'z');
+                agree(body,
+                    std::format("{} straddling the emit point ({:+d}) is refused like the whole file",
+                        op.name, delta));
+            }
+        }
+    }
+
     return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
