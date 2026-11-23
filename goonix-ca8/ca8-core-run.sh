@@ -217,7 +217,8 @@ unshare --user --mount bash -c '
 ns_job=$!
 ns_pid=''
 for i in $(seq 1 300); do
-  ns_pid=$(cat "$scratch/ns-pid" 2>/dev/null | head -1)
+  # || true: pipefail + a missing pid file would abort the run under set -e.
+  ns_pid=$(cat "$scratch/ns-pid" 2>/dev/null | head -1 || true)
   [ -n "$ns_pid" ] && break
   sleep .1
 done

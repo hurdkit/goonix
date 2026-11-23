@@ -236,7 +236,11 @@ unshare --user --mount bash -c '
 ns_job=$!
 ns_pid=''
 for i in $(seq 1 300); do
-  ns_pid=$(cat "$scratch/ns-pid" 2>/dev/null | head -1)
+  # || true: under `set -o pipefail` a missing pid file makes cat fail, the
+  # assignment inherits that status, and `set -e` aborts the whole run on the
+  # FIRST poll iteration (measured, counted run 16: the trace stops right here
+  # with ns_pid empty).  It is a race - z2 won it, the laptop lost it.
+  ns_pid=$(cat "$scratch/ns-pid" 2>/dev/null | head -1 || true)
   [ -n "$ns_pid" ] && break
   sleep .1
 done
