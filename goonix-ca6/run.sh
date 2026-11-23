@@ -140,6 +140,20 @@ rm -f "$scratch/policy-boot-result"
 
 cat > "$scratch/policy-boot-part.sh" <<EOF
 set -euo pipefail
+# Job isolation check, BEFORE any mount and before the daemon starts.  The
+# runner enters a private PID namespace after installing the ID maps, so this
+# script must be PID 1 of its own namespace.  Without it, the daemon's
+# build-user cleanup kill(-1, SIGKILL) reaches other jobs' builders on the host
+# (goonix DECISIONS 30).  Refuse rather than run unisolated: a green gate that
+# could kill a neighbour is not a pass.  Regression: with the runner's
+# 'exec unshare --pid --fork --kill-child' reverted to 'exec bash', this prints
+# a PID other than 1 and exits non-zero (measured, goonix-ca6/pid-ns-check.sh).
+echo "PID_NS_CHECK pid=\$\$ ns=\$(readlink /proc/self/ns/pid)"
+if [ "\$\$" != 1 ]; then
+  echo "REFUSING: not PID 1 of a private PID namespace (pid=\$\$);" \\
+       "the runner must exec unshare --pid --fork --kill-child after the maps" >&2
+  exit 1
+fi
 mount --bind '$scratch/store' /gnu/store
 mount --bind '$scratch/var' /var/guix
 # Build users, and hide the host's nscd: glibc answers getgrnam/getpwnam from
@@ -237,7 +251,18 @@ unshare --user --mount bash -c '
   echo "$$" > "$1"
   for i in $(seq 1 600); do [ -e "$2" ] && break; sleep .1; done
   [ -e "$2" ] || { echo "no maps go-ahead" >&2; exit 1; }
-  exec bash "$3"
+  # Job isolation (reviewer, 2026-11-23; lanes DECISIONS "Job isolation goes
+  # into the committed runners").  A private PID namespace INSIDE the mapping
+  # boundary that newuidmap/newgidmap just installed: the daemon build-user
+  # cleanup does kill(-1, SIGKILL), which without this reaches every process
+  # of that leased uid on the HOST - it killed another job'"'"'s builders
+  # (goonix DECISIONS 30).  --fork is required by --pid; --kill-child ties the
+  # part script'"'"'s lifetime to this child.  It must come AFTER the maps: a
+  # PID namespace created outside/above the user namespace breaks the
+  # newuidmap handshake outright (measured: "Target process is owned by a
+  # different user").  The part script refuses to start the daemon unless it
+  # is PID 1 in its own namespace, so this line cannot silently regress.
+  exec unshare --pid --fork --kill-child -- bash "$3"
 ' _ "$scratch/ns-pid" "$scratch/ns-go" "$scratch/policy-boot-part.sh" \
   > "$scratch/policy-boot-run.log" 2>&1 &
 ns_job=$!

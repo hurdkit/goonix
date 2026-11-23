@@ -130,6 +130,20 @@ floor_kb=$((40 * 1024 * 1024))
 
 cat > "$scratch/part-$stage.sh" <<EOF
 set -uo pipefail
+# Job isolation check, BEFORE any mount and before the daemon starts.  The
+# runner enters a private PID namespace after installing the ID maps, so this
+# script must be PID 1 of its own namespace; otherwise the daemon's build-user
+# cleanup kill(-1, SIGKILL) reaches other jobs' builders on the host (goonix
+# DECISIONS 30).  Refuse rather than run unisolated.  Regression: revert the
+# runner's 'exec unshare --pid --fork --kill-child' to 'exec bash' and this
+# prints a PID other than 1 and exits non-zero (goonix-ca6/pid-ns-check.sh).
+echo "PID_NS_CHECK pid=\$\$ ns=\$(readlink /proc/self/ns/pid)"
+if [ "\$\$" != 1 ]; then
+  echo "REFUSING: not PID 1 of a private PID namespace (pid=\$\$);" \\
+       "the runner must exec unshare --pid --fork --kill-child after the maps" >&2
+  echo "STAGE=$stage EXIT=1" >> '$scratch/results'
+  exit 1
+fi
 mount --bind '$scratch/store' /gnu/store
 mount --bind '$scratch/var' /var/guix
 # Build users, and hide the host's nscd: glibc answers getgrnam/getpwnam
@@ -218,7 +232,18 @@ unshare --user --mount bash -c '
   echo "$$" > "$1"
   for i in $(seq 1 600); do [ -e "$2" ] && break; sleep .1; done
   [ -e "$2" ] || { echo "no maps go-ahead" >&2; exit 1; }
-  exec bash "$3"
+  # Job isolation (reviewer, 2026-11-23; lanes DECISIONS "Job isolation goes
+  # into the committed runners").  Private PID namespace INSIDE the mapping
+  # boundary newuidmap/newgidmap just installed.  The daemon build-user cleanup
+  # does kill(-1, SIGKILL): without this it reaches every process of the leased
+  # uid on the HOST, and it killed the builders of another job mid-CA-8 (goonix
+  # DECISIONS 30).  --fork is required by --pid, --kill-child ties the part
+  # script lifetime to this child.  It must come AFTER the maps - a PID
+  # namespace above the user namespace breaks the handshake outright
+  # (measured: "Target process is owned by a different user").  The part script
+  # refuses to start the daemon unless it is PID 1, so this cannot silently
+  # regress.
+  exec unshare --pid --fork --kill-child -- bash "$3"
 ' _ "$scratch/ns-pid" "$scratch/ns-go" "$scratch/part-$stage.sh" \
   > "$scratch/run-$stage.log" 2>&1 &
 ns_job=$!
