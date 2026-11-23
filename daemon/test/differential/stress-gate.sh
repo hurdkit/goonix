@@ -23,6 +23,20 @@ work=/tmp/pr6-root-ci/$label
 uid=$(id -u)
 gid=$(id -g)
 
+# Subordinate ID ranges: read the invoking user's FIRST range from /etc/subuid and
+# /etc/subgid instead of hard-coding the laptop's 100000, so the gate runs on any
+# host (laptop wrath:100000:65536, zergling2 hurdkit:231072:65536).  Overridable.
+uname=$(id -un)
+subuid_line=$(awk -F: -v u="$uname" -v i="$uid" '($1==u||$1==i){print $2":"$3; exit}' /etc/subuid 2>/dev/null)
+subgid_line=$(awk -F: -v u="$uname" -v i="$gid" '($1==u||$1==i){print $2":"$3; exit}' /etc/subgid 2>/dev/null)
+subuid_start=${STRESS_SUBUID_START:-${subuid_line%%:*}}
+subuid_count=${STRESS_SUBUID_COUNT:-${subuid_line##*:}}
+subgid_start=${STRESS_SUBGID_START:-${subgid_line%%:*}}
+subgid_count=${STRESS_SUBGID_COUNT:-${subgid_line##*:}}
+: "${subuid_start:?no /etc/subuid range for $uname}" "${subuid_count:?}"
+: "${subgid_start:?no /etc/subgid range for $uname}" "${subgid_count:?}"
+echo "subuid=$subuid_start:$subuid_count subgid=$subgid_start:$subgid_count"
+
 bash "$here/root-ci-setup.sh" "$daemon" "$label" || exit 1
 daemon=$(readlink -f "$daemon")
 
@@ -35,8 +49,8 @@ echo "payload_hash=$payload_hash mode=$mode"
 
 export PATH=/run/wrappers/bin:$PATH
 timeout 900 unshare --user \
-  --map-users=0:"$uid":1 --map-users=1:100000:65536 \
-  --map-groups=0:"$gid":1 --map-groups=1:100000:65536 \
+  --map-users=0:"$uid":1 --map-users=1:"$subuid_start":"$subuid_count" \
+  --map-groups=0:"$gid":1 --map-groups=1:"$subgid_start":"$subgid_count" \
   --mount -- bash -c '
     set -uo pipefail
     work="'"$work"'"; root="'"$root"'"; daemon="'"$daemon"'"; mode="'"$mode"'"
