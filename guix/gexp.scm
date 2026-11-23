@@ -1072,50 +1072,6 @@ names and file names suitable for the #:allowed-references argument to
 
     (mapm/accumulate-builds lower lst)))
 
-(define (goonix-reference-inputs allowed disallowed system target)
-  "Return the <derivation-input>s for every derivation output named in the
-reference lists ALLOWED and DISALLOWED, as a store-monadic value.
-
-goonix: an output named in a reference list is a REQUIRED input output, even
-when the builder never mentions it.  CA-6 gate run 13 died on this: glibc-2.41
-takes gcc-cross-boot0 with [\"out\"] only, while its allowedReferences names
-that derivation's LIB output.  resolveDerivation builds its replacement map
-from the REQUESTED outputs, so lib's placeholder had no replacement, survived
-in allowedReferences, and checkResolvedDerivation refused the derivation.
-
-Requesting those outputs here is DETERMINISTIC: it depends only on the gexp's
-own reference lists, never on what happens to be in the store.  A substitute
-that fetched only `out', or a GC of `lib', cannot change how the derivation
-resolves.  It forces no extra build either, because the input derivation's
-builder produces all of its outputs at once.
-
-Bare output names (\"out\", \"static\") name THIS derivation's own outputs and
-are handled by checkGoonixReferences; they are not inputs.  Mirrors
-lower-inputs' shape and native? handling."
-  (with-monad %store-monad
-    (define lower
-      (match-lambda
-        ((? string? _) (return #f))
-        (($ <gexp-input> thing output native?)
-         (mlet %store-monad ((obj (lower-object thing system
-                                                #:target (and (not native?)
-                                                              target))))
-           (return (and (derivation? obj)
-                        (derivation-input obj (list output))))))
-        (thing
-         (mlet %store-monad ((obj (lower-object thing system
-                                                #:target target)))
-           ;; A package named WITHOUT an output means its "out" output, not
-           ;; every output.  (derivation-input obj) defaults to ALL outputs,
-           ;; which is how bash-static picked up "doc" and changed an
-           ;; input-addressed graph.
-           (return (and (derivation? obj)
-                        (derivation-input obj (list "out"))))))))
-    (mlet %store-monad ((inputs (mapm/accumulate-builds
-                                lower (append (or allowed '())
-                                              (or disallowed '())))))
-      (return (filter derivation-input? inputs)))))
-
 (define default-guile-derivation
   ;; Here we break the abstraction by talking to the higher-level layer.
   ;; Thus, do the resolution lazily to hide the circular dependency.
@@ -1385,24 +1341,10 @@ The other arguments are as for 'derivation'."
                        (addressing -> ((module-ref (resolve-module '(guix ca policy)) 'gexp-addressing)
                                        addressing (lowered-gexp-guile lowered)
                                        (lowered-gexp-inputs lowered) graphs allowed disallowed)) ;goonix: actual inputs and references
-                       ;; goonix: reference-list outputs are required inputs,
-                       ;; but ONLY for a CA derivation.  An input-addressed
-                       ;; derivation has real paths in its reference lists and
-                       ;; needs nothing; requesting extra outputs there would
-                       ;; change its .drv and output path and lose upstream
-                       ;; substitutes (measured: glibc-final's drv moved from
-                       ;; upstream's w189hhbh… to 256qrzh1…).  Upstream's
-                       ;; input-addressed graph must stay byte-identical.
-                       ;;
-                       ;; This MUST come after the addressing binding above:
-                       ;; that one shadows the requested parameter with the
-                       ;; kind actually chosen from the lowered inputs, which
-                       ;; is the one that decides whether placeholders exist.
-                       (ref-inputs (if (eq? addressing 'input)
-                                       (return '())
-                                       (goonix-reference-inputs
-                                        allowed-references disallowed-references
-                                        system target)))
+                       ;; goonix: reference-list outputs are required inputs (CA only).
+                       (ref-inputs (if (eq? addressing 'input) (return '())
+                                       ((module-ref (resolve-module '(guix ca references)) 'reference-inputs)
+                                        allowed-references disallowed-references system target)))
                        (builder-text -> (sexp->string
                                          (lowered-gexp-sexp lowered))) ;goonix: builder text
                        (builder  (if (eq? addressing 'input)
@@ -1435,29 +1377,11 @@ The other arguments are as for 'derivation'."
                       #:system system
                       #:inputs `(,guile
                                  ,@(lowered-gexp-inputs lowered)
+                                 ,@ref-inputs ;goonix: reference-list outputs
                                  ,@(match graphs
                                      (((_ . inputs) ...)
                                       (filter derivation-input? inputs))
-                                     (#f '()))
-                                 ;; goonix: an output named in a reference list
-                                 ;; is a REQUIRED input output, even when the
-                                 ;; builder never mentions it.  CA-6 gate run 13
-                                 ;; died on this: glibc-2.41 takes
-                                 ;; gcc-cross-boot0 with ["out"] only, while its
-                                 ;; allowedReferences names that derivation's
-                                 ;; lib output.  resolveDerivation builds its
-                                 ;; replacement map from the REQUESTED outputs,
-                                 ;; so lib's placeholder survived and the
-                                 ;; resolved derivation was refused.
-                                 ;;
-                                 ;; Requesting it here is deterministic: it is a
-                                 ;; function of the gexp's own reference lists,
-                                 ;; never of what happens to be in the store, so
-                                 ;; the same derivation resolves identically on
-                                 ;; every machine.  It forces no extra build
-                                 ;; either - that derivation's builder produces
-                                 ;; all its outputs at once.
-                                 ,@ref-inputs)
+                                     (#f '())))
                       #:sources `(,@(if (eq? addressing 'input) ;goonix: builder embedded for CA
                                         (list builder)
                                         '())
