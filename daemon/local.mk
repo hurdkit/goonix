@@ -112,6 +112,8 @@ EXTRA_DIST += \
   daemon/test/ca-leftover/Main.hs daemon/test/ca-leftover.sh \
   daemon/test/rewrite-mode/Main.hs daemon/test/rewrite-mode.sh \
   nix/libstore/rewrite-mode-probe.cc \
+  daemon/test/dedup-mode/Main.hs daemon/test/dedup-mode.sh \
+  nix/libstore/dedup-probe.cc \
   daemon/test/deep-scan-timeout.hs daemon/test/deep-scan-timeout.sh \
   daemon/proxy/Main.hs \
   daemon/test/wire-proxy/Main.hs daemon/test/wire-proxy/run.sh \
