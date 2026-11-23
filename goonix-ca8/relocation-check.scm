@@ -76,6 +76,34 @@ characters of the nix-base32 digest instead."
             (loop (+ j n) (cons rep (cons (substring str i j) acc)))
             (string-concatenate-reverse (cons (substring str i) acc)))))))
 
+(define (normalise-token bytes needle marker)
+  "BYTES with every occurrence of NEEDLE replaced by MARKER, searched as BYTES.
+
+Both are ASCII and the needle is a fixed-width 32-character store hash, so this
+is safe on ELF and compiled .go alike: no decoding, no offset assumptions beyond
+the replacement itself.  Returns a fresh bytevector."
+  (let* ((n (bytevector-length needle))
+         (m (bytevector-length marker))
+         (len (bytevector-length bytes))
+         (hits (let loop ((i 0) (acc '()))
+                 (cond
+                  ((> (+ i n) len) (reverse acc))
+                  ((let same? ((k 0))
+                     (cond ((= k n) #t)
+                           ((= (bytevector-u8-ref bytes (+ i k))
+                               (bytevector-u8-ref needle k)) (same? (+ k 1)))
+                           (else #f)))
+                   (loop (+ i n) (cons i acc)))
+                  (else (loop (+ i 1) acc)))))
+         (out (make-bytevector (+ len (* (length hits) (- m n))))))
+    (let loop ((src 0) (dst 0) (hits hits))
+      (if (null? hits)
+          (begin (bytevector-copy! bytes src out dst (- len src)) out)
+          (let ((at (car hits)))
+            (bytevector-copy! bytes src out dst (- at src))
+            (bytevector-copy! marker 0 out (+ dst (- at src)) m)
+            (loop (+ at n) (+ dst (- at src) m) (cdr hits)))))))
+
 (define (snapshot root token)
   "An alist of (relative-path . digest-or-link-target) for ROOT, with every
 occurrence of TOKEN normalised to a fixed marker.  Two relocations that differ
@@ -97,15 +125,21 @@ only in their token then compare equal."
                             out)))
            ((regular)
             (let* ((bytes (call-with-input-file file get-bytevector-all))
-                   (text (false-if-exception (utf8->string bytes))))
+                   (tb (string->utf8 token))
+                   (marker (string->utf8 "@TOKEN@")))
+              ;; Normalise the token in BINARY files too, not just text.  An
+              ;; ELF that embeds its own store path (hello's bin/hello, gcc's
+              ;; cpp/cc1/collect2) is not valid UTF-8 - measured: utf8->string
+              ;; on bin/hello throws - so the old text-only pass hashed the raw
+              ;; bytes with the token still in them and EVERY such item was
+              ;; reported as "content differs", i.e. opaque, for a difference
+              ;; that is exactly the token this test introduced.  Search bytes,
+              ;; never decode.  The token is a fixed-width 32-character store
+              ;; hash, so replacing it does not move any other content.
               (set! out
                     (cons (cons rel
                                 (bytevector->base16-string
-                                 (sha256
-                                  (if text
-                                      (string->utf8
-                                       (string-replace-all text token "@TOKEN@"))
-                                      bytes))))
+                                 (sha256 (normalise-token bytes tb marker))))
                           out))))
            (else #t))))
      (find-files root (const #t) #:directories? #t))

@@ -30,6 +30,31 @@ fi
 stage=${1:?stage name}
 script=${2:?scheme file}
 
+# goonix: a gate must run on a COMPILED tree.  This runner starts guile with
+# --no-auto-compile, so an unbuilt tree is interpreted - a different load path
+# that can fail on upstream macro hygiene (jq/oniguruma, DECISIONS 37).  Refuse
+# before any daemon starts.  gate-lib.sh lives in goonix-ca6/ and is shared.
+source "$IMPL/goonix-ca6/gate-lib.sh"
+
+# PREPARE first when the tree is not built, exactly as goonix-ca6/z2-counted.sh
+# does.  A DEDICATED per-job worktree (the lanes session's per-job submission) is
+# created fresh at the requested commit, so it has no configure output and no
+# .go files: asserting the precondition alone made every such job refuse with
+# "cannot read GOBJECTS from make" (measured, goonix-ca8-point1-v7).  On a warm
+# mirror this is a no-op, so the laptop path is unchanged.  GOONIX_CA8_PREPARE=0
+# opts out for a caller that has already prepared the tree itself.
+if [ "${GOONIX_CA8_PREPARE:-1}" = 1 ]; then
+  if ! goonix_gate_require_compiled "$IMPL" >/dev/null 2>&1; then
+    echo '=== prepare the tree (fresh worktree: configure + make) ==='
+    if ! bash "$IMPL/goonix-ca6/prepare-tree.sh" \
+         "${Z2_JOB_CORES:-${GOONIX_GATE_JOBS:-4}}" "$IMPL"; then
+      echo 'PREPARE FAILED' >&2
+      exit 1
+    fi
+  fi
+fi
+goonix_gate_require_compiled "$IMPL" || exit 1
+
 if ! unshare --user --map-root-user --mount true 2>/dev/null; then
   printf 'SKIP: user/mount namespaces are unavailable\n'
   exit 77
@@ -121,8 +146,34 @@ chmod 400 "$scratch/etc/signing-key.sec"
 cap_kb=$((150 * 1024 * 1024))
 floor_kb=$((40 * 1024 * 1024))
 
+# CPU budget (lanes USAGE.md): "A command which starts a Nix/Guix build daemon
+# must also give it an explicit --cores and --max-jobs within the same budget."
+# guix-daemon does NOT read NIX_CONFIG (verified: no reference in nix/), and its
+# defaults are max-jobs UNLIMITED and cores AUTO-DETECTED, so on zergling2 it
+# would see 24 host cores under a 4-core quota and thrash.  z2run exports
+# Z2_JOB_CORES; on the laptop the build lane's own cap applies.
+daemon_cores=${Z2_JOB_CORES:-${GOONIX_GATE_JOBS:-4}}
+daemon_jobs=${GOONIX_DAEMON_MAX_JOBS:-1}
+case "$daemon_cores" in ''|*[!0-9]*) echo "bad core count: $daemon_cores" >&2; exit 1;; esac
+[ "$daemon_cores" -ge 1 ] || { echo 'core count must be >= 1' >&2; exit 1; }
+echo "DAEMON_BUDGET cores=$daemon_cores max-jobs=$daemon_jobs"
+
 cat > "$scratch/part-$stage.sh" <<EOF
 set -uo pipefail
+# Job isolation check, BEFORE any mount and before the daemon starts.  The
+# runner enters a private PID namespace after installing the ID maps, so this
+# script must be PID 1 of its own namespace; otherwise the daemon's build-user
+# cleanup kill(-1, SIGKILL) reaches other jobs' builders on the host (goonix
+# DECISIONS 30).  Refuse rather than run unisolated.  Regression: revert the
+# runner's 'exec unshare --pid --fork --kill-child' to 'exec bash' and this
+# prints a PID other than 1 and exits non-zero (goonix-ca6/pid-ns-check.sh).
+echo "PID_NS_CHECK pid=\$\$ ns=\$(readlink /proc/self/ns/pid)"
+if [ "\$\$" != 1 ]; then
+  echo "REFUSING: not PID 1 of a private PID namespace (pid=\$\$);" \\
+       "the runner must exec unshare --pid --fork --kill-child after the maps" >&2
+  echo "STAGE=$stage EXIT=1" >> '$scratch/results'
+  exit 1
+fi
 mount --bind '$scratch/store' /gnu/store
 mount --bind '$scratch/var' /var/guix
 # Build users, and hide the host's nscd: glibc answers getgrnam/getpwnam
@@ -163,6 +214,7 @@ export TMPDIR=/tmp
 cd '$IMPL'
 ./pre-inst-env ./guix-daemon --disable-chroot \\
   --build-users-group=guixbuild \\
+  --cores=$daemon_cores --max-jobs=$daemon_jobs \\
   --listen='$scratch/socket' \\
   --substitute-urls=https://bordeaux.guix.gnu.org \\
   >'$scratch/daemon-$stage.log' 2>&1 &
@@ -211,7 +263,18 @@ unshare --user --mount bash -c '
   echo "$$" > "$1"
   for i in $(seq 1 600); do [ -e "$2" ] && break; sleep .1; done
   [ -e "$2" ] || { echo "no maps go-ahead" >&2; exit 1; }
-  exec bash "$3"
+  # Job isolation (reviewer, 2026-11-23; lanes DECISIONS "Job isolation goes
+  # into the committed runners").  Private PID namespace INSIDE the mapping
+  # boundary newuidmap/newgidmap just installed.  The daemon build-user cleanup
+  # does kill(-1, SIGKILL): without this it reaches every process of the leased
+  # uid on the HOST, and it killed the builders of another job mid-CA-8 (goonix
+  # DECISIONS 30).  --fork is required by --pid, --kill-child ties the part
+  # script lifetime to this child.  It must come AFTER the maps - a PID
+  # namespace above the user namespace breaks the handshake outright
+  # (measured: "Target process is owned by a different user").  The part script
+  # refuses to start the daemon unless it is PID 1, so this cannot silently
+  # regress.
+  exec unshare --pid --fork --kill-child -- bash "$3"
 ' _ "$scratch/ns-pid" "$scratch/ns-go" "$scratch/part-$stage.sh" \
   > "$scratch/run-$stage.log" 2>&1 &
 ns_job=$!
@@ -231,8 +294,12 @@ newuidmap "$ns_pid" 0 "$host_uid" 1 1 "$sub_uid" "$sub_uid_count"
 newgidmap "$ns_pid" 0 "$host_gid" 1 1 "$sub_gid" "$sub_gid_count"
 echo "MAPS INSTALLED for pid $ns_pid"
 : > "$scratch/ns-go"
-wait "$ns_job"
-status=$?
+# goonix: `wait` must not abort the script under `set -e`.  A FAILING stage is
+# the normal way a gate reports a failure, and a bare `wait` returned its status
+# straight to set -e, so the script died here - before the diagnostic tails and
+# before the explicit exit below.  Capture the status instead.
+status=0
+wait "$ns_job" || status=$?
 
 echo "=== $stage result ==="
 grep "STAGE=$stage" "$scratch/results" 2>/dev/null | tail -1 || echo 'no result line'
@@ -245,4 +312,17 @@ cat "$scratch/watchdog-$stage.log" 2>/dev/null || echo 'not triggered'
 echo "=== disk after ==="
 du -sh "$scratch/store" 2>/dev/null || true
 df -h / | tail -1
-exit $status
+
+# goonix: exit with the STAGE'S OWN verdict, so a failed gate fails the unit
+# that ran it (reviewer, DECISIONS 37).  The part script appends
+# "STAGE=<name> EXIT=<status>" to results; prefer that recorded verdict over the
+# namespace child's status, and treat a missing verdict as a failure.
+stage_exit=$(grep -o "^STAGE=$stage EXIT=[0-9]*" "$scratch/results" 2>/dev/null \
+             | tail -1 | sed 's/.*EXIT=//' || true)
+if [ -n "$stage_exit" ]; then
+  status=$stage_exit
+elif [ "$status" -eq 0 ]; then
+  echo "GATE: no STAGE=$stage EXIT line recorded - no verdict" >&2
+  status=1
+fi
+goonix_gate_exit "$status"

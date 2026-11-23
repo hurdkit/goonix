@@ -21,6 +21,11 @@ namespace nix {
 void checkRewriteForTest(const Path & path, const string & from, const string & to);
 void rewriteTreeForTest(const Path & path, const string & from, const string & to);
 string encodeReservedForTest(const Hash & digest, bool token);
+string inverseTreeForTest(const Path & path, const string & final,
+    const string & token, const std::map<Path, Path> & siblings);
+bool sameContentForTest(const Path & path, const string & final,
+    const string & token, const Hash & expected,
+    const std::map<Path, Path> & siblings);
 }
 
 static unsigned failures = 0;
@@ -1157,5 +1162,240 @@ int main(int argc, char ** argv)
             "its hard-linked twin stays executable across two rewrite passes");
     }
 
+    /* goonix: a sibling hash at the END of a file, and across the 128 KiB read
+       boundary.  inverseTree's streaming loop used to retain only `final.size()
+       - 1' bytes and scan prefixes of `final' alone, so a SIBLING hash crossing
+       the cut was split between two inverse() calls and never mapped back to its
+       token.  sameContent then reported false for identical content - a spurious
+       CA collision / verification failure for multi-output derivations whose
+       outputs reference each other.  Found by the Haskell session's sameContent
+       probe.
+
+       THE PROPERTY.  inverse() undoes a realisation: it maps this output's final
+       hash back to its token, and each sibling's final hash back to that
+       sibling's token.  So two realisations of the SAME content, carrying
+       different final hashes, must invert to the SAME canonical tree - both
+       end up expressed in tokens.  (Inverting A to B's hashes and B to A's would
+       produce two SWAPPED trees, which are legitimately different; that was my
+       first, wrong, expectation.)
+
+       Each fixture builds the token-form tree once as the reference, then two
+       realisations of it, and requires both inversions to equal the reference. */
+    {
+        std::string selfTok(32, 't'), sibTok(32, 's');
+        std::string selfA(32, 'a'), selfB(32, 'b');
+        std::string sibA(32, 'c'), sibB(32, 'd');
+
+        /* Build one tree in a given spelling of the two hashes. */
+        auto build = [&](const std::string & self, const std::string & sib,
+                         const std::string & suffix, size_t pad) {
+            Path root = createTempDir("", "goonix-sibling-boundary");
+            createDirs(root + "/bin");
+            writeFile(root + "/bin/w",
+                std::string(pad, 'p')
+                + "#! /bin/sh\nexec /gnu/store/" + sib + "-foo-bin/bin/x \"$@\""
+                + suffix);
+            writeFile(root + "/bin/self", "/gnu/store/" + self + "-foo\n");
+            return root;
+        };
+        /* The sibling map is TOKEN -> FINAL, as finalisation builds it
+           (rewriteTree(physical, sibling.first, sibling.second)); inverse()
+           replaces it->second with it->first. */
+        auto siblings = [&](const std::string & sibFinal) {
+            std::map<Path, Path> m;
+            m["/gnu/store/" + sibTok + "-foo-bin"] =
+                "/gnu/store/" + sibFinal + "-foo-bin";
+            return m;
+        };
+
+        /* (1) The sibling hash ends 0, 1 and 30 bytes before EOF - all inside
+           the old 31-byte retained tail, so the old code split it. */
+        for (unsigned tail : {0u, 1u, 30u}) {
+            std::string suffix(tail, 'x');
+            Path ref = build(selfTok, sibTok, suffix, 0);
+            Path ra = build(selfA, sibA, suffix, 0);
+            Path rb = build(selfB, sibB, suffix, 0);
+            AutoDelete d1(ref, true), d2(ra, true), d3(rb, true);
+            string want = inverseTreeForTest(ref, selfTok, selfTok, {});
+            string gotA = inverseTreeForTest(ra, selfA, selfTok, siblings(sibA));
+            string gotB = inverseTreeForTest(rb, selfB, selfTok, siblings(sibB));
+            check(gotA == want && gotB == want,
+                std::format("a sibling hash {} bytes from EOF inverts to the token tree", tail));
+        }
+
+        /* (2) A sibling hash STRADDLING the 128 KiB read boundary.  The padding
+           places the hash so the read cut falls inside it. */
+        for (unsigned straddle : {1u, 16u, 31u, 32u}) {
+            /* The prefix before the sibling hash is the padding plus the fixed
+               shebang/exec text; shift the padding so the hash spans the cut. */
+            std::string lead = "#! /bin/sh\nexec /gnu/store/";
+            size_t boundary = 128 * 1024;
+            size_t pad = boundary - straddle - lead.size();
+            Path ref = build(selfTok, sibTok, "", pad);
+            Path ra = build(selfA, sibA, "", pad);
+            Path rb = build(selfB, sibB, "", pad);
+            AutoDelete d1(ref, true), d2(ra, true), d3(rb, true);
+            string want = inverseTreeForTest(ref, selfTok, selfTok, {});
+            string gotA = inverseTreeForTest(ra, selfA, selfTok, siblings(sibA));
+            string gotB = inverseTreeForTest(rb, selfB, selfTok, siblings(sibB));
+            check(gotA == want && gotB == want,
+                std::format("a sibling hash straddling the read boundary ({}) inverts to the token tree",
+                    straddle));
+        }
+
+        /* (2b) THE PREFIX-RULE COUNTEREXAMPLES (reviewer, correcting
+           8f646d4969f; Haskell port 057b2a097b9).  A hash that ends EXACTLY at
+           `process' - i.e. 31 bytes before EOF, or 31 bytes before a read end -
+           is COMPLETE, so it must be inverted in this round.  A prefix test
+           instead sees its last byte as a 1-byte prefix of some pattern whenever
+           that byte equals a pattern's first character, pulls `process' back one
+           byte, and splits the complete match: neither half is ever inverted.
+           These fixtures make that happen deliberately, for both border kinds
+           (the file's own hash and a sibling's) and at the first read's end.
+           tail=30 stays as the control: it is outside the window and passed even
+           under the wrong rule. */
+        {
+            /* The sibling's final hash ends with the FIRST character of the
+               file's own final hash, so the 1-byte suffix matches `final'. */
+            std::string sibEndsLikeSelf = std::string(31, 'c') + selfA.substr(0, 1);
+            std::string sibEndsLikeSelfB = std::string(31, 'd') + selfB.substr(0, 1);
+            /* And one that ends with its OWN first character (self-overlap). */
+            std::string sibSelfOverlap = std::string(32, 'c');
+            std::string sibSelfOverlapB = std::string(32, 'd');
+
+            /* `after' is the distance from the HASH END to EOF, not the length
+               of the padding: build() appends "-foo-bin/bin/x \"$@\"" (19 bytes)
+               after the hash, so a padding of N puts the hash end 19+N bytes
+               before EOF.  My first attempt passed 31 as the padding and so
+               tested 50 bytes, which no rule gets wrong - it passed under BOTH
+               the prefix rule and the whole-match rule.  Compute the padding
+               from the wanted distance instead. */
+            const size_t sibTrail = std::string("-foo-bin/bin/x \"$@\"").size();
+            auto padFor = [&](unsigned after) {
+                return std::string(after > sibTrail ? after - sibTrail : 0, 'x');
+            };
+
+            struct Shape { const char * name; std::string a, b; unsigned after; };
+            std::vector<Shape> shapes = {
+                {"sibling ends in the file hash's first char", sibEndsLikeSelf, sibEndsLikeSelfB, 31},
+                {"sibling ends in its own first char", sibSelfOverlap, sibSelfOverlapB, 31},
+                {"sibling ends in the file hash's first char (control)", sibEndsLikeSelf, sibEndsLikeSelfB, 30},
+            };
+            for (auto & shape : shapes) {
+                std::string suffix = padFor(shape.after);
+                Path ref = build(selfTok, sibTok, suffix, 0);
+                Path ra = build(selfA, shape.a, suffix, 0);
+                Path rb = build(selfB, shape.b, suffix, 0);
+                AutoDelete d1(ref, true), d2(ra, true), d3(rb, true);
+                string want = inverseTreeForTest(ref, selfTok, selfTok, {});
+                string gotA = inverseTreeForTest(ra, selfA, selfTok, siblings(shape.a));
+                string gotB = inverseTreeForTest(rb, selfB, selfTok, siblings(shape.b));
+                check(gotA == want && gotB == want,
+                    std::format("{} {} bytes from EOF inverts whole", shape.name, shape.after));
+            }
+
+            /* The FILE's own hash ending in a SIBLING's first character: the
+               border kind is the other way round.  The self reference is last in
+               its file, its hash end exactly `after' bytes before EOF. */
+            {
+                std::string selfEndsLikeSib = std::string(31, 'a') + sibA.substr(0, 1);
+                std::string selfEndsLikeSibB = std::string(31, 'b') + sibB.substr(0, 1);
+                const size_t selfTrail = std::string("-foo").size();
+                auto buildSelfLast = [&](const std::string & self,
+                                         const std::string & sib, unsigned after) {
+                    Path root = createTempDir("", "goonix-self-border");
+                    createDirs(root + "/bin");
+                    writeFile(root + "/bin/sib", "/gnu/store/" + sib + "-foo-bin\n");
+                    writeFile(root + "/bin/w",
+                        "/gnu/store/" + self + "-foo"
+                        + std::string(after > selfTrail ? after - selfTrail : 0, 'x'));
+                    return root;
+                };
+                Path ref = buildSelfLast(selfTok, sibTok, 31);
+                Path ra = buildSelfLast(selfEndsLikeSib, sibA, 31);
+                Path rb = buildSelfLast(selfEndsLikeSibB, sibB, 31);
+                AutoDelete d1(ref, true), d2(ra, true), d3(rb, true);
+                string want = inverseTreeForTest(ref, selfTok, selfTok, {});
+                string gotA = inverseTreeForTest(ra, selfEndsLikeSib, selfTok, siblings(sibA));
+                string gotB = inverseTreeForTest(rb, selfEndsLikeSibB, selfTok, siblings(sibB));
+                check(gotA == want && gotB == want,
+                    "the file hash ending in a sibling's first char 31 bytes from EOF inverts whole");
+            }
+
+            /* The same shape with the hash end exactly 31 bytes before the END
+               OF THE FIRST 128 KiB READ, so the split is at a read boundary
+               rather than at EOF.  Sweep the distance: the read() chunking is
+               not guaranteed to be exactly 128 KiB, so a single offset can miss
+               the window by a byte and pass under BOTH rules (measured). */
+            {
+                std::string lead = "#! /bin/sh\nexec /gnu/store/";
+                size_t boundary = 128 * 1024;
+                for (unsigned after : {30u, 31u, 32u, 33u}) {
+                    /* The hash END sits at pad + lead + 32; the trailing
+                       "-foo-bin/bin/x" text comes AFTER it and is irrelevant to
+                       where the read cut falls.  Subtracting sibTrail here too
+                       put the hash 19+after bytes before the cut, which no rule
+                       gets wrong (measured: all four passed under both rules). */
+                    size_t pad = boundary - after - lead.size() - 32;
+                    /* The file MUST extend past the read end, or read() returns
+                       it whole and there is no boundary to straddle (measured:
+                       with only the 19-byte trailer the file was 131060 bytes,
+                       under 128 KiB, and all four offsets passed under both
+                       rules).  Add a tail so a second read really happens. */
+                    std::string beyond(4096, 'z');
+                    Path ref = build(selfTok, sibTok, beyond, pad);
+                    Path ra = build(selfA, sibSelfOverlap, beyond, pad);
+                    Path rb = build(selfB, sibSelfOverlapB, beyond, pad);
+                    AutoDelete d1(ref, true), d2(ra, true), d3(rb, true);
+                    string want = inverseTreeForTest(ref, selfTok, selfTok, {});
+                    string gotA = inverseTreeForTest(ra, selfA, selfTok, siblings(sibSelfOverlap));
+                    string gotB = inverseTreeForTest(rb, selfB, selfTok, siblings(sibSelfOverlapB));
+                    check(gotA == want && gotB == want,
+                        std::format("a complete sibling hash {} bytes before the first read end inverts whole",
+                            after));
+                }
+            }
+
+            /* A SWEEP of hash-end distances around EOF, with the self-overlapping
+               sibling (32 equal characters).  This is the general form of the
+               counterexample: whatever `keep' is, a complete match ending at
+               `process' must not be pulled apart.  Sweeping rather than picking
+               one offset is deliberate - my first three hand-picked shapes
+               included two that passed under the WRONG rule too, because the
+               distance I computed was not the distance from the hash end. */
+            for (unsigned after = 28; after <= 36; ++after) {
+                std::string suffix = padFor(after);
+                Path ref = build(selfTok, sibTok, suffix, 0);
+                Path ra = build(selfA, sibSelfOverlap, suffix, 0);
+                Path rb = build(selfB, sibSelfOverlapB, suffix, 0);
+                AutoDelete d1(ref, true), d2(ra, true), d3(rb, true);
+                string want = inverseTreeForTest(ref, selfTok, selfTok, {});
+                string gotA = inverseTreeForTest(ra, selfA, selfTok, siblings(sibSelfOverlap));
+                string gotB = inverseTreeForTest(rb, selfB, selfTok, siblings(sibSelfOverlapB));
+                check(gotA == want && gotB == want,
+                    std::format("self-overlapping sibling hash {} bytes from EOF inverts whole", after));
+            }
+        }
+
+        /* (3) The VERDICT, not just the digest: sameContent must accept a
+           realisation whose sibling reference sits at EOF.  This is the
+           observable a multi-output finalisation consults.  The expected hash is
+           the TOKEN tree's, computed independently of the call under test. */
+        {
+            Path ref = build(selfTok, sibTok, "", 0);
+            Path ra = build(selfA, sibA, "", 0);
+            AutoDelete d1(ref, true), d2(ra, true);
+            Hash expected = parseHash(htSHA256,
+                inverseTreeForTest(ref, selfTok, selfTok, {}));
+            check(sameContentForTest(ra, "/gnu/store/" + selfA + "-foo",
+                    "/gnu/store/" + selfTok + "-foo", expected, siblings(sibA)),
+                "sameContent accepts a sibling reference at EOF");
+            /* And it must still REJECT genuinely different content. */
+            writeFile(ra + "/bin/self", "/gnu/store/" + selfA + "-foo CHANGED\n");
+            check(!sameContentForTest(ra, "/gnu/store/" + selfA + "-foo",
+                    "/gnu/store/" + selfTok + "-foo", expected, siblings(sibA)),
+                "sameContent still rejects a real content change");
+        }
+    }
     return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

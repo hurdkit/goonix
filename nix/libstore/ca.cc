@@ -536,15 +536,6 @@ void checkRewriteForTest(const Path & path, const string & from, const string & 
    entry, including hard-linked twins.  Defined after rewriteTree itself. */
 void rewriteTreeForTest(const Path & path, const string & from, const string & to);
 
-/* goonix: expose the reserved-placeholder tree scan for the same reason - the
-   read-boundary retention is only observable through the whole walk. */
-void checkReservedTreeForTest(const Path & path);
-
-/* goonix: expose the inverse-tree hash so a test can compare the verification
-   digest itself, including its streaming boundary and sibling ordering. */
-string inverseTreeForTest(const Path & path, const string & finalHash,
-    const string & tokenHash, const std::map<Path, Path> & siblings);
-
 string encodeReservedForTest(const Hash & digest, bool token)
 {
     return encodeReserved(digest, token);
@@ -680,6 +671,8 @@ void rewriteTreeForTest(const Path & path, const string & from, const string & t
     rewriteTree(path, from, to);
 }
 
+/* goonix: expose the reserved-placeholder tree scan for the same reason - the
+   read-boundary retention is only observable through the whole walk. */
 void checkReservedTreeForTest(const Path & path)
 {
     checkReservedTree(path);
@@ -714,19 +707,64 @@ static string inverseTree(const Path & path, const string & final,
         auto write = [&](const string & part) {
             sink((const unsigned char *) part.data(), part.size());
         };
+        /* goonix: the boundary must protect EVERY pattern inverse() replaces,
+           not just `final'.  inverse() also maps each sibling's final hash back
+           to its token, so a sibling hash straddling `process' was split across
+           two inverse() calls and never replaced.  With one read for a small
+           file `process' is size-31, so any sibling hash ending within the last
+           31 bytes was missed - e.g. a wrapper whose last line is
+           `exec /gnu/store/<sibling-hash>-foo-bin/bin/x "$@"'.  sameContent then
+           said false for identical content: a spurious CA collision or
+           verification failure for multi-output derivations whose outputs
+           reference each other (found by the Haskell session's sameContent
+           probe).  Every pattern is a 32-character store hash.
+
+           WHY A PREFIX TEST IS WRONG (reviewer, correcting 8f646d4969f; the
+           Haskell port hit the same trap, 057b2a097b9).  Holding back "the
+           longest suffix that is a proper prefix of a pattern" can cut a
+           COMPLETE match in two.  Let a hash H end exactly at `process', and let
+           H's last character equal the first character of any pattern - its own
+           or another one's.  The 1-byte suffix then matches that pattern's
+           prefix, `process' moves back one byte, inverse() sees H minus its last
+           byte and the next round sees a single byte: H is never inverted.  With
+           random hashes that is about one hash in 32 per pattern, whenever a
+           hash ends 31 bytes before EOF or before a read end.  A self-overlapping
+           pattern (32 equal characters) is the extreme case.
+
+           So test WHOLE matches only.  `pending' already carries `keep' bytes of
+           lookahead, so any match STARTING in [process-keep, process) is fully
+           visible; pull the emit point back to the earliest such start when the
+           match extends past `process'.  A match ending at or before `process'
+           is complete and is left alone.  No prefix test remains, and the result
+           cannot depend on how read() split the file. */
+        std::vector<string> patterns;
+        patterns.push_back(final);
+        for (auto & sibling : siblings)
+            patterns.push_back(baseNameOf(sibling.second).substr(0, 32));
+        size_t keep = 0;
+        for (auto & pattern : patterns)
+            if (pattern.size() > 1) keep = std::max(keep, pattern.size() - 1);
         while (true) {
             ssize_t n = read(input, buffer.data(), buffer.size());
             if (n < 0) { if (errno == EINTR) continue;
                 throw SysError(std::format("reading `{}' for CA verification", path)); }
             if (n == 0) break;
             pending.append((const char *) buffer.data(), n);
-            size_t keep = final.size() - 1;
             size_t process = pending.size() > keep ? pending.size() - keep : 0;
-            for (size_t length = std::min(process, final.size() - 1); length > 0; --length)
-                if (pending.compare(process - length, length, final, 0, length) == 0) {
-                    process -= length;
-                    break;
+            size_t scanFrom = process > keep ? process - keep : 0;
+            for (size_t s = scanFrom; s < process; ++s) {
+                for (auto & pattern : patterns) {
+                    size_t len = pattern.size();
+                    if (len < 2 || s + len <= process) continue;
+                    if (s + len > pending.size()) continue;
+                    if (pending.compare(s, len, pattern) == 0) {
+                        /* A whole match straddles the emit point: emit nothing
+                           from its start onward, so inverse() sees it intact. */
+                        process = s;
+                        break;
+                    }
                 }
+            }
             write(inverse(pending.substr(0, process)));
             pending.erase(0, process);
         }
@@ -757,12 +795,6 @@ static string inverseTree(const Path & path, const string & final,
     throw Error(std::format("unsupported file type in CA tree `{}'", path));
 }
 
-string inverseTreeForTest(const Path & path, const string & finalHash,
-    const string & tokenHash, const std::map<Path, Path> & siblings)
-{
-    return inverseTree(path, finalHash, tokenHash, siblings);
-}
-
 /* goonix: compare the inverse tree without writing to an existing store item. */
 static bool sameContent(const Path & path, const string & final,
     const string & token, const Hash & expected,
@@ -770,6 +802,14 @@ static bool sameContent(const Path & path, const string & final,
 {
     return inverseTree(path, baseNameOf(final).substr(0, 32),
         baseNameOf(token).substr(0, 32), siblings) == printHash(expected);
+}
+
+/* goonix: expose inverseTree's digest so a test can compare two realisations
+   against the canonical token tree, which is the property sameContent rests on. */
+string inverseTreeForTest(const Path & path, const string & final,
+    const string & token, const std::map<Path, Path> & siblings)
+{
+    return inverseTree(path, final, token, siblings);
 }
 
 /* goonix: expose sameContent so a test can compare the VERDICT, not just the
