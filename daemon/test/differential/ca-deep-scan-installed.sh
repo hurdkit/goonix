@@ -24,6 +24,7 @@ set -uo pipefail
 hs_pkg=${1:?usage: ca-deep-scan-installed.sh HS_PKG WORK}
 work=${2:?}
 root=$(CDPATH= cd -- "$(dirname "$0")/../../.." && pwd)
+here="$root/daemon/test/differential"
 hs_daemon=$(readlink -f "$hs_pkg/bin/guix-daemon")
 uid=$(id -u); gid=$(id -g)
 rm -rf "$work"; mkdir -p "$work"
@@ -90,40 +91,13 @@ timeout 900 unshare --user \
     mount --bind "$ns/var-guix" /var/guix
     mount --bind "$ns/log-guix" /var/log/guix
     mount --bind "$ns/etc-guix" /etc/guix
-    # env -i: GOONIX_DEEP_SCAN_HELPER is UNSET.  The daemon must find its
-    # installed libexec helper through the make-expanded default.
-    env -i TMPDIR="$ns/build" LC_ALL=C.UTF-8 PATH=/nonexistent \
-      "$daemon" --build-users-group=guixbuild --max-jobs=2 --substitute-urls="" \
-      > "$ns/daemon.log" 2>&1 &
-    dpid=$!
-    for i in $(seq 1 200); do test -S /var/guix/daemon-socket/socket && break; sleep 0.1; done
-    if ! test -S /var/guix/daemon-socket/socket; then
-      echo "DAEMON DID NOT START"; head -30 "$ns/daemon.log"; kill $dpid 2>/dev/null; exit 2
-    fi
-    client_env() {
-      env -i LC_ALL=C.UTF-8 PATH=/nonexistent HOME="$ns" \
-        NIX_STORE_DIR=/gnu/store GUIX_STATE_DIRECTORY=/var/guix \
-        GUIX_DAEMON_SOCKET=/var/guix/daemon-socket/socket \
-        GUIX_DATABASE_DIRECTORY=/var/guix/db GUIX_LOG_DIRECTORY=/var/log/guix \
-        GUIX_BINARY_SUBSTITUTE_URL="file://$ns/substituter-data" \
-        GUIX_ALLOW_UNAUTHENTICATED_SUBSTITUTES=yes \
-        GUILE_LOAD_PATH="$root:$pkg_glp:$dev_glp" \
-        GUILE_LOAD_COMPILED_PATH="$root:$pkg_glcp:$dev_glcp" \
-        GUILE_AUTO_COMPILE=0 "$@"
-    }
-    client_env "$guile_bin" --no-auto-compile \
-      "$root/daemon/test/seed-restore.scm" "/home/wrath/.cache/goonix-test-seed" \
-      > "$ns/seed.log" 2>&1
-    echo "SEED_RC=$? $(tail -1 "$ns/seed.log")"
-    mkdir -p "$ns/results"
-    client_env "$guile_bin" --no-auto-compile -e main \
-      "$root/build-aux/test-driver.scm" \
-      --test-name=tests/ca-build --log-file="$ns/results/ca-build.log" \
-      --trs-file="$ns/results/ca-build.trs" --brief=yes --color-tests=no \
-      -- "$root/tests/ca-build.scm" > "$ns/results/ca-build.out" 2>&1
-    echo "CA_BUILD_RC=$?"
-    kill $dpid 2>/dev/null; wait $dpid 2>/dev/null
-  '
+    # Job isolation: the uid/gid maps are installed, so enter a PRIVATE PID
+    # namespace before the daemon starts.  A daemon kills every process of a
+    # build user before a build and those uids come from the host range, so
+    # without this the kill(-1) of one job reaches the builders of another.
+    exec unshare --pid --fork --kill-child -- bash "$0" "$@"
+  ' "$here/ca-deep-scan-installed-part.sh" "$ns" "$root" "$hs_daemon" \
+    "$guile_bin" "$dev_glp" "$dev_glcp" "$pkg_glp" "$pkg_glcp"
 run_rc=$?
 trs="$work/HS/results/ca-build.trs"
 pass=$(grep -c ":test-result: PASS" "$trs" 2>/dev/null); pass=${pass:-0}

@@ -129,7 +129,11 @@ EXTRA_DIST += \
   daemon/test/differential/socket-query.c \
   daemon/test/differential/builtin-ci.sh daemon/test/differential/builtin-ci.scm \
   daemon/test/differential/ca-counted-gate.sh \
+  daemon/test/differential/ca-counted-gate-part.sh \
   daemon/test/differential/ca-deep-scan-installed.sh \
+  daemon/test/differential/ca-deep-scan-installed-part.sh \
+  daemon/test/differential/root-ci-part.sh \
+  daemon/test/differential/pidns-guard.sh daemon/test/differential/pidns-isolation.sh \
   daemon/sandbox/README.md daemon/sandbox/guix-sandbox.cc \
   daemon/sandbox/Makefile daemon/test/lib.sh daemon/test/seed-restore.scm \
   daemon/test/sandbox-helper-cleanup.sh daemon/test/sandbox-helper-cleanup.scm \
