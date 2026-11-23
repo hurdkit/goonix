@@ -540,6 +540,11 @@ void rewriteTreeForTest(const Path & path, const string & from, const string & t
    read-boundary retention is only observable through the whole walk. */
 void checkReservedTreeForTest(const Path & path);
 
+/* goonix: expose the inverse-tree hash so a test can compare the verification
+   digest itself, including its streaming boundary and sibling ordering. */
+string inverseTreeForTest(const Path & path, const string & finalHash,
+    const string & tokenHash, const std::map<Path, Path> & siblings);
+
 string encodeReservedForTest(const Hash & digest, bool token)
 {
     return encodeReserved(digest, token);
@@ -750,6 +755,12 @@ static string inverseTree(const Path & path, const string & final,
         return printHash(hashString(htSHA256, encoding));
     }
     throw Error(std::format("unsupported file type in CA tree `{}'", path));
+}
+
+string inverseTreeForTest(const Path & path, const string & finalHash,
+    const string & tokenHash, const std::map<Path, Path> & siblings)
+{
+    return inverseTree(path, finalHash, tokenHash, siblings);
 }
 
 /* goonix: compare the inverse tree without writing to an existing store item. */
