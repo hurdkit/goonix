@@ -1105,7 +1105,12 @@ lower-inputs' shape and native? handling."
         (thing
          (mlet %store-monad ((obj (lower-object thing system
                                                 #:target target)))
-           (return (and (derivation? obj) (derivation-input obj)))))))
+           ;; A package named WITHOUT an output means its "out" output, not
+           ;; every output.  (derivation-input obj) defaults to ALL outputs,
+           ;; which is how bash-static picked up "doc" and changed an
+           ;; input-addressed graph.
+           (return (and (derivation? obj)
+                        (derivation-input obj (list "out"))))))))
     (mlet %store-monad ((inputs (mapm/accumulate-builds
                                 lower (append (or allowed '())
                                               (or disallowed '())))))
@@ -1376,14 +1381,28 @@ The other arguments are as for 'derivation'."
                                                          #:system system
                                                          #:target target)
                                        (return #f)))
-                       ;; goonix: reference-list outputs are required inputs.
-                       (ref-inputs (goonix-reference-inputs
-                                    allowed-references disallowed-references
-                                    system target))
                        (guile -> (lowered-gexp-guile lowered))
                        (addressing -> ((module-ref (resolve-module '(guix ca policy)) 'gexp-addressing)
                                        addressing (lowered-gexp-guile lowered)
                                        (lowered-gexp-inputs lowered) graphs allowed disallowed)) ;goonix: actual inputs and references
+                       ;; goonix: reference-list outputs are required inputs,
+                       ;; but ONLY for a CA derivation.  An input-addressed
+                       ;; derivation has real paths in its reference lists and
+                       ;; needs nothing; requesting extra outputs there would
+                       ;; change its .drv and output path and lose upstream
+                       ;; substitutes (measured: glibc-final's drv moved from
+                       ;; upstream's w189hhbh… to 256qrzh1…).  Upstream's
+                       ;; input-addressed graph must stay byte-identical.
+                       ;;
+                       ;; This MUST come after the addressing binding above:
+                       ;; that one shadows the requested parameter with the
+                       ;; kind actually chosen from the lowered inputs, which
+                       ;; is the one that decides whether placeholders exist.
+                       (ref-inputs (if (eq? addressing 'input)
+                                       (return '())
+                                       (goonix-reference-inputs
+                                        allowed-references disallowed-references
+                                        system target)))
                        (builder-text -> (sexp->string
                                          (lowered-gexp-sexp lowered))) ;goonix: builder text
                        (builder  (if (eq? addressing 'input)
