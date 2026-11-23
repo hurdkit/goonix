@@ -111,10 +111,15 @@ run_daemon() {
       if ! test -S /var/guix/daemon-socket/socket; then
         echo "DAEMON DID NOT START ($label)"; head -20 "$ns/daemon.log"; kill $dpid 2>/dev/null; exit 2
       fi
-      # Client environment: the INSTALLED package modules first, then the
-      # worktree (for the gitignored bootstrap binaries search-bootstrap-binary
-      # reads from gnu/packages/bootstrap/i686-linux), then dev-shell deps.
-      # NIX_STORE_DIR=/gnu/store matches the daemon; the socket is the
+      # Client environment: the WORKTREE first on the load path (exactly as
+      # pre-inst-env: builddir:srcdir:$GUILE_LOAD_PATH), then the installed
+      # package modules, then dev-shell deps.  Worktree-first is required so
+      # gnu/packages/bootstrap.scm resolves from the worktree, where the
+      # gitignored bootstrap binaries (bash/mkdir) live; the package ships no
+      # bootstrap dir and is read-only, so search-bootstrap-binary would try to
+      # write the built binary into the nix store and fail.  The daemon under
+      # test is still the INSTALLED package; only the client modules load this
+      # way.  NIX_STORE_DIR=/gnu/store matches the daemon; the socket is the
       # configure-time /var/guix/daemon-socket/socket.
       client_env() {
         env -i LC_ALL=C.UTF-8 PATH=/nonexistent HOME="$ns" \
@@ -126,8 +131,8 @@ run_daemon() {
           GUIX_BINARY_SUBSTITUTE_URL="file://$ns/substituter-data" \
           GUIX_ALLOW_UNAUTHENTICATED_SUBSTITUTES=yes \
           GOONIX_SCAN_REAL_STORE="$fixture" \
-          GUILE_LOAD_PATH="$pkg_glp:$root:$dev_glp" \
-          GUILE_LOAD_COMPILED_PATH="$pkg_glcp:$dev_glcp" \
+          GUILE_LOAD_PATH="$root:$pkg_glp:$dev_glp" \
+          GUILE_LOAD_COMPILED_PATH="$root:$pkg_glcp:$dev_glcp" \
           GUILE_AUTO_COMPILE=0 \
           "$@"
       }
