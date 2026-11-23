@@ -37,14 +37,30 @@ import System.Environment (getArgs)
 import System.Exit (exitFailure)
 import System.IO (hPutStrLn, stderr)
 
--- A's hold time before committing, and the wall budget for the allocating loop.
--- The loop budget is well under A's hold (2s) plus B's busy_timeout (60s): if the
--- process is frozen at a GC the loop cannot finish inside it.
+-- A's hold time before committing.
 holdMicros :: Int
 holdMicros = 2000000
 
-loopBudgetSeconds :: Double
-loopBudgetSeconds = 1.5
+-- The allocating loop's budget is RELATIVE to this host, not an absolute wall
+-- number.  The property is liveness: while A holds the write lock and B sleeps
+-- in its busy handler, the RTS must still be able to run a pure allocating
+-- thread.  A held capability freezes it; a slow or loaded host merely takes
+-- longer.  An absolute 1.5s bound conflated the two: on a 2-core box the same
+-- loop took 1.75s and FINISHED, and the fixed 200ms sample window then reported
+-- "DID NOT FINISH" for a loop that was still running - both read as the freeze
+-- class they are meant to detect.
+--
+-- So: measure the SAME loop uncontended first, then require the contended run
+-- to finish within a multiple of that, and WAIT for it rather than sampling
+-- once.  A real freeze does not finish at all inside the outer bound.
+loopSlowdownFactor :: Double
+loopSlowdownFactor = 8
+
+-- Outer bound on waiting for the contended loop.  A freeze never completes, so
+-- this only has to be long enough that a slow host can finish; it is not the
+-- pass criterion, the relative budget is.
+loopWaitSeconds :: Double
+loopWaitSeconds = 60
 
 -- A pure allocating loop: builds a fresh list each iteration so the nursery
 -- (-A1m) fills and GC runs often.  Returns a checksum so it cannot be optimised
@@ -61,6 +77,16 @@ main = do
   let dbPath = case args of
         (p : _) -> p
         [] -> "/tmp/sqlite-contention-regression.sqlite"
+  -- Baseline: the SAME loop with no lock held and no busy handler, on THIS
+  -- host.  The contended run is judged against it, so a slow machine is not
+  -- mistaken for a frozen one.
+  baseStart <- getMonotonicTime
+  let !baseChecksum = allocLoop 200000
+  unless (baseChecksum >= 0) (hPutStrLn stderr "impossible")
+  baseEnd <- getMonotonicTime
+  let baseSeconds = baseEnd - baseStart
+      loopBudgetSeconds = baseSeconds * loopSlowdownFactor
+
   -- Two independent handles to one WAL database, as two connections.
   a <- openReadWrite dbPath
   b <- openReadWrite dbPath
@@ -109,8 +135,16 @@ main = do
   -- if a capability were held in an unsafe call.
   bOutcome <- takeMVar bResult
   takeMVar aDone
-  -- Give the loop a moment to record its result if it finished.
-  threadDelay 200000
+  -- WAIT for the loop to record its result, up to the outer bound.  Sampling
+  -- once after a fixed 200ms reported "DID NOT FINISH" for a loop that was
+  -- merely still running on a slow host, which is the freeze signal.
+  let waitForLoop :: Int -> IO ()
+      waitForLoop n = do
+        finished <- readIORef loopDone
+        if finished || n >= (round (loopWaitSeconds * 10) :: Int)
+          then pure ()
+          else threadDelay 100000 >> waitForLoop (n + 1)
+  waitForLoop 0
   lDone <- readIORef loopDone
   lSecs <- readIORef loopSeconds
 
@@ -127,6 +161,9 @@ main = do
           Just _ -> False
           Nothing -> False
   hPutStrLn stderr ("B insert: " ++ either show (const "ok") bOutcome)
+  hPutStrLn stderr ("uncontended loop: " ++ show baseSeconds ++ "s (this host's baseline)")
+  hPutStrLn stderr ("loop budget: " ++ show loopBudgetSeconds ++ "s ("
+    ++ show loopSlowdownFactor ++ "x baseline)")
   hPutStrLn stderr ("allocating loop: " ++ (if lDone then show lSecs ++ "s" else "DID NOT FINISH"))
   hPutStrLn stderr ("rows: " ++ show rows)
 
