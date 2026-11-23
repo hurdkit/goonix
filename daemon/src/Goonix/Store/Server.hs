@@ -26,6 +26,7 @@ import qualified Data.ByteString.Char8 as C
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import qualified Data.Set as Set
 import Data.Word (Word32, Word64)
+import Goonix.Store.GuixProgram (absPath)
 import Goonix.Store.Database (Value (Bytes))
 import Goonix.Store.Base32 (encodeBase16)
 import Goonix.Store.Config (ServerConfig (..), defaultConfig)
@@ -252,7 +253,11 @@ dispatch config store client settingsRef rootFd rootPath clientVersion operation
     writeFrame client stderrLast
     writeSocket client (encodeInt 1)
   12 -> do
-    path <- readStringSocket client
+    -- C++ wopAddIndirectRoot: `Path path = absPath(readString(from))'.  The
+    -- auto root's name is SHA1 of THIS string, so an uncanonicalised value
+    -- registers a second root under a different name -- and that root does not
+    -- protect the item, because findRoots resolves the link the client made.
+    path <- readStringSocket client >>= absPath
     addIndirectRoot store path
     writeFrame client stderrLast
     writeSocket client (encodeInt 1)
