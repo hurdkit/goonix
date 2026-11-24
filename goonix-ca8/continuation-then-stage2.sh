@@ -39,8 +39,30 @@ say "LABEL: (a) is a CONTINUATION, not the counted gate (DECISIONS 57). Scratch 
 say "TIMEOUTS: continuation=${CONT_TIMEOUT}s (2 x measured 16800s), stage2=${STAGE2_TIMEOUT}s"
 
 # --- refuse 1: the original stage1 must have exited -------------------------
-if pgrep -f 'ca8-core-run\.sh stage1' >/dev/null 2>&1; then
-  say 'REFUSE: the 2565a86d63b stage1 is still running (ca8-core-run.sh stage1 present)'
+# Match a process that is ACTUALLY RUNNING the runner, not any command line that
+# merely mentions it.  `pgrep -f 'ca8-core-run\.sh stage1'` matched 11 processes
+# on this laptop while no stage1 was running at all: my own z2 submission tickets
+# (counted3, point1 v9) carry that string in their argv, because the remote
+# command is passed as arguments to z2run.sh.  A queued z2 ticket is not a local
+# stage1, and refusing on it would block this job forever.  So require the
+# runner to be the EXECUTED SCRIPT: argv[0] is a bash and argv[1] ends in
+# ca8-core-run.sh, with argv[2] = stage1.
+stage1_running() {
+  local p argv0 argv1 argv2
+  for p in /proc/[0-9]*; do
+    [ -r "$p/cmdline" ] || continue
+    { read -r -d '' argv0; read -r -d '' argv1; read -r -d '' argv2; } \
+      < "$p/cmdline" 2>/dev/null || continue
+    case "$argv0" in */bash|bash) ;; *) continue ;; esac
+    case "$argv1" in */ca8-core-run.sh|ca8-core-run.sh) ;; *) continue ;; esac
+    [ "$argv2" = stage1 ] || continue
+    printf '%s\n' "${p#/proc/}"
+    return 0
+  done
+  return 1
+}
+if pid=$(stage1_running); then
+  say "REFUSE: the 2565a86d63b stage1 is still running (runner pid $pid)"
   exit 1
 fi
 if pgrep -f 'timeout 28800 bash -c cd /home/wrath/goonix/.worktrees/goonix-implementation' >/dev/null 2>&1; then
