@@ -34,6 +34,29 @@ STAGE2_TIMEOUT=21600
 
 say() { printf '%s %s\n' "$(date '+%F %T')" "$*"; }
 
+# --- provenance: record the tree this job ACTUALLY runs ---------------------
+# The ticket's label ("from 8e5c41d4a2d") is only a label.  This script is
+# invoked by PATH with no rev pin, so bash reads whatever the worktree holds
+# when the lane is granted - which may be a later commit than the label names.
+# Without this line a stage2 verdict would name a commit it did not run.
+# Refuse on tracked changes: an uncommitted edit is not attributable to any
+# commit, and bash reads a script as it goes, so a mid-run edit could change
+# what the rest of this very file does.
+cd "$IMPL" || exit 1
+SOURCE_COMMIT=$(git rev-parse HEAD 2>/dev/null || echo unknown)
+TRACKED_CHANGES=$(git status --porcelain --untracked-files=no 2>/dev/null | wc -l)
+say "SOURCE_COMMIT=$SOURCE_COMMIT"
+say "TRACKED_CHANGES=$TRACKED_CHANGES"
+if [ "$SOURCE_COMMIT" = unknown ]; then
+  say 'REFUSE: cannot read HEAD; the run would not be attributable to a commit'
+  exit 1
+fi
+if [ "${TRACKED_CHANGES:-1}" -ne 0 ]; then
+  say "REFUSE: $TRACKED_CHANGES tracked change(s) in $IMPL; commit or revert them first"
+  git status --porcelain --untracked-files=no | head -10
+  exit 1
+fi
+
 say "QUEUED-AT=$(date '+%F %T') CA-8 CONTINUATION + stage2 (one job); scratch=$SCRATCH"
 say "LABEL: (a) is a CONTINUATION, not the counted gate (DECISIONS 57). Scratch REUSED, not wiped."
 say "TIMEOUTS: continuation=${CONT_TIMEOUT}s (2 x measured 16800s), stage2=${STAGE2_TIMEOUT}s"
