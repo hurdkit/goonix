@@ -3,11 +3,17 @@
 # entered by root-ci.sh after the uid/gid maps and the bind mounts are in place.
 #
 # Usage (from the runner): root-ci-part.sh WORK ROOT DAEMON MODE GITREV \
-#   PAYLOAD_HASH GIT_HASH DEV_GLP DEV_GLCP ROOT_CI_CLIENT
+#   PAYLOAD_HASH GIT_HASH DEV_GLP DEV_GLCP ROOT_CI_CLIENT SOCAT_BIN GIT_BIN
 set -uo pipefail
 work=${1:?work}; root=${2:?root}; daemon=${3:?daemon}; mode=${4:?mode}
 gitrev=${5:?gitrev}; payload_hash=${6:?payload}; git_hash=${7:?git}
 dev_glp=${8:-}; dev_glcp=${9:-}; ROOT_CI_CLIENT=${10:-}
+# Absolute fixture-tool paths the runner resolved in the DEV SHELL.  Bare
+# `socat'/`git' here depended on whatever PATH the host gave the job: without
+# socat the HTTP fixture never started and builtin:download failed with
+# "Connection refused", which read as a daemon defect.  The runner refuses to
+# start when either is missing, so these are non-empty by construction.
+socat_bin=${11:?socat path from the runner}; git_bin=${12:?git path from the runner}
 
 # Job isolation check: refuse to start the daemon outside a private PID
 # namespace (one job's build-user kill(-1) must not reach another's builders).
@@ -16,11 +22,11 @@ dev_glp=${8:-}; dev_glcp=${9:-}; ROOT_CI_CLIENT=${10:-}
 # Local servers for the builtins (they refuse file:// URLs): HTTP for
 # builtin:download, git:// for builtin:git-download.  Loopback is shared
 # with the host (no network namespace), so the daemon reaches them.
-socat TCP-LISTEN:18080,reuseaddr,fork \
+"$socat_bin" TCP-LISTEN:18080,reuseaddr,fork \
   EXEC:"$root/daemon/test/differential/root-ci-http.sh $work/payload.txt" \
   > "$work/http.log" 2>&1 &
 http_pid=$!
-git daemon --base-path="$work/gitrepo" --export-all --reuseaddr \
+"$git_bin" daemon --base-path="$work/gitrepo" --export-all --reuseaddr \
   --listen=127.0.0.1 --port=19418 "$work/gitrepo" > "$work/gitd.log" 2>&1 &
 gitd_pid=$!
 sleep 1

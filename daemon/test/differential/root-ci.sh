@@ -25,6 +25,30 @@ work=/tmp/pr6-root-ci/$label
 uid=$(id -u)
 gid=$(id -g)
 
+# --- fixture-tool preflight, BEFORE anything is set up or started ---
+# root-ci-part.sh runs `socat TCP-LISTEN' for builtin:download and `git daemon'
+# for builtin:git-download.  Taking them from the host PATH made the gate depend
+# on the machine: on zergling2 socat was absent, the HTTP fixture never started,
+# and the builder's "Connection refused" was reported as a daemon FAIL.  Resolve
+# them in the DEV SHELL (flake.nix provides socat and git) and refuse to run at
+# all when either is missing, the same way the pidns guard refuses with exit 3.
+fixture_tools=$(cd "$root" && nix develop .#default -c bash -c '
+  for t in socat git; do
+    p=$(command -v "$t" 2>/dev/null) || p=
+    printf "%s=%s\n" "$t" "$p"
+  done')
+socat_bin=$(printf '%s\n' "$fixture_tools" | sed -n 's/^socat=//p')
+git_bin=$(printf '%s\n' "$fixture_tools" | sed -n 's/^git=//p')
+for pair in "socat:$socat_bin" "git:$git_bin"; do
+  tool=${pair%%:*}
+  path=${pair#*:}
+  if test -z "$path" || test ! -x "$path"; then
+    echo "root-ci: MISSING FIXTURE TOOL $tool (not in the dev shell); refusing to run a gate whose fixture cannot start" >&2
+    exit 3
+  fi
+done
+echo "fixture tools: socat=$socat_bin git=$git_bin"
+
 bash "$here/root-ci-setup.sh" "$daemon" "$label" || exit 1
 daemon=$(readlink -f "$daemon")
 gitrev=$(cat "$work/gitrev")
@@ -48,6 +72,7 @@ timeout 300 unshare --user \
     work="'"$work"'"; root="'"$root"'"; daemon="'"$daemon"'"; mode="'"$mode"'"
     gitrev="'"$gitrev"'"; payload_hash="'"$payload_hash"'"; git_hash="'"$git_hash"'"
     dev_glp="'"$dev_glp"'"; dev_glcp="'"$dev_glcp"'"; ROOT_CI_CLIENT="'"${ROOT_CI_CLIENT:-}"'"
+    socat_bin="'"$socat_bin"'"; git_bin="'"$git_bin"'"
     mount --bind "$work/etc/passwd" /etc/passwd
     mount --bind "$work/etc/group" /etc/group
     mount --bind "$work/etc/nsswitch.conf" /etc/nsswitch.conf
@@ -77,7 +102,8 @@ timeout 300 unshare --user \
     case "$part_bash" in /bin/*) part_bash=$(command -v bash) ;; esac
     exec unshare --pid --fork --kill-child -- "$part_bash" "$0" "$@"
   ' "$here/root-ci-part.sh" "$work" "$root" "$daemon" "$mode" "$gitrev" \
-    "$payload_hash" "$git_hash" "$dev_glp" "$dev_glcp" "${ROOT_CI_CLIENT:-}"
+    "$payload_hash" "$git_hash" "$dev_glp" "$dev_glcp" "${ROOT_CI_CLIENT:-}" \
+    "$socat_bin" "$git_bin"
 rc=$?
 echo "root-ci[$label] rc=$rc"
 exit $rc

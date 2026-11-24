@@ -163,7 +163,13 @@
       devShells = forAllSystems (pkgs: {
         default = pkgs.mkShell {
           inputsFrom = [ (mkGoonix pkgs) ];
-          packages = [ pkgs.age pkgs.openssh ];
+          # age/openssh for the build; socat and git are FIXTURE tools the
+          # root-ci gate needs (root-ci-part.sh runs `socat TCP-LISTEN' for
+          # builtin:download and `git daemon' for builtin:git-download).
+          # Without them here the gate depends on the host PATH: on zergling2
+          # socat was absent, the HTTP fixture never started, and the builder's
+          # "Connection refused" read as a daemon FAIL.
+          packages = [ pkgs.age pkgs.openssh pkgs.socat pkgs.git ];
 
           # The bootstrap Guile 2.0 scripts in tests/gexp.scm must not load
           # Guile 3.0's own ice-9/boot-9.go.  Keep the Guile libraries'
