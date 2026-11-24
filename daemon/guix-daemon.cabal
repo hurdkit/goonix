@@ -35,6 +35,11 @@ library
         Goonix.Store.Archive
         Goonix.Store.Collector
         Goonix.Store.GuixProgram
+        Goonix.Store.Ca
+        Goonix.Store.CaBuild
+        Goonix.Store.CaStore
+        Goonix.Store.DeepScan
+        Goonix.Store.Records
         Goonix.Build.Engine
         Goonix.Build.Offload
         Goonix.Build.Seccomp
