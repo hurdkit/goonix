@@ -30,6 +30,25 @@ fi
 stage=${1:?stage name}
 script=${2:?scheme file}
 
+# The scratch path MUST be absolute, and this is checked HERE - at the top,
+# before the prepare build, before any daemon, in seconds rather than after 39
+# minutes of compiling.  Every scratch-derived path below is interpolated into
+# the namespace script verbatim and the daemon validates them: given a relative
+# scratch it exits with
+#   error: not an absolute path: `.scratch/<name>/log'
+# so it never listens, the 10 s socket wait gives up, and guile reports
+#   &store-connection-error file: ".scratch/<name>/socket" errno: 2
+# which reads like a daemon crash rather than a bad argument.  Measured on
+# z2-ca8-stage1-counted2: STAGE=stage1 EXIT=1, 0 store items, 0 build events,
+# stage1.out empty, and that one line in daemon-stage1.log.  Refuse instead of
+# silently resolving: the caller meant a specific tree, and guessing which one
+# (this worktree? its cwd?) could wipe or write the wrong store.
+case "${GOONIX_CA8_SCRATCH:-$IMPL/.scratch/ca8-core}" in
+  /*) ;;
+  *) echo "REFUSE: GOONIX_CA8_SCRATCH must be an absolute path, not '${GOONIX_CA8_SCRATCH}' (the daemon rejects relative paths)" >&2
+     exit 1 ;;
+esac
+
 # goonix: a gate must run on a COMPILED tree.  This runner starts guile with
 # --no-auto-compile, so an unbuilt tree is interpreted - a different load path
 # that can fail on upstream macro hygiene (jq/oniguruma, DECISIONS 37).  Refuse
@@ -61,6 +80,7 @@ if ! unshare --user --map-root-user --mount true 2>/dev/null; then
 fi
 
 scratch=${GOONIX_CA8_SCRATCH:-$IMPL/.scratch/ca8-core}
+# Absolute-path guard already ran at the top of this script, before prepare.
 
 # GOONIX_CA8_FRESH=1 makes this the COUNTED run: the gate's claim is that the
 # seeds and the ladder build content-addressed FROM A WIPED STORE, so a run
