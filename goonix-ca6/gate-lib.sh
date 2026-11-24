@@ -85,3 +85,37 @@ goonix_gate_exit() {
   echo "GATE_EXIT=$verdict"
   exit "$verdict"
 }
+
+# goonix_stage_running STAGE
+#
+# Print the pid of a process that is ACTUALLY EXECUTING
+# `bash .../ca8-core-run.sh STAGE ...`, and return 0; return 1 when there is none.
+#
+# Do NOT use `pgrep -f 'ca8-core-run\.sh stage1'` for this.  Measured on the
+# laptop: it matches my own z2 submission tickets, because z2run.sh takes the
+# remote command as ARGUMENTS, so the runner string sits in the argv of the
+# heavy-turn ticket, its launcher and the z2run wrapper.  A queued z2 ticket is
+# not a local stage1.  With the pgrep form, goonix-ca8/stage2-gate-after-stage1.sh
+# REFUSED on 2026-11-24 07:11:28 with no stage1 running at all - the three matches
+# were the counted3 ticket, its launcher and its z2run wrapper.  The same trap was
+# first fixed in continuation-then-stage2.sh (744ca029b21); this is the shared
+# form, so a third caller does not reintroduce it.
+#
+# argv[0] must be a bash, argv[1] must end in ca8-core-run.sh, argv[2] must be
+# exactly the requested stage.  A string buried in another command's arguments
+# cannot satisfy that.
+goonix_stage_running() {
+  local want=${1:?stage name required}
+  local p argv0 argv1 argv2
+  for p in /proc/[0-9]*; do
+    [ -r "$p/cmdline" ] || continue
+    { read -r -d '' argv0; read -r -d '' argv1; read -r -d '' argv2; } \
+      < "$p/cmdline" 2>/dev/null || continue
+    case "$argv0" in */bash|bash) ;; *) continue ;; esac
+    case "$argv1" in */ca8-core-run.sh|ca8-core-run.sh) ;; *) continue ;; esac
+    [ "$argv2" = "$want" ] || continue
+    printf '%s\n' "${p#/proc/}"
+    return 0
+  done
+  return 1
+}

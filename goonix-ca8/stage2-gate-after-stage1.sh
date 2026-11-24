@@ -30,9 +30,12 @@ say() { printf '%s %s\n' "$(date '+%F %T')" "$*"; }
 say "QUEUED-AT=$(date '+%F %T') stage2 toolchain gate; scratch=$SCRATCH"
 
 # --- refuse 1: stage1 must have exited -------------------------------------
-# Match the runner and its timeout wrapper, not this script.
-if pgrep -f 'ca8-core-run\.sh stage1' >/dev/null 2>&1; then
-  say 'REFUSE: stage1 is still running (ca8-core-run.sh stage1 present)'
+# Match the runner and its timeout wrapper, not this script.  The pgrep form
+# matched my own z2 tickets and refused on 2026-11-24 07:11:28 with no stage1
+# running; use the shared argv-shape detector (goonix-ca6/gate-lib.sh).
+source "$(dirname "${BASH_SOURCE[0]}")/../goonix-ca6/gate-lib.sh"
+if pid=$(goonix_stage_running stage1); then
+  say "REFUSE: stage1 is still running (runner pid $pid)"
   exit 1
 fi
 if pgrep -f 'timeout 28800 bash -c cd /home/wrath/goonix/.worktrees/goonix-implementation' >/dev/null 2>&1; then
