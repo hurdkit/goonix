@@ -62,14 +62,36 @@ printf 7 > "$work/var-guix/db/schema"
 # --- the guix client the daemon resolves via the configured bindir (/bin/guix) ---
 # Bind-mount a scratch /bin holding guix + sh (the host /bin has sh but no guix).
 # Only the worktree mode bind-mounts this /bin; the installed (CI-like) package
-# resolves its own helpers.  sh comes from the caller's PATH, not a store path.
+# resolves its own helpers.
+#
+# The entries must NOT point back into the directory the bind replaces.  On a
+# merged-/usr host (Ubuntu, WSL) /bin is a SYMLINK to usr/bin, so binding over
+# /bin lands on /usr/bin: an entry pointing at /usr/bin/bash then resolves to
+# itself and exec fails with ELOOP ("Too many levels of symbolic links", exit
+# 126).  `command -v bash` yields exactly that host path when the caller is not
+# inside the dev shell.  Resolve to the real file instead: readlink -f gives a
+# store path for a dev-shell tool, which stays reachable because /nix/store is
+# bind-mounted into the namespace and is never the bind target.
+#
+# Refuse a target that still lives under the replaced directory rather than
+# create a link that cannot resolve.
+link_outside_bin() { # name resolved-target
+  local name=$1 target=$2
+  target=$(readlink -f "$target" 2>/dev/null || printf '%s' "$target")
+  case "$target" in
+    /bin/*|/usr/bin/*)
+      echo "root-ci-setup: $name resolves to $target, inside the directory the scratch /bin replaces; run inside the dev shell so it resolves to a store path" >&2
+      return 1;;
+  esac
+  ln -sf "$target" "$work/bin/$name"
+}
 cp "$root/scripts/guix" "$work/bin/guix"
 chmod +x "$work/bin/guix"
-ln -sf "$(command -v sh)" "$work/bin/sh"
+link_outside_bin sh "$(command -v sh)" || exit 1
 # bash too: the runner execs the PID-namespace part with bash AFTER this
 # scratch /bin is bind-mounted over /bin, so a bare `bash` (or $BASH=/bin/bash
 # on a merged-usr host) would be hidden.  Link the real one in.
-ln -sf "$(command -v bash)" "$work/bin/bash"
+link_outside_bin bash "$(command -v bash)" || exit 1
 
 # --- a local git repo for builtin:git-download ---
 git init -q "$work/gitrepo"
