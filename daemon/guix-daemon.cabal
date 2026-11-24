@@ -41,6 +41,7 @@ library
         Goonix.Store.DeepScan
         Goonix.Store.Records
         Goonix.Build.Engine
+        Goonix.Build.Graph
         Goonix.Build.Offload
         Goonix.Build.Seccomp
         Goonix.Build.Runtime

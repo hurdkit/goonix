@@ -146,6 +146,10 @@ runScheduledShared shared slots downloadSlots keepGoing discover initialSpecs ca
               -- release slots.  Released once acquired, even if the job fails.
               result <- case rtShared runtime of
                 Nothing -> try (jobRun spec (jobWanted spec))
+                Just shared | jobKind spec == GraphJob ->
+                  -- A graph goal is not a build goal: it must not occupy the
+                  -- daemon-wide slot while another derivation builds.
+                  try (jobRun spec (jobWanted spec))
                 Just shared -> do
                   acquireSlot shared
                   (try (jobRun spec (jobWanted spec))) `finally` releaseSlot shared

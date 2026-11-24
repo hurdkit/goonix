@@ -24,7 +24,7 @@ import Control.Monad (foldM)
 -- connections. Download slots default to the build slots, as in C++.
 type JobId = ByteString
 
-data JobKind = BuildJob | DownloadJob deriving (Eq, Ord, Show)
+data JobKind = BuildJob | DownloadJob | GraphJob deriving (Eq, Ord, Show)
 data Status = Waiting | Running | Succeeded | Failed | Blocked
   deriving (Eq, Ord, Show)
 
@@ -91,7 +91,7 @@ step event state = schedule $ case event of
 schedule :: State -> (State, [Action])
 schedule state =
   let candidates = [name | name <- jobOrder state, Just job <- [Map.lookup name (jobs state)], status job == Waiting,
-        all (succeeded state) (dependencies job)]
+        kind job == GraphJob || all (succeeded state) (dependencies job)]
       (chosen, _) = choose state [] candidates
       state' = state { jobs = foldl (\js name -> Map.adjust (\job -> job { status = Running }) name js) (jobs state) chosen }
       failedDependents = [name | (name, job) <- Map.toList (jobs state'), status job == Waiting,
@@ -111,9 +111,11 @@ schedule state =
       let job = jobs current Map.! name
           builds = runningCount current BuildJob
           downloads = runningCount current DownloadJob
-      in if separateDownloads current && kind job == DownloadJob
-        then downloads < maybe 0 id (downloadSlots current)
-        else builds + downloads < slots current
+      in if kind job == GraphJob
+        then True  -- A graph lookup holds no build slot (C++ Goal::key).
+        else if separateDownloads current && kind job == DownloadJob
+          then downloads < maybe 0 id (downloadSlots current)
+          else builds + downloads < slots current
 
     start current name =
       let job = jobs current Map.! name

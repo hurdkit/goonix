@@ -71,6 +71,7 @@ SCM_TESTS +=					\
 SH_TESTS +=					\
   build-aux/check-goonix-hooks.sh		\
   tests/guix-ca-async.sh			\
+  tests/ca-async-lifecycle.sh			\
   tests/guix-ca-two-store.sh			\
   tests/guix-ca-files.sh			\
   tests/guix-ca-second-machine.sh		\

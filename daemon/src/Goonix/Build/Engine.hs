@@ -71,6 +71,7 @@ import Foreign.Ptr (Ptr, castPtr, nullPtr)
 import Foreign.Storable (peek)
 import Goonix.Build.Sandbox
 import Goonix.Build.Runtime (JobSpec (..), Outcome (..), runScheduled, runScheduledWithCancel, runScheduledShared)
+import Goonix.Build.Graph (runGraphLookup)
 import Goonix.Build.Scheduler (JobKind (..))
 import Goonix.Build.Shared (raiseLimit, withGoal)
 import Goonix.Build.Offload
@@ -129,7 +130,18 @@ buildThingsInternal config rootFd store settings trace hook things mode cancel =
   -- mode with redirected outputs (re-downloading fixed-output inputs, rebuilding
   -- the whole input closure), which C++ never does.
   let inputMode = if mode == Repair then Repair else Normal
+  -- HS-11: graph lookups are separate jobs and hold no build slot.  Their CA
+  -- dependent waits while another top goal can build, as C++ addWaitee does.
   let discover jobMode path wanted role = case role of
+        GraphJob -> pure JobSpec
+          { jobId = path, jobWanted = wanted, jobKind = GraphJob
+          , jobRun = \_ -> do
+              let actualPath = B.take (B.length path - B.length "\0graph") path
+              case config of
+                Just serverConfig -> runGraphLookup settings (configGuixProgram serverConfig)
+                  actualPath (C.words (setting "substitute-urls" "" settings)) (traceOutput trace)
+                Nothing -> pure ()
+              pure Done }
         DownloadJob -> pure JobSpec
           { jobId = path, jobWanted = wanted, jobKind = DownloadJob
           , jobRun = \_ -> do
@@ -237,8 +249,20 @@ buildDerivation attemptedDownloads discover config rootFd store settings trace h
     -- inputs first (C++ goonixRealiseInputsFirst clears wantedOutputs), then
     -- resolves to a resolved derivation and re-enters the goal machinery on it.
     buildCaDerivation drvPath drv
-      | not (resolvedDerivation (Map.lookup "goonixResolved" (environment drv))) =
-          pure (Need [(input, Set.empty, BuildJob) | input <- Map.keys (inputDrvs drv)])
+      | not (resolvedDerivation (Map.lookup "goonixResolved" (environment drv))) = do
+          -- C++ goonixHaveDerivation requests records only for a TOP CA goal
+          -- with substitutes enabled and a wanted output missing
+          -- (build-goonix.inc:26-45).  `requested' is empty for a top goal and
+          -- non-empty for a discovered input.
+          missing <- if Set.null wanted
+            then or <$> mapM (fmap not . isValidPath store . outputPath) (Map.elems (outputs drv))
+            else or <$> mapM (fmap not . isValidPath store . outputPath)
+              (Map.elems (Map.restrictKeys (outputs drv) wanted))
+          let graph = if Set.null wanted && missing && mode == Normal
+                && settingBool "build-use-substitutes" False settings && maybe False (const True) config
+                then [(drvPath <> "\0graph", Set.empty, GraphJob)]
+                else []
+          pure (Need (graph ++ [(input, Set.empty, BuildJob) | input <- Map.keys (inputDrvs drv)]))
       | otherwise = do
           -- A resolved derivation: select the realised outputs from the records.
           prepared <- prepareResolvedCaBuild drvPath drv

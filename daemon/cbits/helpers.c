@@ -75,6 +75,19 @@ int goonix_kill_user(uid_t uid, char *diag, size_t diag_len)
   return -1;
 }
 
+/* Observe a child's exit without reaping it.  The graph-helper reaper marks
+   its process as no longer signalable between this call and waitpid.  WNOWAIT
+   keeps the zombie and its pid allocated during that transition, so the
+   deadline thread cannot signal a pid that has already been reaped. */
+int goonix_waitid_nowait(pid_t pid)
+{
+  siginfo_t info;
+  while (waitid(P_PID, (id_t)pid, &info, WEXITED | WNOWAIT) < 0) {
+    if (errno != EINTR) return -1;
+  }
+  return 0;
+}
+
 int goonix_spawn_sandbox(const char *program, const char *plan,
                         int log_fd, int *pid_out)
 {
