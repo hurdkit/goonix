@@ -1,0 +1,1024 @@
+;;; goonix: mixed package policy and builders embedded at lowering.
+(use-modules (guix)
+             (guix tests)
+             (guix ca)
+             (guix ca policy)
+             (guix ca scan)
+             (guix sets)
+             (guix derivations)
+             (guix gexp)
+             (guix serialization)
+             (guix build-system trivial)
+             ((guix build utils) #:select (mkdir-p delete-file-recursively))
+             (gcrypt hash)
+             (gnu packages base)
+             (gnu packages bootstrap)
+             (ice-9 binary-ports)
+             (ice-9 textual-ports)
+             (ice-9 match)
+             (srfi srfi-1)
+             (srfi srfi-64))
+
+(test-begin "ca-policy")
+(define store (open-connection-for-tests))
+(%graft? #f)
+
+(define (addressing drv)
+  (assoc-ref (derivation-builder-environment-vars drv) "goonixAddressing"))
+
+(define (bytes drv)
+  (call-with-input-file (derivation-file-name drv) get-bytevector-all #:binary #t))
+
+(define upstream-hello (package-derivation store hello))
+(define hello-bytes (bytes upstream-hello))
+(define inherited-hello (package (inherit hello)))
+
+(define (mixed store package)
+  (parameterize ((%package-addressing-policy 'mixed))
+    (package-derivation store package)))
+
+(define (closure-alist table)
+  (sort (hash-map->list cons table)
+        (lambda (left right) (string<? (car left) (car right)))))
+
+
+(define (derivation-closure drv)
+  (let ((table (make-hash-table)))
+    (let visit ((d drv))
+      (unless (hash-ref table (derivation-file-name d))
+        (hash-set! table (derivation-file-name d)
+                   (call-with-input-file (derivation-file-name d)
+                     get-bytevector-all))
+        (for-each (lambda (input)
+                    (visit (derivation-input-derivation input)))
+                  (derivation-inputs d))))
+    table))
+
+(define (dependency-closure drv)
+  (let ((table (derivation-closure drv)))
+    (hash-remove! table (derivation-file-name drv))
+    table))
+
+(test-group "the default origin marker recognizes upstream definitions"
+  (test-assert "hello is upstream" (upstream-package? hello))
+  (test-assert "an inherited package in tests is not upstream"
+    (not (upstream-package? inherited-hello)))
+  (test-assert "a runtime bootstrap package retains its upstream origin"
+    (upstream-package? %bootstrap-coreutils&co)))
+
+(test-group "fresh mixed lowering preserves the upstream graph"
+  (let ((reference (open-connection-for-tests)))
+    (let ((input (package-derivation reference hello)))
+      (close-connection reference)
+      (let ((fresh (open-connection-for-tests)))
+        (let ((actual (mixed fresh hello)))
+          (close-connection fresh)
+          (test-equal "fresh mixed hello derivation is byte-identical"
+            hello-bytes (bytes actual))
+          (test-equal "every hello dependency is byte-identical"
+            (closure-alist (derivation-closure input))
+            (closure-alist (derivation-closure actual))))))))
+
+(test-group "fresh mixed inherited hello is content-addressed"
+  (let ((fresh (open-connection-for-tests)))
+    (let ((actual (mixed fresh inherited-hello)))
+      (close-connection fresh)
+      (test-equal "inherited hello is content-addressed without selection"
+        "content" (addressing actual))
+      (test-assert "inherited hello differs from upstream hello"
+        (not (string=? (derivation-file-name upstream-hello)
+                       (derivation-file-name actual))))
+      (let* ((dependent
+              (package (inherit inherited-hello)
+                (name "ca-policy-unselected-dependent")
+                (inputs (list (list "hello" inherited-hello)))))
+             (second (open-connection-for-tests))
+             (dependent-drv (mixed second dependent)))
+        (close-connection second)
+        (test-equal "an unselected dependent is content-addressed"
+          "content" (addressing dependent-drv))))))
+
+(test-group "shared origins and all their dependencies are order independent"
+  (let* ((snippet
+          (package (inherit hello) (name "ca-policy-upstream-snippet")
+            (source (origin (inherit (package-source hello))
+                            (snippet #~(begin #t))))))
+         (inherited (package (inherit snippet) (name "ca-policy-local-snippet")))
+         (marked? (let ((default (%upstream-package?)))
+                    (lambda (package)
+                      (or (eq? package snippet) (default package)))))
+         (mixed-marked (lambda (connection package)
+                         (parameterize ((%package-addressing-policy 'mixed)
+                                        (%upstream-package? marked?))
+                           (package-derivation connection package)))))
+    (for-each
+     (lambda (packages)
+       (let ((connection (open-connection-for-tests)))
+         (let ((derivations
+                (parameterize ((%package-addressing-policy 'mixed)
+                               (%upstream-package? marked?))
+                  (map (lambda (package) (package-derivation connection package))
+                       packages))))
+           (close-connection connection)
+           (test-equal "shared-origin upstream derivation is byte-identical in either order"
+             (bytes (package-derivation store snippet))
+             (bytes (if (eq? snippet (car packages))
+                        (car derivations) (cadr derivations)))))))
+     (list (list snippet inherited) (list inherited snippet)))
+    (let* ((upstream-reference (derivation-closure (package-derivation store snippet)))
+           (upstream-mixed
+            (let ((connection (open-connection-for-tests)))
+              (let ((result (derivation-closure (mixed-marked connection snippet))))
+                (close-connection connection) result)))
+           (local-drv
+            (let ((connection (open-connection-for-tests)))
+              (let ((result (mixed-marked connection inherited)))
+                (close-connection connection) result))))
+      (test-equal "upstream snippet package's whole graph is byte-identical"
+        (closure-alist upstream-reference) (closure-alist upstream-mixed))
+      (test-equal "local snippet package is content-addressed"
+        "content" (addressing local-drv))
+      (test-equal "local snippet package's upstream dependencies are byte-identical"
+        (closure-alist (dependency-closure (package-derivation store inherited)))
+        (closure-alist (dependency-closure local-drv))))))
+
+(define* (lower-gexp store name exp #:rest options)
+  (parameterize ((%package-addressing-policy 'mixed))
+    (let ((guile (package-derivation store %bootstrap-guile)))
+      (run-with-store store
+        (apply gexp->derivation name exp #:guile-for-build guile options)))))
+
+(define (fresh-lower . options)
+  (let ((connection (open-connection-for-tests)))
+    (let ((result (apply lower-gexp connection "ca-policy-graph"
+                         #~(mkdir #$output) options)))
+      (close-connection connection)
+      result)))
+
+(define* (trivial name builder #:optional (inputs '()) (properties '()))
+  (package
+    (name name)
+    (version "1")
+    (source #f)
+    (build-system trivial-build-system)
+    (arguments (list #:guile %bootstrap-guile #:builder builder))
+    (inputs inputs)
+    (properties properties)
+    (synopsis "CA policy test")
+    (description "CA policy test")
+    (home-page #f)
+    (license #f)))
+
+(test-group "mixed uses the graph for the requested system and target"
+  (let* ((opaque (trivial "ca-policy-marked-opaque" #~(mkdir #$output)
+                          '() '((self-references . opaque))))
+         (on-opaque (trivial "ca-policy-on-opaque" #~(symlink #$opaque #$output)
+                             `(("opaque" ,opaque))))
+         (foreign (trivial "ca-policy-foreign" #~(mkdir #$output)))
+         (system-package
+          (package (inherit (trivial "ca-policy-system" #~(mkdir #$output)))
+            (inputs (if (string=? (%current-system) "i686-linux")
+                        `(("foreign" ,foreign)) '()))))
+         (target-package
+          (package (inherit (trivial "ca-policy-target" #~(mkdir #$output)))
+            (inputs (if (%current-target-system) `(("foreign" ,foreign)) '())))))
+    (parameterize ((%package-addressing-policy 'mixed)
+                   (%upstream-package?
+                    (upstream-package-set
+                     (list->setq (list opaque on-opaque system-package
+                                       target-package %bootstrap-guile)))))
+      (test-equal "upstream dependent on opaque input is content-addressed"
+        "content" (addressing (package-derivation store on-opaque)))
+      (test-equal "i686-specific foreign input promotes its parent"
+        "content" (addressing (package-derivation store system-package
+                                                   "i686-linux")))
+      (test-equal "cross-target foreign input promotes its parent"
+        "content" (addressing (package-cross-derivation
+                               store target-package "aarch64-linux-gnu"))))))
+
+(define a
+  (trivial "ca-policy-a"
+           #~(call-with-output-file #$output
+               (lambda (port) (display "content from A\n" port)))))
+
+(define b
+  (trivial "ca-policy-b"
+           #~(call-with-output-file #$output
+               (lambda (port) (display #$a port)))
+           `(("a" ,a))))
+
+(test-group "reference graphs are classified from their actual values"
+  (test-assert "an upstream package graph stays input-addressed"
+    (not (addressing (fresh-lower #:references-graphs
+                                  `(("graph" ,%bootstrap-guile))))))
+  (let ((connection (open-connection-for-tests)))
+    (let ((item (add-text-to-store connection "ca-policy-store-item" "x")))
+      (test-assert "a store-item graph stays input-addressed"
+        (not (addressing (fresh-lower #:references-graphs
+                                      `(("graph" ,item))))))
+      (close-connection connection)))
+  (test-equal "a content-addressed package graph promotes its derivation"
+    "content" (addressing (fresh-lower #:references-graphs `(("graph" ,a))))))
+
+(test-group "reference lists and explicit requests are promoted by content inputs"
+  (test-equal "disallowed content-addressed reference promotes"
+    "content" (addressing (fresh-lower #:disallowed-references (list a))))
+  (test-equal "allowed content-addressed reference promotes"
+    "content" (addressing (fresh-lower #:allowed-references (list a))))
+  (let ((connection (open-connection-for-tests)))
+    (let ((actual (lower-gexp connection "ca-policy-explicit"
+                              #~(symlink #$a #$output) #:addressing 'input)))
+      (close-connection connection)
+      (test-equal "an explicit input request cannot hide a content input"
+        "content" (addressing actual)))))
+
+(test-group "the addressing cache includes the current mode on every call"
+  (let ((input (parameterize ((%package-addressing-policy 'input)
+                              (%upstream-package? (upstream-package-set (set))))
+                 (package-derivation store inherited-hello)))
+        (content (parameterize ((%package-addressing-policy 'content)
+                                (%upstream-package? (upstream-package-set (set))))
+                   (package-derivation store inherited-hello))))
+    (test-assert "the same package lowered under input then content differs"
+      (and (not (addressing input))
+           (string=? "content" (addressing content))
+           (not (string=? (derivation-file-name input)
+                          (derivation-file-name content)))))))
+
+(define opaque-a
+  (trivial "ca-policy-opaque-a"
+           #~(call-with-output-file #$output
+               (lambda (port) (display "resolved A\n" port)))
+           '() '((self-references . opaque))))
+
+(define opaque-b
+  (trivial "ca-policy-opaque-b"
+           #~(call-with-output-file #$output
+               (lambda (port) (display #$opaque-a port)))
+           `(("opaque-a" ,opaque-a))))
+
+(define (build-and-read package)
+  (let* ((fresh (open-connection-for-tests))
+         (drv (package-derivation fresh package)))
+    (close-connection fresh)
+    (build-derivations store (list drv))
+    (let* ((out (realised-output-path store drv "out"))
+           (text (call-with-input-file out get-string-all)))
+      (test-assert (string-append (package-name package) " embeds its builder")
+        (and (null? (derivation-sources drv))
+             (assoc-ref (derivation-builder-environment-vars drv) "__files")
+             (string-prefix? "$NIX_BUILD_TOP/"
+                             (last (derivation-builder-arguments drv)))))
+      (test-assert (string-append (package-name package) " has no placeholder in its output")
+        (not (placeholder-path? text)))
+      (list drv out text))))
+
+(test-group "a computed file is promoted by its actual content-addressed input"
+  (let ((connection (open-connection-for-tests)))
+    (let ((b-drv
+           (parameterize ((%package-addressing-policy 'mixed))
+             (package-derivation connection b)))
+          (computed
+           (parameterize ((%package-addressing-policy 'mixed))
+             (run-with-store connection
+               (lower-object
+                (computed-file "ca-policy-computed"
+                               #~(call-with-output-file #$output
+                                   (lambda (port) (display #$b port)))
+                               #:guile %bootstrap-guile))))))
+      (close-connection connection)
+      (test-equal "computed-file test starts with a content-addressed B"
+        "content" (addressing b-drv))
+      (test-equal "computed file is content-addressed, not input-addressed"
+        "content" (addressing computed))
+      (test-assert "computed file embeds its builder"
+        (assoc-ref (derivation-builder-environment-vars computed) "__files")))))
+
+(test-group "real builds use the realised input path"
+  (parameterize ((%package-addressing-policy 'mixed)
+                 (%upstream-package? (upstream-package-set (list->setq (list %bootstrap-guile)))))
+    (let* ((a-result (build-and-read a))
+           (b-result (build-and-read b)))
+      (test-equal "A is content-addressed by the mixed rule"
+        "content" (addressing (first a-result)))
+      (test-equal "B is content-addressed by the mixed rule"
+        "content" (addressing (first b-result)))
+      (test-equal "trivial gexp B writes A's realised path"
+        (second a-result) (third b-result))
+      (test-assert "B refers to A's realised path"
+        (member (second a-result) (references store (second b-result)))))
+    (let* ((a-result (build-and-read opaque-a))
+           (b-result (build-and-read opaque-b)))
+      (test-equal "the same works with A marked opaque"
+        (second a-result) (third b-result))
+      (test-equal "opaque A uses resolved addressing"
+        "resolved" (addressing (first a-result)))
+      (test-assert "opaque B refers to A's realised path"
+        (member (second a-result) (references store (second b-result)))))))
+
+(test-group "the adopted policy adopts upstream packages and builds the rest"
+  (let* ((leaf (trivial "ca-policy-adopt-leaf"
+                        #~(call-with-output-file #$output
+                            (lambda (p) (display "LEAF" p)))))
+         (mid  (trivial "ca-policy-adopt-mid"
+                        #~(call-with-output-file #$output
+                            (lambda (p) (format p "~a/MID" #$leaf)))
+                        `(("leaf" ,leaf))))
+         (top  (trivial "ca-policy-adopt-top"
+                        #~(call-with-output-file #$output
+                            (lambda (p) (format p "~a/TOP" #$mid)))
+                        `(("mid" ,mid))))
+         (inherited (package (inherit top)))
+         (opaque (trivial "ca-policy-adopt-opaque"
+                          #~(call-with-output-file #$output
+                              (lambda (p) (display "OPAQUE" p)))
+                          '() '((self-references . opaque)))))
+    (parameterize ((%package-addressing-policy 'adopted)
+                   (%upstream-package?
+                    (upstream-package-set
+                     (list->setq (list leaf mid top opaque %bootstrap-guile)))))
+      (test-assert "an upstream package is adopted"
+        (adopt-package? top))
+      (test-assert "an inherited package is not adopted"
+        (not (adopt-package? inherited)))
+      (test-assert "an opaque package is not adopted"
+        (not (adopt-package? opaque)))
+      (let ((d (package-derivation store top))
+            (original-mid
+             (parameterize ((%package-addressing-policy 'input))
+               (let ((mid-drv (package-derivation store mid)))
+                 (build-derivations store (list mid-drv))
+                 (realised-output-path store mid-drv "out")))))
+        (test-equal "the adopted top is content-addressed"
+          "content" (addressing d))
+        (build-derivations store (list d))
+        (let* ((out (realised-output-path store d "out"))
+               (refs (references store out)))
+          (test-assert "the adopted top references an adopted mid, not the original"
+            (and (not (member original-mid refs))
+                 (every (lambda (r) (string-contains r "ca-policy-adopt-mid"))
+                        refs)))
+          (test-assert "the adopted top keeps its payload"
+            (string-suffix? "/TOP" (call-with-input-file out get-string-all)))))
+      (test-equal "an inherited package is content-addressed from source"
+        "content" (addressing (package-derivation store inherited)))
+      (test-equal "an opaque package stays resolved"
+        "resolved" (addressing (package-derivation store opaque))))))
+
+(test-group "adopting a reference through one output realises the whole deriver"
+  ;; A multi-output package referenced through ONE output (gcc:lib, glib:bin,
+  ;; any :debug output): only the referenced output is substituted, so the
+  ;; deriver's other outputs are absent from the store AND the filesystem.
+  ;; Adoption must realise every output before scanning the deriver.  Before
+  ;; the fix, adopt* scanned the deriver's out output without realising it and
+  ;; failed with lstat on the absent path (the CA-6 boot gate's gcc:lib case).
+  ;; The gate goes through the 'adopted POLICY's entry point (package lowering
+  ;; -> lower-bag-with-addressing -> adopt-lowered-derivation), not a direct
+  ;; adopt-derivation on a prebuilt closure.
+  (define (fresh-name prefix)
+    (string-append prefix "-"
+                   (number->string (random 1000000000
+                                           (random-state-from-platform)))))
+  ;; A fresh connection with substitutes enabled before any build, so the
+  ;; daemon's substituter picks up the file:// cache (as derivations.scm does).
+  (with-store store
+    (%graft? #f)
+    (let* ((multi-name (fresh-name "ca-policy-multi"))
+           (ref-name   (fresh-name "ca-policy-ref-lib"))
+           ;; A two-output package: out and lib.
+           (multi (package
+                    (inherit (trivial multi-name
+                               #~(begin
+                                   (call-with-output-file #$output
+                                     (lambda (p) (display "OUT" p)))
+                                   (call-with-output-file #$output:lib
+                                     (lambda (p) (display "LIB" p))))))
+                    (outputs '("out" "lib"))))
+           ;; A second package that refers ONLY to multi's lib output: the
+           ;; input tuple (,multi "lib") and the #$multi:lib reference both
+           ;; request lib alone, so multi's out output is never built.
+           (ref-lib (trivial ref-name
+                             #~(call-with-output-file #$output
+                                 (lambda (p) (format p "~a/REF" #$multi:lib)))
+                             `(("multi" ,multi "lib")))))
+      ;; The input-addressed lib path, for comparison.
+      (define multi-drv
+        (parameterize ((%package-addressing-policy 'input))
+          (package-derivation store multi)))
+      (define lib-path (derivation->output-path multi-drv "lib"))
+      (define out-path (derivation->output-path multi-drv "out"))
+      ;; Install a substitute for ONLY the lib output, built from a temporary
+      ;; directory (no build of multi, so out stays absent).  The files are
+      ;; removed on exit, as call-with-derivation-narinfo does; that helper
+      ;; only covers the "out" output, so the lib narinfo is written here.
+      (define dir (%substitute-directory))
+      (define tag (fresh-name "lib-sub"))
+      (define tmp-lib (string-append dir "/" tag))
+      (define nar-file (string-append tag ".nar"))
+      (define cache-info (string-append dir "/nix-cache-info"))
+      (define narinfo
+        (string-append dir "/" (store-path-hash-part lib-path) ".narinfo"))
+      (dynamic-wind
+        (lambda ()
+          (mkdir-p tmp-lib)
+          (call-with-output-file (string-append tmp-lib "/libfile")
+            (lambda (p) (display "LIB" p)))
+          (call-with-output-file (string-append dir "/" nar-file)
+            (lambda (p) (write-file tmp-lib p)))
+          (let ((nar-hash (call-with-input-file (string-append dir "/" nar-file)
+                            port-sha256)))
+            (call-with-output-file cache-info
+              (lambda (p)
+                (format p "StoreDir: ~a\nWantMassQuery: 0\n" (%store-prefix))))
+            (call-with-output-file narinfo
+              (lambda (p)
+                (format p "StorePath: ~a\nURL: ~a\nCompression: none\n\
+NarSize: 1234\nNarHash: sha256:~a\nReferences: \nSystem: ~a\nDeriver: ~a\n"
+                        lib-path nar-file
+                        (bytevector->nix-base32-string nar-hash)
+                        (derivation-system multi-drv)
+                        (basename (derivation-file-name multi-drv)))))))
+        (lambda ()
+          (set-build-options store #:use-substitutes? #t
+                             #:substitute-urls (%test-substitute-urls))
+          (test-assert "the lib output has a substitute"
+            (has-substitutes? store lib-path))
+          ;; Lower ref-lib through the adopted policy and build it.  Only
+          ;; multi:lib is substituted; multi:out is absent until adoption
+          ;; realises it.
+          (parameterize ((%package-addressing-policy 'adopted)
+                         (%upstream-package?
+                          (upstream-package-set
+                           (list->setq (list multi ref-lib %bootstrap-guile)))))
+            (let ((d (package-derivation store ref-lib)))
+              (test-equal "the adopted ref-lib is content-addressed"
+                "content" (addressing d))
+              (build-derivations store (list d))
+              (test-assert "adoption realised the deriver's absent out output"
+                (valid-path? store out-path))
+              (let* ((out (realised-output-path store d "out"))
+                     (refs (references store out)))
+                (test-assert "the adopted ref-lib references the adopted lib, not the IA one"
+                  (and (pair? refs)
+                       (not (member lib-path refs))
+                       (every (lambda (r) (string-contains r multi-name)) refs)))
+                (test-assert "the adopted ref-lib keeps its payload"
+                  (string-suffix? "/REF"
+                                  (call-with-input-file out get-string-all)))))))
+        (lambda ()
+          (false-if-exception (delete-file narinfo))
+          (false-if-exception (delete-file cache-info))
+          (false-if-exception (delete-file (string-append dir "/" nar-file)))
+          (false-if-exception (delete-file-recursively tmp-lib)))))))
+
+(test-group "a shared dependency is scanned and adopted once across lowerings"
+  ;; The CA-6 gate rescanned the whole closure for EVERY package lowered under
+  ;; the 'adopted policy: adopt-derivation made a fresh cache per call, so
+  ;; gcc came round once per package (O(packages x closure)).  Measured on the
+  ;; gate client: rchar 165.9 GB against a 6.05 GB store, ~27 passes, with the
+  ;; daemon idle.  Two packages sharing one dependency must scan that
+  ;; dependency ONCE and adopt it ONCE, counted with a hook, not a timer.
+  (let* ((shared (trivial "ca-policy-memo-shared"
+                          #~(call-with-output-file #$output
+                              (lambda (p) (display "SHARED" p)))))
+         (left  (trivial "ca-policy-memo-left"
+                         #~(call-with-output-file #$output
+                             (lambda (p) (format p "~a/L" #$shared)))
+                         `(("shared" ,shared))))
+         (right (trivial "ca-policy-memo-right"
+                         #~(call-with-output-file #$output
+                             (lambda (p) (format p "~a/R" #$shared)))
+                         `(("shared" ,shared)))))
+    (parameterize ((%package-addressing-policy 'adopted)
+                   (%upstream-package?
+                    (upstream-package-set
+                     (list->setq (list shared left right %bootstrap-guile)))))
+      (let* ((shared-ia (parameterize ((%package-addressing-policy 'input))
+                          (package-derivation store shared)))
+             (_ (build-derivations store (list shared-ia)))
+             (shared-out (realised-output-path store shared-ia "out")))
+        ;; Record every scanned path via the hook, then count the SHARED
+        ;; item's occurrences: unrelated items (bootstrap guile, the two
+        ;; tops) must not mask the property.
+        (let ((scans '()))
+          (parameterize ((%scan-count
+                          (lambda (path) (set! scans (cons path scans)))))
+            (package-derivation store left)
+            (package-derivation store right))
+          (test-equal "a dependency shared by two packages is scanned exactly once"
+            1
+            (count (lambda (p) (string=? p shared-out)) scans)))))))
+
+(test-group "a gexp over an adopted input is content-addressed under adopted"
+  ;; The plan's policy table (01-content-addressing.md, section 8): under
+  ;; 'adopted, upstream's packages are adopted (content-addressed grafts) and
+  ;; EVERYTHING ELSE is content-addressed.  A gexp is "everything else".
+  ;;
+  ;; gexp-with-addressing chose 'input for every policy except content, full
+  ;; and mixed, so under 'adopted a gexp whose inputs had been adopted stayed
+  ;; input-addressed and the daemon refused it: "input-addressed derivation
+  ;; depends on content/resolved-addressed `…-guile-static-initrd-3.0.11.drv';
+  ;; mark the dependent as content-addressed too".  Measured on the CA-6 boot
+  ;; gate at module-import-compiled (compiled-modules, guix/gexp.scm), which
+  ;; takes its guile from %guile-for-build and imports modules over it.
+  ;;
+  ;; gexp-addressing's input test only ran under 'mixed, so the adopted case
+  ;; had no fallback either.  This test lowers a gexp over an ADOPTED input
+  ;; under 'adopted and requires the result to be content-addressed and to
+  ;; build, which is what the daemon's checkInputAddressedPolicy enforces.
+  (let* ((leaf (trivial "ca-policy-gexp-adopt-leaf"
+                        #~(call-with-output-file #$output
+                            (lambda (p) (display "LEAF" p))))))
+    (parameterize ((%package-addressing-policy 'adopted)
+                   (%upstream-package?
+                    (upstream-package-set
+                     (list->setq (list leaf %bootstrap-guile)))))
+      (let* ((adopted-leaf (package-derivation store leaf))
+             (_ (build-derivations store (list adopted-leaf)))
+             ;; A gexp, not a package: no %package-derivation-name is set, so
+             ;; gexp-with-addressing decides by POLICY alone.
+             (drv (run-with-store store
+                    (gexp->derivation "ca-policy-gexp-adopt-top"
+                      #~(call-with-output-file #$output
+                          (lambda (p)
+                            (format p "~a/TOP" #$adopted-leaf)))))))
+        (test-equal "the adopted leaf is content-addressed"
+          "content" (addressing adopted-leaf))
+        (test-equal "a gexp over an adopted input is content-addressed"
+          "content" (addressing drv))
+        ;; The daemon refuses an input-addressed derivation over a CA input.
+        ;; Catch that so the failure is a recorded FAIL, not an aborted suite.
+        (test-assert "the gexp over an adopted input builds"
+          (catch 'store-protocol-error
+            (lambda () (build-derivations store (list drv)))
+            (lambda (key . args)
+              (format #t "build refused: ~a~%" args)
+              #f)))
+        ;; An explicit #:addressing #f means "no override": a graft over an
+        ;; input-addressed derivation passes it so its derivation stays
+        ;; upstream's.  The 'adopted branch must not override that, or every
+        ;; input-addressed graft's bytes would change.
+        (test-equal "an explicit #:addressing #f stays input-addressed under adopted"
+          #f
+          (addressing
+           (run-with-store store
+             (gexp->derivation "ca-policy-gexp-no-override"
+                               #~(mkdir #$output)
+                               #:addressing #f))))))))
+
+(test-group "an explicit #:addressing #f keeps each policy's own default"
+  ;; Reviewer, 2026-11-22, on 46fc1ed2e41: the no-override guard was applied
+  ;; to EVERY policy, so under 'content and 'full a gexp lowered with
+  ;; #:addressing #f became input-addressed where it had been content.
+  ;; Measured both ways with .scratch/addr-false-probe.scm:
+  ;;   at 9bd5c39487d (before): content -> "content", full -> "content"
+  ;;   at 46fc1ed2e41:          content -> #f,        full -> #f
+  ;; That was not intended.  'content and 'full build everything
+  ;; content-addressed, so "no override" there means the policy's own
+  ;; default, which is content.  Only 'adopted needs the guard, because it
+  ;; is the one policy whose default for a gexp changed.
+  ;;
+  ;; The keyword is matched by walking keyword/value PAIRS, not with memq
+  ;; over the whole list: memq would also find #:addressing sitting in a
+  ;; value position (e.g. #:env-vars '((#:addressing . x))) and treat it as
+  ;; an override that was never passed.
+  (define (addressing-with-false policy)
+    (parameterize ((%package-addressing-policy policy))
+      (addressing
+       (run-with-store store
+         (gexp->derivation "ca-policy-addr-false" #~(mkdir #$output)
+                           #:addressing #f)))))
+  ;; test-group puts its body in a lambda, so every internal define must come
+  ;; before the first expression.
+  (define (lower-with-decoy policy)
+    (parameterize ((%package-addressing-policy policy))
+      (addressing
+       (run-with-store store
+         (gexp->derivation "ca-policy-addr-mid-decoy" #~(mkdir #$output)
+                           #:local-build? #:addressing
+                           #:system (%current-system))))))
+  (test-equal "under content, #:addressing #f is still content-addressed"
+    "content" (addressing-with-false 'content))
+  (test-equal "under full, #:addressing #f is still content-addressed"
+    "content" (addressing-with-false 'full))
+  (test-equal "under input, #:addressing #f stays input-addressed"
+    #f (addressing-with-false 'input))
+  (test-equal "under mixed, #:addressing #f stays input-addressed"
+    #f (addressing-with-false 'mixed))
+  ;; A keyword in a VALUE position is not an #:addressing argument.  The
+  ;; decoy is a TOP-LEVEL value, so a plain memq over the argument list finds
+  ;; it: (#:local-build? #:addressing) has #:addressing at an odd index.  A
+  ;; walk over keyword/value pairs does not.
+  (test-equal "a keyword in a value position is not an addressing override"
+    "content"
+    (parameterize ((%package-addressing-policy 'adopted))
+      (addressing
+       (run-with-store store
+         (gexp->derivation "ca-policy-addr-decoy" #~(mkdir #$output)
+                           #:local-build? #:addressing)))))
+  ;; Reviewer, 2026-11-22, on 57c18c13496: the decoy above puts the
+  ;; value-position keyword at the END of the list, where (pair? (cdr rest))
+  ;; is false, so it survives a strip-keyword that still steps one element at
+  ;; a time.  With another pair AFTER it the corruption shows: strip-keyword
+  ;; keeps #:local-build?, then sees #:addressing (its VALUE) as a keyword,
+  ;; drops it together with #:system, and returns
+  ;; (#:local-build? "x86_64-linux").  Measured on the committed definition:
+  ;;   mid (#:local-build? #:addressing #:system "x86_64-linux")
+  ;;     -> (#:local-build? "x86_64-linux")   WRONG
+  ;;   end (#:local-build? #:addressing) -> unchanged (the weak case)
+  ;;
+  ;; Exercised through gexp-with-addressing, the exported entry point: the
+  ;; three helpers are private and Guile INLINES them, so they are not bound
+  ;; in the module at runtime and @@ cannot reach them (measured:
+  ;; strip-keyword, keyword-argument and addressing-keyword-present? all
+  ;; report bound? #f).  A decoy keyword followed by a real pair is what
+  ;; distinguishes a pair walk from an element walk: the surviving #:system
+  ;; argument must still reach the lowerer, and the addressing must be the
+  ;; policy's own, not an override read out of a value position.
+  (test-equal "a mid-list value-position keyword does not become an override"
+    "content" (lower-with-decoy 'adopted))
+  ;; The DISCRIMINATING case, found by measurement (the two decoy cases above
+  ;; pass either way, because keyword-argument already walks pairs and makes
+  ;; the addressing decision before strip-keyword runs).  What strip-keyword
+  ;; corrupts is the argument list that reaches the LOWERER.  With a decoy in
+  ;; #:local-build?'s value followed by a real #:env-vars pair, the element
+  ;; walk drops the decoy together with #:env-vars and hands the lowerer
+  ;; (#:local-build? (("goonixProbe" . "yes"))), so the environment variable
+  ;; is LOST.  The pair walk keeps both pairs and the variable survives.
+  ;; Measured on the committed definition:
+  ;;   bad  -> (#:local-build? (("goonixProbe" . "yes")))
+  ;;   good -> (#:local-build? #:addressing #:env-vars (("goonixProbe" . "yes")))
+  (test-equal "an argument after a value-position decoy still reaches the builder"
+    "yes"
+    (assoc-ref
+     (derivation-builder-environment-vars
+      (parameterize ((%package-addressing-policy 'adopted))
+        (run-with-store store
+          (gexp->derivation "ca-policy-addr-decoy-env" #~(mkdir #$output)
+                            #:local-build? #:addressing
+                            #:env-vars '(("goonixProbe" . "yes"))))))
+     "goonixProbe")))
+
+(test-group "a package re-lowered from source under adopted is content-addressed"
+  ;; CA-6 gate run 9 stopped at glibc-2.41.drv:
+  ;;   input-addressed derivation depends on content/resolved-addressed
+  ;;   `...-gawk-boot0-5.3.0.drv'; mark the dependent as content-addressed too
+  ;;
+  ;; adopt.scm never adopts glibc (glibc-derivation? is a name-prefix test):
+  ;; adopt-derivation returns the derivation unchanged and
+  ;; adopt-lowered-derivation re-lowers it "content-addressed from source".
+  ;; That re-lowering runs inside the OUTER (state-parameterize
+  ;; ((%package-addressing-policy 'input)) ...), and it sets only
+  ;; %package-addressing to 'content.  lower-bag-with-addressing then OVERWRITES
+  ;; %package-addressing with (package-addressing context), which under the
+  ;; 'input policy returns 'input.  So the re-lowered glibc came out
+  ;; input-addressed over adopted (content-addressed) inputs, and the daemon
+  ;; rightly refused it -- the same class as module-import-compiled earlier.
+  ;;
+  ;; A package named glibc-* takes exactly that path.  Two earlier attempts are
+  ;; recorded so they are not repeated:
+  ;;  v1 plain trivial inputs: PASSED 68/68.  The re-lowered bag's inputs are
+  ;;     lowered inside the same 'input extent, so they stay input-addressed
+  ;;     and nothing is inconsistent.
+  ;;  v2 an already-adopted input, built eagerly: reproduced the gate's EXACT
+  ;;     refusal, but it was thrown by (build-derivations ... leaf) OUTSIDE any
+  ;;     catch, so the group aborted with zero assertions run.
+  ;; So the whole fixture runs inside one catch, and the refusal is reported as
+  ;; a failed assertion rather than killing the suite.
+  (define outcome
+    (catch #t
+      (lambda ()
+        (let* ((leaf (trivial "ca-policy-relower-leaf"
+                              #~(call-with-output-file #$output
+                                  (lambda (p) (display "LEAF" p)))))
+               (adopted-leaf
+                (parameterize ((%package-addressing-policy 'adopted)
+                               (%upstream-package?
+                                (upstream-package-set
+                                 (list->setq (list leaf %bootstrap-guile)))))
+                  (let ((d (package-derivation store leaf)))
+                    (build-derivations store (list d))
+                    d)))
+               ;; glibc-like: its input is the ADOPTED content-addressed item.
+               (glibc-like (trivial "glibc-ca-policy-relower"
+                                    #~(call-with-output-file #$output
+                                        (lambda (p)
+                                          (format p "~a/GLIBC" #$adopted-leaf))))))
+          (parameterize ((%package-addressing-policy 'adopted)
+                         (%upstream-package?
+                          (upstream-package-set
+                           (list->setq (list leaf glibc-like %bootstrap-guile)))))
+            (let ((drv (package-derivation store glibc-like)))
+              (build-derivations store (list drv))
+              (list (addressing adopted-leaf) (addressing drv))))))
+      (lambda (key . args)
+        ;; Name the refusal, so a failure cannot be mistaken for a fixture
+        ;; problem: the daemon's message is the point of this test.
+        (format #t "re-lower refused: ~a ~a~%" key args)
+        (list 'refused key))))
+  (test-assert "a glibc-like package over an adopted input lowers and builds"
+    (not (and (pair? outcome) (eq? 'refused (car outcome)))))
+  (test-equal "the adopted input is content-addressed"
+    "content" (and (pair? outcome) (car outcome)))
+  (test-equal "the re-lowered package is content-addressed, not input"
+    "content" (and (pair? outcome) (cadr outcome))))
+
+(test-group "glibc's content mark does not widen to what its build lowers"
+  ;; The mark is on glibc's OWN derivation.  The POLICY must stay 'adopted
+  ;; inside its bag lowering, so everything lowered there is ADOPTED - a
+  ;; graft over the input-addressed item its peers use - not re-lowered
+  ;; content-addressed FROM SOURCE.
+  ;;
+  ;; Measured cost of widening it: with the policy 'content for the whole
+  ;; extent, a glibc-named package using (default-guile) got a FROM-SOURCE
+  ;; guile-3.0 (its own guile-3.0.9.tar input, a 198-derivation closure)
+  ;; instead of a graft.
+  ;;
+  ;; The property asserted here is the one that actually separates the two
+  ;; scopes: glibc's derivation closure must contain NO fresh from-source
+  ;; content-addressed lowering of an upstream package.  A graft is fine
+  ;; (it reuses a built item); a non-graft content-addressed derivation of an
+  ;; upstream package is the from-source re-lowering.
+  ;;
+  ;; An earlier version of this test compared the builder guile after
+  ;; normalising a graft to the item it rewrites.  That did NOT distinguish
+  ;; the scopes - widening the override still passed 72/0 - because the wide
+  ;; scope hands glibc the plain input-addressed guile and the narrow one a
+  ;; graft over that same guile, so both normalise to one path.  Recorded so
+  ;; the weaker assertion is not reintroduced.
+  (define (graft? d)
+    ;; A graft imports (guix ca build graft) in its builder script; the
+    ;; "__file:..." environment entry holds that script's TEXT inline
+    ;; (measured), not a path to it.
+    (any (lambda (entry)
+           (and (string-prefix? "__file:" (car entry))
+                (string? (cdr entry))
+                (string-contains (cdr entry) "(guix ca build graft)")))
+         (derivation-builder-environment-vars d)))
+  (define (closure drv)
+    (let ((table (make-hash-table)))
+      (let visit ((d drv))
+        (unless (hash-ref table (derivation-file-name d))
+          (hash-set! table (derivation-file-name d) d)
+          (for-each (lambda (i) (visit (derivation-input-derivation i)))
+                    (derivation-inputs d))))
+      (hash-map->list (lambda (k v) v) table)))
+  (let* ((leaf (trivial "ca-policy-scope-leaf"
+                        #~(call-with-output-file #$output
+                            (lambda (p) (display "L" p)))))
+         (glibc-like (trivial "glibc-ca-policy-scope"
+                              #~(call-with-output-file #$output
+                                  (lambda (p) (format p "~a/G" #$leaf)))
+                              `(("leaf" ,leaf)))))
+    (parameterize ((%package-addressing-policy 'adopted)
+                   (%upstream-package?
+                    (upstream-package-set
+                     (list->setq (list leaf glibc-like %bootstrap-guile)))))
+      (let* ((g (package-derivation store glibc-like))
+             ;; Upstream PACKAGES re-lowered from source inside the extent:
+             ;; content-addressed, NOT a graft, and not glibc itself.
+             ;; module-import / module-import-compiled are not packages: they
+             ;; are the compiled build modules, content-addressed by design
+             ;; and shared with every other package (measured: the same
+             ;; 8jwj8r0h… derivation in both closures), so they are excluded.
+             (from-source
+              (filter (lambda (d)
+                        (let ((name (derivation-name d)))
+                          (and (equal? "content" (addressing d))
+                               (not (graft? d))
+                               (not (glibc-name? name))
+                               (not (string-prefix? "module-import" name)))))
+                      (closure g))))
+        (test-equal "glibc's own derivation is content-addressed"
+          "content" (addressing g))
+        (test-equal "nothing upstream is re-lowered from source inside glibc"
+          '() (map (lambda (d) (basename (derivation-file-name d)))
+                   from-source))))))
+
+(test-group "an input-addressed request over adopted inputs is corrected"
+  ;; CA-6 gate, narrow glibc scope (699dc449953): the daemon refused
+  ;;   input-addressed derivation depends on content/resolved-addressed
+  ;;   `…-gawk-boot0-5.3.0.drv'; mark the dependent as content-addressed too
+  ;; while writing file-5.46.drv.
+  ;;
+  ;; Measured with a backtrace probe inside `derivation` (before the write,
+  ;; since the refusal happens inside add-data-to-store): the caller is an
+  ;; ordinary NESTED PACKAGE lowering - package->derivation -> bag->derivation
+  ;; -> expand-input -> package->derivation, three levels, all in
+  ;; guix/packages.scm - not a gexp compiler, lower-object or a graft.  At the
+  ;; leaking lowering the parameters were
+  ;;   POLICY=adopted MARK=input NAMEPARAM=#f addressing=input
+  ;; i.e. a gexp whose requested kind stayed 'input while its inputs had
+  ;; already been lowered content-addressed.
+  ;;
+  ;; gexp-addressing re-decided the kind from the ACTUAL inputs only under
+  ;; 'mixed; under 'adopted it returned the request unchanged.  The wide glibc
+  ;; scope hid this because the policy inside glibc's extent was 'content, so
+  ;; those gexps were content-addressed by the policy clause anyway.
+  ;;
+  ;; So 'adopted needs the same input-based correction 'mixed has.  An explicit
+  ;; #:addressing #f ("no override", used by grafts over input-addressed
+  ;; derivations) must still be honoured - that is asserted here too.
+  (let* ((leaf (trivial "ca-policy-stale-input-leaf"
+                        #~(call-with-output-file #$output
+                            (lambda (p) (display "LEAF" p))))))
+    (parameterize ((%package-addressing-policy 'adopted)
+                   (%upstream-package?
+                    (upstream-package-set
+                     (list->setq (list leaf %bootstrap-guile)))))
+      (let* ((adopted-leaf (package-derivation store leaf))
+             (_ (build-derivations store (list adopted-leaf)))
+             ;; An explicit 'input request over an ADOPTED input: the stale
+             ;; request the gate hit.  The daemon refuses the WRITE, so catch
+             ;; it here: an uncaught throw aborts the whole suite instead of
+             ;; recording a FAIL (the same lesson as the re-lower group).
+             (outcome
+              (catch #t
+                (lambda ()
+                  (let ((drv (run-with-store store
+                               (gexp->derivation "ca-policy-stale-input-top"
+                                 #~(call-with-output-file #$output
+                                     (lambda (p)
+                                       (format p "~a/TOP" #$adopted-leaf)))
+                                 #:addressing 'input))))
+                    (build-derivations store (list drv))
+                    (addressing drv)))
+                (lambda (key . args)
+                  (format #t "stale-input refused: ~a ~a~%" key args)
+                  'refused))))
+        (test-equal "the adopted input is content-addressed"
+          "content" (addressing adopted-leaf))
+        (test-equal "an 'input request over adopted inputs becomes content"
+          "content" outcome)
+        ;; The no-override case must NOT be swept up by the correction.
+        ;;
+        ;; Call gexp-addressing DIRECTLY with requested #f AND an input list
+        ;; holding the adopted (content-addressed) leaf.  Lowering a gexp with
+        ;; #:addressing #f and NO inputs cannot fail this: with no inputs the
+        ;; input-based correction leaves the request alone even if #f were
+        ;; matched alongside 'input, so such an assertion is vacuous.
+        (let ((adopted-input (derivation-input adopted-leaf)))
+          (test-equal "gexp-addressing keeps #f over adopted inputs"
+            #f
+            (gexp-addressing #f adopted-input (list adopted-input) #f #f #f))
+          ;; The same inputs DO correct a genuine 'input request: this is what
+          ;; makes the assertion above meaningful rather than trivially true.
+          (test-equal "gexp-addressing corrects 'input over the same inputs"
+            'content
+            (gexp-addressing 'input adopted-input (list adopted-input)
+                             #f #f #f)))
+        ;; And end to end, the no-override gexp still lowers input-addressed.
+        (test-equal "#:addressing #f still stays input-addressed under adopted"
+          #f
+          (addressing
+           (run-with-store store
+             (gexp->derivation "ca-policy-stale-input-no-override"
+                               #~(mkdir #$output)
+                               #:addressing #f))))))))
+
+(test-group "a reference list may name an output the dependent does not consume"
+  ;; CA-6 gate run 13 died here, at glibc-2.41 over gcc-cross-boot0:
+  ;;   goonix: unresolved placeholder
+  ;;   `/gnu/store/eotuouutuotottteeeuuetueetootttt-gcc-cross-boot0-14.3.0-lib'
+  ;;   in resolved derivation
+  ;; Measured in the gate's store: glibc takes that derivation as an input but
+  ;; requests ONLY ["out"], while its allowedReferences names the derivation's
+  ;; LIB output.  resolveDerivation (nix/libstore/ca.cc:889) builds its
+  ;; replacement map from input.second, i.e. only the REQUESTED sub-outputs, so
+  ;; lib's placeholder gets no replacement, survives in allowedReferences, and
+  ;; checkResolvedDerivation's scan refuses the derivation at registration.
+  ;;
+  ;; The whole fixture is inside one catch so a refusal reports as failed
+  ;; assertions instead of aborting the group (the ca-policy.scm idiom).
+  (let ((fresh (lambda (prefix)
+                 (string-append prefix "-"
+                                (number->string
+                                 (random 1000000000
+                                         (random-state-from-platform)))))))
+    (let ((multi-name (fresh "ca-reflist-multi"))
+          (user-name  (fresh "ca-reflist-user")))
+    (catch #t
+      (lambda ()
+        (let* ((multi (trivial multi-name
+                        #~(begin
+                            (call-with-output-file #$output
+                              (lambda (p) (display "OUT" p)))
+                            (call-with-output-file #$output:lib
+                              (lambda (p) (display "LIB" p))))
+                        '() '()))
+               (multi (package
+                        (inherit multi)
+                        (outputs '("out" "lib"))))
+               (multi-drv (parameterize ((%package-addressing-policy 'content))
+                            (package-derivation store multi)))
+               (lib-placeholder (derivation->output-path multi-drv "lib")))
+          (test-assert "the non-consumed sibling output really is a placeholder"
+            (placeholder-path? lib-placeholder))
+          ;; The reviewer's required case: lib must NOT be realised before the
+          ;; dependent is built.  A fix that only rewrote placeholders when the
+          ;; item happened to be in the store would pass here by luck and be
+          ;; refused on a machine that substituted only `out', or after a GC of
+          ;; lib.  So assert it is absent, then build the DEPENDENT first.
+          (test-assert "lib is NOT realised before the dependent is built"
+            (not (valid-path? store lib-placeholder)))
+          ;; allowed-references must name BOTH: out is what the builder actually
+          ;; refers to, lib is the non-consumed sibling under test.  Listing lib
+          ;; alone is correctly refused with "is not allowed to refer to path"
+          ;; (measured), which is a different property, not this bug.
+          (let ((drv (parameterize ((%package-addressing-policy 'content))
+                       (run-with-store store
+                         (gexp->derivation user-name
+                           #~(call-with-output-file #$output
+                               (lambda (p) (display #$multi:out p)))
+                           #:allowed-references (list (gexp-input multi "out")
+                                                      (gexp-input multi "lib"))
+                           #:addressing 'content)))))
+            (test-assert "lowering a dependent whose allowed-references names a non-consumed output succeeds"
+              (derivation? drv))
+            ;; The requested outputs must include lib, deterministically from
+            ;; the reference list rather than from store contents.
+            (test-assert "the reference-list output is a REQUESTED input output"
+              (any (lambda (input)
+                     (and (member "lib" (derivation-input-sub-derivations input))
+                          (string=? (derivation-file-name
+                                     (derivation-input-derivation input))
+                                    (derivation-file-name multi-drv))))
+                   (derivation-inputs drv)))
+            (test-assert "and it builds"
+              (begin (build-derivations store (list drv)) #t)))))
+      (lambda (key . args)
+        (format #t "refusal: ~a ~a~%" key args)
+        (test-assert "lowering a dependent whose allowed-references names a non-consumed output succeeds"
+          #f)
+        (test-assert "and it builds" #f))))))
+
+(test-group "an input-addressed derivation's inputs stay exactly upstream's"
+  ;; The blocking regression the reviewer measured on 4ec5f3b1273: adding
+  ;; reference-list outputs unconditionally changed INPUT-ADDRESSED graphs.
+  ;; glibc-final's drv moved from upstream's w189hhbh… to 256qrzh1…, because
+  ;; gcc-cross-boot0 went "out" -> "lib","out" and bash-static "out" ->
+  ;; "doc","out".  glibc-final is under everything, so every input-addressed
+  ;; package got a new .drv and output path and lost upstream substitutes.
+  ;;
+  ;; Structural, no hard-coded hashes: lower the SAME gexp twice, once with a
+  ;; reference list naming a non-consumed sibling and once without, under the
+  ;; DEFAULT (input) policy, and require identical inputs.  An input-addressed
+  ;; derivation has real paths in its reference lists, so it needs nothing.
+  (let ((fresh (lambda (prefix)
+                 (string-append prefix "-"
+                                (number->string
+                                 (random 1000000000
+                                         (random-state-from-platform)))))))
+    (catch #t
+      (lambda ()
+        (let* ((multi (trivial (fresh "ca-ia-reflist-multi")
+                        #~(begin
+                            (call-with-output-file #$output
+                              (lambda (p) (display "OUT" p)))
+                            (call-with-output-file #$output:lib
+                              (lambda (p) (display "LIB" p))))))
+               (multi (package (inherit multi) (outputs '("out" "lib"))))
+               (lower (lambda (refs)
+                        (run-with-store store
+                          (gexp->derivation "ca-ia-reflist-user"
+                            #~(call-with-output-file #$output
+                                (lambda (p) (display #$multi:out p)))
+                            #:allowed-references refs))))
+               (plain (lower #f))
+               (with-sibling (lower (list (gexp-input multi "out")
+                                        (gexp-input multi "lib")))))
+          (define (input-key drv)
+            (sort (map (lambda (i)
+                         (cons (derivation-file-name
+                                (derivation-input-derivation i))
+                               (sort (derivation-input-sub-derivations i)
+                                     string<?)))
+                       (derivation-inputs drv))
+                  (lambda (a b) (string<? (car a) (car b)))))
+          (test-assert "the default policy really lowers this input-addressed"
+            (not (assoc-ref (derivation-builder-environment-vars with-sibling)
+                            "goonixAddressing")))
+          (test-equal "a non-consumed sibling in allowed-references adds NO input under the default policy"
+            (input-key plain) (input-key with-sibling))
+          ;; Pin the bug directly: "lib" must NOT become a requested output of
+          ;; multi.  Before the fix it did ("out" -> "lib","out"), which moved
+          ;; glibc-final's drv off upstream's path.
+          (test-assert "the non-consumed sibling is NOT a requested output"
+            (not (any (lambda (i)
+                        (member "lib" (derivation-input-sub-derivations i)))
+                      (derivation-inputs with-sibling))))
+          ;; NOTE: the .drv file AND the output path do differ between these two
+          ;; lowerings, and that is correct upstream behaviour: allowedReferences
+          ;; is part of an input-addressed derivation's hash.  Measured:
+          ;; pw29hnfs… vs z9xy0la6….  The property that matters is that the
+          ;; INPUTS are unchanged, so the same reference list yields the same
+          ;; graph as upstream - checked by hand on glibc-final, which is back
+          ;; to the host's w189hhbh1r33l2h37qr772rijklxqqxg-glibc-2.41.drv.
+          ))
+      (lambda (key . args)
+        (format #t "refusal: ~a ~a~%" key args)
+        (test-assert "a non-consumed sibling in allowed-references adds NO input under the default policy"
+          #f)))))
+
+(close-connection store)
+(test-end)

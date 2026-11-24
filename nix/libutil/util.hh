@@ -289,7 +289,8 @@ struct Agent
     /* The command and arguments passed to the agent along with a list of
        environment variable name/value pairs.  */
     Agent(const string &command, const Strings &args,
-	  const std::map<string, string> &env = std::map<string, string>());
+	  const std::map<string, string> &env = std::map<string, string>(),
+          bool separateStderr = false); // goonix: isolated protocol replies
 
     ~Agent();
 };

@@ -31,6 +31,7 @@
   #:use-module (gnu machine)
   #:use-module (guix discovery)
   #:use-module (guix scripts)
+  #:autoload   (guix scripts flake) (flake-deploy) ;goonix: flake references
   #:use-module (guix scripts build)
   #:use-module (guix store)
   #:use-module (guix gexp)
@@ -302,7 +303,9 @@ otherwise."
                                      #:argument-handler handle-argument))
            (file (assq-ref opts 'file))
            (expression (assoc-ref opts 'expression))
-           (machines (or (and file (load-source-file file))
+           (machines (or (and file              ;goonix: a flake reference
+                              (flake-deploy file opts (append args command)))
+                         (and file (load-source-file file))
                          (and expression (read/eval expression))))
            (dry-run? (assoc-ref opts 'dry-run?))
            (roll-back? (assq-ref opts 'roll-back?))

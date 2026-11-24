@@ -116,6 +116,7 @@ void Settings::update()
     _get(multiplexedBuildOutput, "multiplexed-build-output");
     _get(maxSilentTime, "build-max-silent-time");
     _get(buildTimeout, "build-timeout");
+    _get(goonixGraphTimeout, "build-graph-timeout"); // goonix: worker deadline
     _get(reservedSize, "gc-reserved-space");
     _get(fsyncMetadata, "fsync-metadata");
     _get(useSQLiteWAL, "use-sqlite-wal");

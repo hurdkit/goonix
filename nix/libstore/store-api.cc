@@ -1,4 +1,6 @@
 #include "store-api.hh"
+#include "local-store.hh" // goonix: realised-output-path implementation
+#include "ca.hh"
 #include "globals.hh"
 #include "util.hh"
 
@@ -105,6 +107,16 @@ void assertStorePathStrict(const Path & path)
 {
     if (!isStorePathStrict(path))
         throw Error(std::format("path `{}' is not a valid store path", path));
+}
+
+Path realisedOutputPath(StoreAPI & store, const Path & drvPath,
+    const Derivation & drv, const string & output)
+{
+    // goonix: local daemon method is intentionally absent from StoreAPI;
+    // clients use realised-output-path RPC, never a client-side mapping.
+    auto local = dynamic_cast<LocalStore *>(&store);
+    if (!local) throw Error("realised-output-path requires a local store");
+    return local->realisedOutputPath(drvPath, drv, output);
 }
 
 
@@ -326,6 +338,7 @@ Path readStorePath(Source & from)
 {
     Path path = readString(from);
     assertStorePath(path);
+    assertNotReserved(path); // goonix: no placeholder escapes to store operations
     return path;
 }
 
@@ -345,6 +358,7 @@ Path readStorePathStrict(Source & from)
 {
     Path path = readString(from);
     assertStorePathStrict(path);
+    assertNotReserved(path); // goonix: strict paths are never placeholders
     return path;
 }
 

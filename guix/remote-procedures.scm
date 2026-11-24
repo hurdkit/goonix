@@ -46,7 +46,7 @@
 
 (define %protocol-version
   ;; Version of the currently-implemented protocol.
-  #x164)
+  #x165)                                        ;goonix: realised CA outputs
 
 ;; Values sent by the client and then the server upon handshake.
 (define %worker-magic-1 #x6e697863)               ; "nixc"
@@ -301,7 +301,29 @@ Return #t on success."
   (define (substitute-urls)
     "Return the list of substitute URLs."
     id: 81
-    returns: string-list))
+    returns: string-list)
+
+  ;; goonix: direct binding; store.scm exposes the same procedure name.
+  (define (query-realised-output/direct (store-path derivation)
+                                        (utf8-string output))
+    "Return the realised store path of DERIVATION's OUTPUT."
+    id: 82
+    returns: store-path)
+
+  (define (query-build-records (base16 resolved-hash)
+                               (utf8-string output))
+    "Return the signed records of a resolved derivation output as one list
+of strings, six per record; see 'build-records' in (guix ca)."
+    id: 83
+    returns: string-list)
+
+  (define (query-build-graph (store-path derivation))
+    "Return the signed records of DERIVATION's whole build graph, seven
+strings per record: resolved hash, resolved derivation, output, path, origin,
+relocation flag and signature.  That is seven fields.  The second string list
+contains unsigned original-derivation, output and chosen-path triples."
+    id: 84
+    returns: string-list string-list))
 
 (define-syntax remote-procedure-id
   (syntax-rules ()

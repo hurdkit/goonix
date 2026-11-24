@@ -41,6 +41,7 @@
   #:use-module (guix records)
   #:use-module (guix store)
   #:use-module (guix monads)
+  #:use-module (guix package-overrides)          ;goonix: lowering-time overrides
   #:use-module (guix gexp)
   #:use-module (guix base32)
   #:autoload   (guix base64) (base64-decode)
@@ -2090,6 +2091,19 @@ This is an internal procedure."
            #:system system #:target target
            (bag-arguments bag))))
 
+(define bag->derivation/plain bag->derivation) ;goonix: retain upstream lowerer
+(define bag->cross-derivation/plain bag->cross-derivation) ;goonix: retain upstream lowerer
+(set! bag->derivation
+      (lambda args
+        (apply (module-ref (resolve-module '(guix ca policy))
+                           'lower-bag-with-addressing)
+               bag->derivation/plain args))) ;goonix: exact package bag boundary
+(set! bag->cross-derivation
+      (lambda args
+        (apply (module-ref (resolve-module '(guix ca policy))
+                           'lower-bag-with-addressing)
+               bag->cross-derivation/plain args))) ;goonix: exact cross package bag boundary
+
 (define bag->derivation*
   (store-lower bag->derivation))
 
@@ -2120,7 +2134,9 @@ This is an internal procedure."
                                               #:system system
                                               #:guile guile)))))
                  (return drv)))
-           package system #f graft?))
+           package system #f graft?
+           ((module-ref (resolve-module '(guix ca policy)) 'package-addressing-key)) ;goonix: current policy and origins
+           (package-override-key)))               ;goonix: overrides in effect
 
 (define* (package->cross-derivation package target
                                     #:optional (system (%current-system))
@@ -2143,7 +2159,15 @@ system identifying string)."
                                               #:system system
                                               #:guile guile)))))
                  (return drv)))
-           package system target graft?))
+           package system target graft?
+           ((module-ref (resolve-module '(guix ca policy)) 'package-addressing-key)) ;goonix: current policy and origins
+           (package-override-key)))               ;goonix: overrides in effect
+
+;; goonix: both heed the overrides in effect; see (guix package-overrides).
+(define package->derivation/plain package->derivation) ;goonix: retain upstream lowerer
+(define package->cross-derivation/plain package->cross-derivation) ;goonix: retain upstream lowerer
+(set! package->derivation (overridable package->derivation/plain)) ;goonix: heed overrides
+(set! package->cross-derivation (overridable package->cross-derivation/plain)) ;goonix: heed overrides
 
 (define* (package-output store package
                          #:optional (output "out") (system (%current-system)))

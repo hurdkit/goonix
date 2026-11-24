@@ -394,6 +394,11 @@ inline std::shared_ptr<StoreAPI> store;
    and separated by commas). */
 string showPaths(const PathSet & paths);
 
+/* goonix: realise a content/resolved-addressed derivation input. */
+class Derivation;
+Path realisedOutputPath(StoreAPI & store, const Path & drvPath,
+    const Derivation & drv, const string & output);
+
 MakeError(SubstError, Error)
 MakeError(BuildError, Error) /* denotes a permanent build failure */
 

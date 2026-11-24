@@ -344,7 +344,9 @@ OBJ must be an object that has an associated gexp compiler, such as a
                               (loop lowered)
                               (return lowered)))
                         obj
-                        system target graft?))))))))
+                        system target graft?
+                        ((module-ref (resolve-module '(guix ca policy))
+                                     'package-addressing-key)))))))))) ;goonix: mode-sensitive object cache
 
 (define* (lower+expand-object obj
                               #:optional (system (%current-system))
@@ -364,7 +366,9 @@ expand to file names, but it's possible to expand to a plain data type."
                                            (return obj)
                                            (mcached (lower obj system target)
                                                     obj
-                                                    system target graft?))))
+                                                    system target graft?
+                                                    ((module-ref (resolve-module '(guix ca policy))
+                                                                 'package-addressing-key)))))) ;goonix: mode-sensitive object cache
            ;; LOWER might return something that needs to be further
            ;; lowered.
            (if (struct? lowered)
@@ -1232,6 +1236,7 @@ derivations--e.g., code evaluated for its side effects."
                            leaked-env-vars
                            local-build? (substitutable? #t)
                            (properties '())
+                           (addressing 'input)       ;goonix: lowering policy
                            deprecation-warnings
                            (script-name (string-append name "-builder")))
   "Return a derivation NAME that runs EXP (a gexp) with GUILE-FOR-BUILD (a
@@ -1333,9 +1338,18 @@ The other arguments are as for 'derivation'."
                                                          #:target target)
                                        (return #f)))
                        (guile -> (lowered-gexp-guile lowered))
-                       (builder  (text-file script-name
-                                            (sexp->string
-                                             (lowered-gexp-sexp lowered)))))
+                       (addressing -> ((module-ref (resolve-module '(guix ca policy)) 'gexp-addressing)
+                                       addressing (lowered-gexp-guile lowered)
+                                       (lowered-gexp-inputs lowered) graphs allowed disallowed)) ;goonix: actual inputs and references
+                       ;; goonix: reference-list outputs are required inputs (CA only).
+                       (ref-inputs (if (eq? addressing 'input) (return '())
+                                       ((module-ref (resolve-module '(guix ca references)) 'reference-inputs)
+                                        allowed-references disallowed-references system target)))
+                       (builder-text -> (sexp->string
+                                         (lowered-gexp-sexp lowered))) ;goonix: builder text
+                       (builder  (if (eq? addressing 'input)
+                                     (text-file script-name builder-text)
+                                     (return script-name))))
     (mbegin %store-monad
       (set-grafting graft?)                       ;restore the initial setting
       (raw-derivation name
@@ -1348,17 +1362,29 @@ The other arguments are as for 'derivation'."
                         ,@(append-map (lambda (directory)
                                         `("-C" ,directory))
                                       (lowered-gexp-load-compiled-path lowered))
-                        ,builder)
+                        ,(if (eq? addressing 'input) ;goonix: embedded builder in non-input modes
+                             builder
+                             (string-append "$NIX_BUILD_TOP/" builder)))
                       #:outputs outputs
-                      #:env-vars env-vars
+                      #:env-vars
+                      `(,@env-vars ;goonix: __files and addressing are daemon metadata
+                        ,@(if (eq? addressing 'input)
+                              '()
+                              `(("__files" . ,builder)
+                                (,(string-append "__file:" builder)
+                                 . ,builder-text))))
+                      #:addressing addressing
                       #:system system
                       #:inputs `(,guile
                                  ,@(lowered-gexp-inputs lowered)
+                                 ,@ref-inputs ;goonix: reference-list outputs
                                  ,@(match graphs
                                      (((_ . inputs) ...)
                                       (filter derivation-input? inputs))
                                      (#f '())))
-                      #:sources `(,builder
+                      #:sources `(,@(if (eq? addressing 'input) ;goonix: builder embedded for CA
+                                        (list builder)
+                                        '())
                                   ,@(if (and (string? modules)
                                              (store-path? modules))
                                         (list modules)
@@ -1377,6 +1403,10 @@ The other arguments are as for 'derivation'."
                       #:local-build? local-build?
                       #:substitutable? substitutable?
                       #:properties properties))))
+
+;; goonix: only CA package builders get the package's addressing at run time.
+(define gexp->derivation/plain gexp->derivation) ;goonix: retain upstream lowerer
+(set! gexp->derivation (lambda args (apply (module-ref (resolve-module '(guix ca policy)) 'gexp-with-addressing) gexp->derivation/plain args))) ;goonix: embed builders
 
 (define (fold/tree proc seed lst)
   "Like 'fold', but recurse into sub-lists of LST and accept improper lists."

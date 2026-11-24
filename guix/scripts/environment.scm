@@ -63,6 +63,8 @@
   #:use-module (srfi srfi-37)
   #:use-module (srfi srfi-98)
   #:export (assert-container-features
+            options/resolve-packages     ;goonix: for the evaluator
+            manifest->derivation         ;goonix: for the evaluator
             load-manifest
             launch-environment/container
             guix-environment

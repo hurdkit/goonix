@@ -1,0 +1,1566 @@
+// goonix: test vectors for tokens, placeholders and reserved paths.
+#include "ca.hh"
+#include "deep-scan.hh"
+#include "references.hh"
+#include "local-store.hh"
+#include "globals.hh"
+#include <cstdlib>
+#include <iostream>
+#include <format>
+#include <variant>
+#include <stdexcept>
+
+#include <fcntl.h>
+#include <sys/stat.h>
+
+#include <sys/resource.h>
+#include <poll.h>
+
+using namespace nix;
+namespace nix {
+void checkRewriteForTest(const Path & path, const string & from, const string & to);
+string replaceWholeForTest(const string & body, const string & from, const string & to);
+void rewriteTreeForTest(const Path & path, const string & from, const string & to);
+string encodeReservedForTest(const Hash & digest, bool token);
+string inverseTreeForTest(const Path & path, const string & final,
+    const string & token, const std::map<Path, Path> & siblings);
+bool sameContentForTest(const Path & path, const string & final,
+    const string & token, const Hash & expected,
+    const std::map<Path, Path> & siblings);
+}
+
+static unsigned failures = 0;
+
+static void check(bool condition, const std::string & name)
+{
+    if (condition) {
+        std::cout << "PASS " << name << '\n';
+    } else {
+        std::cerr << "FAIL " << name << '\n';
+        ++failures;
+    }
+}
+
+template<class F> static bool throws(F && f)
+{
+    try { f(); return false; }
+    catch (const Error &) { return true; }
+}
+
+static void configureIsolatedStore(const Path & root)
+{
+    settings.nixStateDir = root + "/state";
+    settings.nixStore = root + "/store";
+    settings.nixDBPath = root + "/db";
+    settings.nixConfDir = root + "/etc";
+    settings.nixLogDir = root + "/log";
+    settings.nixDaemonSocketFile = root + "/socket";
+    settings.buildUsersGroup = "";
+}
+
+/* A small, strict JSON reader for the shared vectors. It is test code only;
+   the daemon itself does not acquire a JSON dependency. */
+struct JSON;
+using JSONArray = std::vector<JSON>;
+using JSONObject = std::map<string, JSON>;
+struct JSON : std::variant<std::nullptr_t, bool, uint64_t, string,
+    JSONArray, JSONObject>
+{
+    using variant::variant;
+    const JSON & at(const string & key) const
+    {
+        auto object = std::get_if<JSONObject>(this);
+        if (!object) throw std::runtime_error("expected JSON object");
+        auto found = object->find(key);
+        if (found == object->end())
+            throw std::runtime_error("missing JSON vector field: " + key);
+        return found->second;
+    }
+    const string & text() const
+    {
+        auto value = std::get_if<string>(this);
+        if (!value) throw std::runtime_error("expected JSON string");
+        return *value;
+    }
+    uint64_t number() const
+    {
+        auto value = std::get_if<uint64_t>(this);
+        if (!value) throw std::runtime_error("expected JSON integer");
+        return *value;
+    }
+    const JSONArray & array() const
+    {
+        auto value = std::get_if<JSONArray>(this);
+        if (!value) throw std::runtime_error("expected JSON array");
+        return *value;
+    }
+};
+
+class JSONParser
+{
+    const string input;
+    size_t at = 0;
+    void whitespace()
+    {
+        while (at < input.size() &&
+            (input[at] == ' ' || input[at] == '\n' ||
+             input[at] == '\r' || input[at] == '\t')) ++at;
+    }
+    bool consume(char c)
+    {
+        whitespace();
+        if (at < input.size() && input[at] == c) { ++at; return true; }
+        return false;
+    }
+    void literal(const char * text)
+    {
+        size_t length = strlen(text);
+        if (input.compare(at, length, text) != 0)
+            throw std::runtime_error("invalid JSON literal");
+        at += length;
+    }
+    static void utf8(string & out, unsigned codepoint)
+    {
+        if (codepoint <= 0x7f) out.push_back(codepoint);
+        else if (codepoint <= 0x7ff) {
+            out.push_back(0xc0 | (codepoint >> 6));
+            out.push_back(0x80 | (codepoint & 0x3f));
+        } else {
+            if (codepoint >= 0xd800 && codepoint <= 0xdfff)
+                throw std::runtime_error("unpaired JSON surrogate");
+            out.push_back(0xe0 | (codepoint >> 12));
+            out.push_back(0x80 | ((codepoint >> 6) & 0x3f));
+            out.push_back(0x80 | (codepoint & 0x3f));
+        }
+    }
+    string parseString()
+    {
+        whitespace();
+        if (at >= input.size() || input[at++] != '"')
+            throw std::runtime_error("expected JSON string");
+        string result;
+        while (at < input.size()) {
+            unsigned char c = input[at++];
+            if (c == '"') return result;
+            if (c < 0x20) throw std::runtime_error("control byte in JSON string");
+            if (c != '\\') { result.push_back(c); continue; }
+            if (at == input.size()) throw std::runtime_error("truncated JSON escape");
+            char escape = input[at++];
+            switch (escape) {
+                case '"': case '\\': case '/': result.push_back(escape); break;
+                case 'b': result.push_back('\b'); break;
+                case 'f': result.push_back('\f'); break;
+                case 'n': result.push_back('\n'); break;
+                case 'r': result.push_back('\r'); break;
+                case 't': result.push_back('\t'); break;
+                case 'u': {
+                    if (at + 4 > input.size())
+                        throw std::runtime_error("truncated JSON Unicode escape");
+                    unsigned value = 0;
+                    for (unsigned i = 0; i < 4; ++i) {
+                        char digit = input[at++];
+                        value <<= 4;
+                        if (digit >= '0' && digit <= '9') value += digit - '0';
+                        else if (digit >= 'a' && digit <= 'f') value += digit - 'a' + 10;
+                        else if (digit >= 'A' && digit <= 'F') value += digit - 'A' + 10;
+                        else throw std::runtime_error("invalid JSON Unicode escape");
+                    }
+                    utf8(result, value);
+                    break;
+                }
+                default: throw std::runtime_error("unknown JSON escape");
+            }
+        }
+        throw std::runtime_error("unterminated JSON string");
+    }
+    JSON value()
+    {
+        whitespace();
+        if (at == input.size()) throw std::runtime_error("missing JSON value");
+        if (consume('{')) {
+            JSONObject object;
+            if (consume('}')) return object;
+            while (true) {
+                string key = parseString();
+                if (!consume(':')) throw std::runtime_error("expected JSON colon");
+                if (!object.emplace(key, value()).second)
+                    throw std::runtime_error("duplicate JSON vector field: " + key);
+                if (consume('}')) return object;
+                if (!consume(',')) throw std::runtime_error("expected JSON comma");
+            }
+        }
+        if (consume('[')) {
+            JSONArray array;
+            if (consume(']')) return array;
+            while (true) {
+                array.push_back(value());
+                if (consume(']')) return array;
+                if (!consume(',')) throw std::runtime_error("expected JSON comma");
+            }
+        }
+        if (input[at] == '"') return parseString();
+        if (input.compare(at, 4, "true") == 0) { literal("true"); return true; }
+        if (input.compare(at, 5, "false") == 0) { literal("false"); return false; }
+        if (input.compare(at, 4, "null") == 0) { literal("null"); return nullptr; }
+        size_t start = at;
+        while (at < input.size() && input[at] >= '0' && input[at] <= '9') ++at;
+        if (start == at) throw std::runtime_error("invalid JSON number");
+        return std::stoull(input.substr(start, at - start));
+    }
+public:
+    explicit JSONParser(const Path & file) : input(readFile(file)) { }
+    JSON parse()
+    {
+        JSON result = value();
+        whitespace();
+        if (at != input.size()) throw std::runtime_error("trailing JSON input");
+        return result;
+    }
+};
+
+static void checkOutputPathValidation(const Path & root)
+{
+    configureIsolatedStore(root);
+    LocalStore store(false);
+    Hash hash = hashString(htSHA256, "attacker-controlled content");
+    Derivation drv;
+    drv.platform = "x86_64-linux";
+    drv.builder = "/bin/sh";
+    drv.env["goonixResolved"] = "1";
+    drv.outputs["out"] = DerivationOutput(
+        settings.nixStore + "/00000000000000000000000000000000-chosen",
+        "r:sha256", printHash(hash));
+    drv.env["out"] = drv.outputs["out"].path;
+    bool accepted = true;
+    try {
+        store.addTextToStore("fixed.drv", unparseDerivation(drv), PathSet());
+    } catch (const Error &) {
+        accepted = false;
+    }
+    check(!accepted, "fixed output path is recomputed, not attacker chosen");
+
+    drv.env.erase("goonixResolved");
+    drv.outputs["out"] = DerivationOutput(
+        settings.nixStore + "/00000000000000000000000000000001-chosen", "", "");
+    drv.env["out"] = drv.outputs["out"].path;
+    accepted = true;
+    try { store.addTextToStore("unvalidated.drv", unparseDerivation(drv), PathSet()); }
+    catch (const Error &) { accepted = false; }
+    check(!accepted, "addressing marker cannot bypass output path validation");
+
+    drv.env["goonixAddressing"] = "resolved";
+    drv.env["goonixResolved"] = "1";
+    drv.env["out"] = drv.outputs["out"].path;
+    accepted = true;
+    try { store.addTextToStore("resolved-chosen.drv", unparseDerivation(drv), PathSet()); }
+    catch (const Error &) { accepted = false; }
+    check(!accepted, "resolved-addressed path is recomputed from resolved bytes");
+
+    drv.outputs["out"] = DerivationOutput(
+        makePlaceholder(unparseDerivation(drv), "out", "placeholder"), "", "");
+    drv.env["goonixResolved"] = "1";
+    drv.env["out"] = drv.outputs["out"].path;
+    accepted = true;
+    try { store.addTextToStore("placeholder.drv", unparseDerivation(drv), PathSet()); }
+    catch (const Error &) { accepted = false; }
+    check(!accepted, "placeholder output path is bound to the unresolved derivation");
+}
+
+static void checkSymlinkModes(const Path & root)
+{
+    configureIsolatedStore(root);
+    LocalStore store(false);
+    createDirs(settings.nixStore);
+    chmod(settings.nixStore.c_str(), 0755);
+    Path output = tokenPath("out", "symlink-output");
+    createSymlink(baseNameOf(output), output);
+    PathSet references;
+    Hash narHash;
+    uint64_t narSize = 0;
+    chmod(settings.nixStore.c_str(), 0755);
+    Path final = finaliseContentOutput(store, output, "out", "symlink-output",
+        PathSet{output}, references, narHash, narSize);
+    struct stat st;
+    if (stat(settings.nixStore.c_str(), &st))
+        throw SysError("reading isolated store mode");
+    check((st.st_mode & 07777) == 0755, "top-level symlink preserves store mode");
+    Path directory = tokenPath("out", "symlink-directory");
+    createDirs(directory);
+    chmod(directory.c_str(), 0755);
+    createSymlink(directory, directory + "/self");
+    writeFile(directory + "/reference", directory);
+    const timespec times[2] = {{0, UTIME_OMIT}, {1, 0}};
+    if (utimensat(AT_FDCWD, (directory + "/self").c_str(), times, AT_SYMLINK_NOFOLLOW) ||
+        utimensat(AT_FDCWD, (directory + "/reference").c_str(), times, 0) ||
+        utimensat(AT_FDCWD, directory.c_str(), times, 0))
+        throw SysError("canonicalising CA test timestamps");
+    references.clear();
+    final = finaliseContentOutput(store, directory, "out", "symlink-directory",
+        PathSet{directory}, references, narHash, narSize);
+    if (stat(final.c_str(), &st)) throw SysError("reading final directory mode");
+    check((st.st_mode & 07777) == 0755, "nested symlink preserves parent mode");
+    check(st.st_mtime == 1, "rewritten directory retains canonical timestamp");
+    if (lstat((final + "/self").c_str(), &st)) throw SysError("reading rewritten symlink");
+    check(st.st_mtime == 1, "rewritten symlink retains canonical timestamp");
+    if (stat((final + "/reference").c_str(), &st)) throw SysError("reading rewritten file");
+    check(st.st_mtime == 1, "rewritten file retains canonical timestamp");
+}
+
+static void checkStreamingFinalisation(const Path & root)
+{
+    configureIsolatedStore(root);
+    LocalStore store(false);
+    createDirs(settings.nixStore);
+    Path output = tokenPath("out", "sparse-output");
+    int fd = open(output.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (fd < 0) throw SysError("creating sparse CA test output");
+    AutoCloseFD close = fd;
+    const uint64_t size = 128 * 1024 * 1024;
+    if (ftruncate(fd, size)) throw SysError("sizing sparse CA test output");
+    const string self = output;
+    if (pwrite(fd, self.data(), self.size(), size / 2) != (ssize_t) self.size())
+        throw SysError("writing sparse CA self-reference");
+    close.close();
+    struct rlimit limit;
+    if (getrlimit(RLIMIT_AS, &limit)) throw SysError("reading address-space limit");
+    if (limit.rlim_cur > 96 * 1024 * 1024) limit.rlim_cur = 96 * 1024 * 1024;
+    if (setrlimit(RLIMIT_AS, &limit)) throw SysError("setting CA test memory limit");
+    PathSet references;
+    Hash narHash;
+    uint64_t narSize = 0;
+    Path final = finaliseContentOutput(store, output, "out", "sparse-output",
+        PathSet{output}, references, narHash, narSize);
+    check(pathExists(final), "sparse output finalises within the memory limit");
+}
+
+static void checkExistingItemIsUntouched(const Path & root)
+{
+    configureIsolatedStore(root);
+    LocalStore store(false);
+    createDirs(settings.nixStore);
+    Path token = tokenPath("out", "existing-output");
+    createDirs(token);
+    writeFile(token + "/reference", token);
+    PathSet references;
+    Hash narHash;
+    uint64_t narSize = 0;
+    bool created = false;
+    Path final = finaliseContentOutput(store, token, "out", "existing-output",
+        PathSet{token}, references, narHash, narSize, {}, "", &created);
+    check(created, "a newly moved final tree is owned by its finaliser");
+    ValidPathInfo valid;
+    valid.path = final;
+    valid.hash = narHash;
+    valid.narSize = narSize;
+    valid.references = references;
+    store.registerValidPath(valid);
+    Path witness = root + "/witness";
+    createDirs(witness);
+    writeFile(witness + "/reference", final);
+    if (link((final + "/reference").c_str(), (witness + "/linked").c_str()))
+        throw SysError("hard-linking early-cutoff witness");
+    chmod(final.c_str(), 0555);
+    Path againToken = tokenPath("out", "existing-output");
+    createDirs(againToken);
+    writeFile(againToken + "/reference", againToken);
+    Path again = finaliseContentOutput(store, againToken, "out", "existing-output",
+        PathSet{againToken}, references, narHash, narSize, {}, "", &created);
+    check(!created, "an existing valid final tree is not caller-owned");
+    check(again == final, "existing result is reused at the same address");
+    check(readFile(final + "/reference") == final,
+        "existing self-reference remains in final form");
+    check(readFile(witness + "/linked") == final,
+        "hard-linked content is not rewritten");
+
+    /* Put a token-form tree at the valid final address.  The old inverse
+       check hashes that tree on disk and accepts it; the fixed check must
+       refuse it without touching the item or a hard link to its contents. */
+    if (chmod((final + "/reference").c_str(), 0600) ||
+        chmod((witness + "/linked").c_str(), 0600))
+        throw SysError("preparing the same-address collision fixture");
+    writeFile(final + "/reference", againToken);
+    check(readFile(witness + "/linked") == againToken,
+        "collision fixture changed the linked existing item");
+    bool collision = throws([&] {
+        PathSet ignoredReferences;
+        Hash ignoredNAR;
+        uint64_t ignoredSize = 0;
+        finaliseContentOutput(store, againToken, "out", "existing-output",
+            PathSet{againToken}, ignoredReferences, ignoredNAR, ignoredSize);
+    });
+    check(collision, "corrupt tree at a claimed content address is refused");
+    check(readFile(witness + "/linked") == againToken,
+        "failed early-cutoff comparison leaves the linked item untouched");
+    check(readFile(final + "/reference") == againToken,
+        "failed early-cutoff comparison leaves the existing item untouched");
+}
+
+static void checkInvalidLeftoverIsReplaced(const Path & root)
+{
+    configureIsolatedStore(root);
+    LocalStore store(false);
+    createDirs(settings.nixStore);
+    Path token = tokenPath("out", "leftover-output");
+    createDirs(token);
+    writeFile(token + "/reference", token);
+    PathSet references;
+    Hash narHash;
+    uint64_t narSize = 0;
+    Path final = finaliseContentOutput(store, token, "out", "leftover-output",
+        PathSet{token}, references, narHash, narSize);
+    /* This simulates a daemon death after the rename but before registration.
+       The final tree has the right content but is not valid. */
+    check(!store.isValidPath(final), "leftover fixture is not registered");
+    createDirs(token);
+    writeFile(token + "/reference", token);
+    bool created = false;
+    Path recovered = finaliseContentOutput(store, token, "out", "leftover-output",
+        PathSet{token}, references, narHash, narSize, {}, "", &created);
+    check(recovered == final, "leftover is recovered at its content address");
+    check(created, "recovered leftover belongs to this finalisation");
+    check(readFile(final + "/reference") == final,
+        "recovered leftover contains the final self reference");
+}
+
+static void checkSiblingOutputReferences(const Path & root)
+{
+    configureIsolatedStore(root);
+    LocalStore store(false);
+    createDirs(settings.nixStore);
+    Path libToken = tokenPath("lib", "multi-lib");
+    createDirs(libToken);
+    PathSet references;
+    Hash narHash;
+    uint64_t narSize = 0;
+    Path libFinal = finaliseContentOutput(store, libToken, "lib", "multi-lib",
+        PathSet{libToken}, references, narHash, narSize);
+    Path outToken = tokenPath("out", "multi-out");
+    createDirs(outToken);
+    writeFile(outToken + "/uses-lib", libToken);
+    references.clear();
+    Path outFinal = finaliseContentOutput(store, outToken, "out", "multi-out",
+        PathSet{outToken, libToken, libFinal}, references, narHash, narSize,
+        std::map<Path, Path>{{libToken, libFinal}});
+    check(readFile(outFinal + "/uses-lib") == libFinal,
+        "sibling token is replaced by its final output path");
+    check(references.count(libFinal) == 1,
+        "sibling output is registered as a reference");
+}
+
+/* goonix: a tree that already carries a sibling's FINAL path, not its token.
+
+   Measured on CA-6's gcc-14.3.0: bin/gcc-ar holds
+   sans3lascpwwjmmml8p7y4x8rh34hgrz (the REALISED lib output) while the
+   derivation declares that sibling as the token
+   teuttuuueeuttoototeeeutooeeeuout.  A graft writes the replacement's realised
+   path through (guix/ca/build/graft.scm stands in only own-outputs).
+
+   The forward sibling loop in finaliseContentOutput rewrites sibling TOKENS to
+   finals; an occurrence that is already final is untouched and enters `built`
+   as a final.  inverseTree then maps every sibling final back to its token,
+   including that one, so the inverse disagrees with `built`.
+
+   The control above writes the sibling TOKEN, so both sides see the same
+   token-to-final change and agree. */
+static void checkSiblingAlreadyFinal(const Path & root)
+{
+    configureIsolatedStore(root);
+    LocalStore store(false);
+    createDirs(settings.nixStore);
+    Path libToken = tokenPath("lib", "sibfinal-lib");
+    createDirs(libToken);
+    writeFile(libToken + "/payload", "library");
+    PathSet references;
+    Hash narHash;
+    uint64_t narSize = 0;
+    Path libFinal = finaliseContentOutput(store, libToken, "lib", "sibfinal-lib",
+        PathSet{libToken}, references, narHash, narSize);
+    Path outToken = tokenPath("out", "sibfinal-out");
+    createDirs(outToken);
+    /* The sibling's FINAL path, plus this output's own token. */
+    writeFile(outToken + "/driver", libFinal + " " + outToken);
+    references.clear();
+    bool refused = false;
+    std::string message;
+    Path outFinal;
+    try {
+        outFinal = finaliseContentOutput(store, outToken, "out", "sibfinal-out",
+            PathSet{outToken, libToken, libFinal}, references, narHash, narSize,
+            std::map<Path, Path>{{libToken, libFinal}});
+    } catch (const Error & e) {
+        refused = true;
+        message = e.what();
+    }
+    /* Name the refusal, so a future failure cannot be mistaken for a fixture
+       problem: this test's whole point is that finalisation must not refuse. */
+    std::cout << "sibfinal: refused=" << refused << " message=" << message << '\n';
+    check(!refused,
+        "a tree carrying a sibling's final path is finalised, not refused");
+    if (!refused)
+        check(readFile(outFinal + "/driver") == libFinal + " " + outFinal,
+            "the sibling's final path and the self reference are both correct");
+}
+
+/* goonix: the SAME sibling present both as its token and as its final path.
+
+   Reviewer, 2026-11-22, on 356945478fc: that fix selected per SIBLING, not per
+   occurrence, so the mixed case was expected to fail the inverse check again.
+   MEASURED: it does not.  On 356945478fc this fixture printed refused=0.
+
+   The reason is that scanForReferences cannot see a reserved name at all
+   (RefScanSink's search rejects every byte outside nix's base32 alphabet, and
+   goonix tokens use the disjoint 'eout' alphabet; probe: tokens=1 present=0).
+   So that selection was always empty and no sibling was ever reversed.
+
+   What is correct here, stated explicitly: after the sibling loop every
+   occurrence of that sibling in the tree is its FINAL path — the token one was
+   rewritten, the already-final one was left alone — and `built` is hashed from
+   that tree.  Finalisation's job is exactly to leave no token behind, so the
+   output must finalise with both occurrences final.  This test pins that, and
+   pins that no token survives. */
+static void checkSiblingMixedForms(const Path & root)
+{
+    configureIsolatedStore(root);
+    LocalStore store(false);
+    createDirs(settings.nixStore);
+    Path libToken = tokenPath("lib", "sibmixed-lib");
+    createDirs(libToken);
+    writeFile(libToken + "/payload", "library");
+    PathSet references;
+    Hash narHash;
+    uint64_t narSize = 0;
+    Path libFinal = finaliseContentOutput(store, libToken, "lib", "sibmixed-lib",
+        PathSet{libToken}, references, narHash, narSize);
+    Path outToken = tokenPath("out", "sibmixed-out");
+    createDirs(outToken);
+    /* One file holds the token, another holds the same sibling's final path. */
+    writeFile(outToken + "/from-builder", libToken);
+    writeFile(outToken + "/from-graft", libFinal);
+    references.clear();
+    bool refused = false;
+    std::string message;
+    Path outFinal;
+    try {
+        outFinal = finaliseContentOutput(store, outToken, "out", "sibmixed-out",
+            PathSet{outToken, libToken, libFinal}, references, narHash, narSize,
+            std::map<Path, Path>{{libToken, libFinal}});
+    } catch (const Error & e) {
+        refused = true;
+        message = e.what();
+    }
+    std::cout << "sibmixed: refused=" << refused << " message=" << message << '\n';
+    check(!refused,
+        "a sibling present as both token and final is finalised, not refused");
+    if (!refused) {
+        check(readFile(outFinal + "/from-builder") == libFinal,
+            "the token occurrence becomes the sibling's final path");
+        check(readFile(outFinal + "/from-graft") == libFinal,
+            "the already-final occurrence stays the sibling's final path");
+        check(references.count(libFinal) == 1,
+            "the sibling is registered once as a reference");
+    }
+}
+
+static void checkFinalRootBeforeExistence(const Path & root)
+{
+    configureIsolatedStore(root);
+    createDirs(settings.nixStore);
+    Path token = tokenPath("out", "root-before-existence");
+    createDirs(token);
+    writeFile(token + "/reference", token);
+    HashResult ignored;
+    PathSet initialReferences = scanForReferences(token, PathSet{token}, ignored);
+    initialReferences.erase(token);
+    Path final = contentAddressedPath("out", "root-before-existence",
+        treeHash(token), initialReferences);
+    Pipe ready, proceed;
+    ready.create();
+    proceed.create();
+    pid_t pid = fork();
+    if (pid == -1) throw SysError("forking CA rooting test");
+    if (pid == 0) {
+        try {
+            ready.readSide.close();
+            proceed.writeSide.close();
+            /* The store and its roots file belong to this child, not to the
+               parent acting as the collector. This avoids inherited POSIX
+               lock ownership. */
+            LocalStore store(false);
+            store.addTempRoot(token);
+            Path roots = settings.nixStateDir + "/temproots/" +
+                std::to_string(getpid());
+            writeFull(ready.writeSide, roots + "\n");
+            char byte;
+            if (read(proceed.readSide, &byte, 1) != 1)
+                throw Error("rooting test did not receive proceed signal");
+            PathSet references;
+            Hash narHash;
+            uint64_t narSize = 0;
+            Path result = finaliseContentOutput(store, token, "out",
+                "root-before-existence", PathSet{token}, references,
+                narHash, narSize);
+            check(result == final, "rooting fixture selected expected final path");
+            check(references.count(final) == 1,
+                "rooting fixture includes its final self reference");
+            _exit(failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE);
+        } catch (const std::exception & e) {
+            try { std::cerr << "rooting child: " << e.what() << '\n'; } catch (...) { }
+            _exit(EXIT_FAILURE);
+        }
+    }
+    Pid child = pid;
+    ready.writeSide.close();
+    proceed.readSide.close();
+    Path roots = readLine(ready.readSide);
+    check(!roots.empty(), "rooting child created its temporary roots file");
+    AutoCloseFD lock = openLockFile(roots, false);
+    if (!lockFile(lock, ltRead, true)) throw Error("locking collector roots");
+    writeFull(proceed.writeSide, "go\n");
+    pollfd completion = {ready.readSide.borrow(), POLLIN | POLLHUP, 0};
+    int readyResult = poll(&completion, 1, 1000);
+    string contents = readFile(roots, true);
+    bool rooted = false;
+    size_t at = 0;
+    while (at < contents.size()) {
+        size_t end = contents.find('\0', at);
+        if (end == string::npos) break;
+        if (contents.substr(at, end - at) == final) rooted = true;
+        at = end + 1;
+    }
+    check(readyResult == 0 && pathExists(token),
+        "finalisation waits for the temporary-roots read lock");
+    /* A collector holds this lock while taking its snapshot. addTempRoot
+       excludes it before the final path can be checked, moved or reused. */
+    check(!rooted,
+        "final path cannot enter the store while the collector snapshot is blocked");
+    lockFile(lock, ltNone, true);
+    check(child.wait(true) == 0, "rooting child completes after collector lock releases");
+    contents = readFile(roots, true);
+    check(contents.find(final + '\0') != string::npos,
+        "final path is rooted before the finaliser can complete");
+    check(readFile(final + "/reference") == final,
+        "rooted final tree is intact after the lock handoff");
+}
+
+static void checkSharedVectors(const Path & file, const Path & root)
+{
+    settings.nixStore = "/gnu/store";
+    JSON vectors = JSONParser(file).parse();
+    check(vectors.at("format").number() == 1, "shared vector format is 1");
+    auto field = [&](const JSON & object, const string & name) {
+        return object.at(name).text();
+    };
+    auto tokens = vectors.at("tokens");
+    auto out = field(tokens, "out");
+    auto lib = field(tokens, "lib");
+    check(selfToken("out") == out, "shared self token vector");
+    check(selfToken("lib") == lib, "shared lib token vector");
+    check(tokenPath("out", "hello-1.0") ==
+        "/gnu/store/" + out + "-hello-1.0", "shared token path vector");
+    auto placeholder = vectors.at("placeholder");
+    Path placeholderPath = makePlaceholder(field(placeholder, "derivationBytes"),
+        field(placeholder, "output"), field(placeholder, "name"));
+    check(placeholderPath == "/gnu/store/" + field(placeholder, "hash") + "-" +
+        field(placeholder, "name"), "shared placeholder vector");
+
+    if (pathExists(root)) deletePath(root);
+    createDirs(root);
+    auto trees = vectors.at("trees");
+    for (auto & vector : trees.array()) {
+        auto name = field(vector, "name");
+        auto kind = field(vector, "kind");
+        Path path = root + "/" + name;
+        if (kind == "regular") {
+            string bytes;
+            for (auto & byte : vector.at("bytes").array())
+                bytes.push_back((char) byte.number());
+            writeFile(path, bytes);
+            chmod(path.c_str(), vector.at("executable").number() ? 0555 : 0444);
+        } else if (kind == "symlink")
+            createSymlink(field(vector, "target"), path);
+        else if (kind == "directory") {
+            createDirs(path);
+            for (auto & entry : vector.at("entries").array()) {
+                string bytes;
+                for (auto & byte : entry.at("bytes").array())
+                    bytes.push_back((char) byte.number());
+                Path child = path + "/" + field(entry, "name");
+                writeFile(child, bytes);
+                chmod(child.c_str(), 0444);
+            }
+        }
+        else throw Error("unknown shared tree vector kind");
+        check(printHash(treeHash(path)) == field(vector, "sha256"),
+            "shared tree vector: " + name);
+    }
+    /* Create these in reverse lexical order: the expected digest must come
+       from the specified byte ordering, not from directory insertion order. */
+    Path ordered = root + "/ordered";
+    createDirs(ordered);
+    writeFile(ordered + "/z-last", "z");
+    writeFile(ordered + "/a-first", "a");
+    createSymlink("m-target", ordered + "/m-link");
+    for (auto & file : {ordered + "/z-last", ordered + "/a-first"})
+        chmod(file.c_str(), 0444);
+    check(printHash(treeHash(ordered)) ==
+        field(vectors.at("orderedDirectory"), "sha256"),
+        "shared directory entry ordering vector");
+
+    auto content = vectors.at("contentPaths");
+    Hash empty = parseHash(htSHA256,
+        field(trees.array().front(), "sha256"));
+    PathSet references;
+    for (auto & reference : content.at("references").array())
+        references.insert(reference.text());
+    check(contentAddressedPath("out", "hello", empty, {}) ==
+        field(content, "withoutReferences"), "shared content path vector");
+    check(contentAddressedPath("out", "hello", empty, references) ==
+        field(content, "withReferences"),
+        "shared content path with sorted references vector");
+
+    auto resolved = vectors.at("resolvedDerivation");
+    string bytes = field(resolved, "bytes");
+    Derivation parsed = parseDerivationText(bytes);
+    check(unparseDerivation(parsed) == bytes,
+        "shared resolved derivation canonical bytes");
+    check(resolvedAddressedPath("out", "hello", bytes) ==
+        field(resolved, "resolvedPath"), "shared resolved-addressed path vector");
+    check(resolvedAddressedPath("lib", "hello-lib", bytes) ==
+        field(resolved, "resolvedLibPath"),
+        "shared resolved-addressed sibling path vector");
+
+    auto unresolved = vectors.at("unresolvedDerivation");
+    string unresolvedBytes = field(unresolved, "bytes");
+    Derivation unresolvedParsed = parseDerivationText(unresolvedBytes);
+    check(unparseDerivation(unresolvedParsed) == unresolvedBytes,
+        "shared unresolved derivation canonical bytes");
+    check(unresolvedParsed.outputs.size() == 2 &&
+        unresolvedParsed.inputDrvs.size() == 1,
+        "shared unresolved derivation has two outputs and an input derivation");
+    check(makePlaceholder(unresolvedBytes, field(unresolved, "output"),
+            field(unresolved, "name")) == "/gnu/store/" +
+            field(unresolved, "placeholderHash") + "-" + field(unresolved, "name"),
+        "shared placeholder bytes match the unresolved derivation serializer");
+
+    auto recordVector = vectors.at("record");
+    BuildRecord record;
+    record.resolvedHash = field(recordVector, "resolvedHash");
+    record.resolvedDerivation = field(recordVector, "derivation");
+    record.output = field(recordVector, "output");
+    record.path = field(recordVector, "path");
+    record.origin = field(recordVector, "origin");
+    record.relocationChecked = recordVector.at("relocationChecked").number();
+    string payload = canonicalBuildRecordPayload(record);
+    string expectedPayload;
+    for (auto & byte : recordVector.at("payload").array())
+        expectedPayload.push_back((char) byte.number());
+    check(payload == expectedPayload, "shared canonical record payload bytes");
+    check(printHash(hashString(htSHA256, payload)) == field(recordVector, "sha256"),
+        "shared canonical record payload hash");
+}
+
+static void checkStagedToken(const Path & root)
+{
+    configureIsolatedStore(root);
+    LocalStore store(false);
+    createDirs(settings.nixStore);
+    Path token = tokenPath("out", "ca-relocation");
+    Path staged = settings.nixStore + "/.goonix-tmp-test";
+    createDirs(staged);
+    writeFile(staged + "/reference", token);
+    createSymlink(baseNameOf(token), staged + "/link");
+    createDirs(staged + "/" + baseNameOf(token));
+    writeFile(staged + "/executable", "#!/bin/sh\n");
+    chmod((staged + "/executable").c_str(), 0555);
+    PathSet references;
+    Hash narHash;
+    uint64_t narSize = 0;
+    Path final = finaliseContentOutput(store, token, "out", "ca-relocation",
+        PathSet{token}, references, narHash, narSize, {}, staged);
+    check(readFile(final + "/reference") == final,
+        "staged physical path retains the logical self token");
+    check(readLink(final + "/link") == baseNameOf(final),
+        "staged symlink is rewritten against the logical token");
+}
+
+static void checkSiblingOrder(const Path & root)
+{
+    configureIsolatedStore(root);
+    LocalStore store(false);
+    createDirs(settings.nixStore);
+    Derivation drv;
+    drv.outputs["lib"] = DerivationOutput(tokenPath("lib", "multi-lib"), "", "");
+    drv.outputs["out"] = DerivationOutput(tokenPath("out", "multi-out"), "", "");
+    Path out = drv.outputs["out"].path;
+    createDirs(out);
+    writeFile(out + "/uses-lib", drv.outputs["lib"].path);
+    createDirs(drv.outputs["lib"].path);
+    auto order = contentOutputOrder(drv, PathSet{out, drv.outputs["lib"].path});
+    check(order.size() == 2 && order.front().first == "lib",
+        "referenced sibling is finalised before its dependent");
+}
+
+static void checkOpaqueUtf(const Path & root)
+{
+    configureIsolatedStore(root);
+    string token = baseNameOf(tokenPath("out", "utf")).substr(0, 32);
+    for (unsigned width : {2, 4}) {
+        Path file = root + (width == 2 ? "/utf16" : "/utf32");
+        string bytes;
+        for (char c : token) {
+            bytes.push_back(c);
+            for (unsigned i = 1; i < width; ++i) bytes.push_back(0);
+        }
+        writeFile(file, bytes);
+        string replacement(token.size(), 'x');
+        check(throws([&] { checkRewriteForTest(file, token, replacement); }),
+            width == 2 ? "UTF-16 self-reference is refused" :
+                         "UTF-32 self-reference is refused");
+    }
+}
+
+static void checkOpaqueFragmentBoundary(const Path & root)
+{
+    configureIsolatedStore(root);
+    Path token = tokenPath("out", "fragment");
+    Path file = root + "/fragment";
+    string hash = baseNameOf(token).substr(0, 32);
+    size_t split = 128 * 1024 - 31;
+    string contents(split, 'x');
+    contents += hash.substr(0, 1);
+    contents += hash.substr(1, 7);
+    contents += "tail";
+    writeFile(file, contents);
+    check(throws([&] { checkRewriteForTest(file, hash, hash); }),
+        "opaque fragment split across a read boundary is refused");
+}
+
+static void checkInverseFragmentBoundary(const Path & root)
+{
+    configureIsolatedStore(root);
+    Path file = root + "/inverse-fragment";
+    string hash = baseNameOf(tokenPath("out", "inverse")).substr(0, 32);
+    string contents(128 * 1024 - 31, 'x');
+    contents += hash.substr(0, 1);
+    contents += hash.substr(1, 7);
+    contents += "tail";
+    writeFile(file, contents);
+    check(throws([&] { checkRewriteForTest(file, hash, hash); }),
+        "inverse fragment split across a read boundary is refused");
+}
+
+static void checkDeepCompressedSelfToken(const Path & root)
+{
+    ::unsetenv("GOONIX_DEEP_SCAN_HELPER");
+    settings.set("goonix-deep-scan-helper", "");
+    Path installedHelper = deepScanHelperPath();
+    check(!installedHelper.empty() && installedHelper[0] == '/' &&
+        installedHelper.find('$') == string::npos,
+        std::format("installed helper path is expanded: {}", installedHelper));
+    configureIsolatedStore(root);
+    LocalStore store(false);
+    createDirs(settings.nixStore);
+    chmod(settings.nixStore.c_str(), 0755);
+    Path directory = settings.nixStore + "/" + baseNameOf(tokenPath("out", "deep-scan"));
+    createDirs(directory);
+    string token = baseNameOf(directory).substr(0, 32);
+    Path archive = root + "/member.gz";
+    writeFile(archive, readFile("tests/fixtures/ca-self-token.gz"));
+    writeFile(directory + "/member.gz", readFile(archive));
+    PathSet references;
+    Hash narHash;
+    uint64_t narSize = 0;
+    settings.set("goonix-deep-scan", "false");
+    Path final = finaliseContentOutput(store, directory, "out", "deep-scan",
+        PathSet{directory}, references, narHash, narSize);
+    check(!final.empty() && pathExists(final), "ordinary finalisation accepts a compressed self token");
+    deletePath(final);
+
+    /* The environment override is how a build-tree daemon finds its helper. */
+    createDirs(directory);
+    writeFile(directory + "/member.gz", readFile(archive));
+    ::setenv("GOONIX_DEEP_SCAN_HELPER", (root + "/missing-from-environment").c_str(), 1);
+    settings.set("goonix-deep-scan", "true");
+    bool environmentMissing = false;
+    try { checkDeepOutput(directory, StringSet{token}); }
+    catch (const Error & error) {
+        environmentMissing = string(error.what()).find("unavailable") != string::npos;
+    }
+    check(environmentMissing, "missing helper from the environment refuses deep scanning");
+    settings.set("goonix-deep-scan", "false");
+    references.clear();
+    final = finaliseContentOutput(store, directory, "out", "deep-scan",
+        PathSet{directory}, references, narHash, narSize);
+    check(!final.empty() && pathExists(final),
+        "missing helper does not affect ordinary finalisation");
+    deletePath(final);
+    ::unsetenv("GOONIX_DEEP_SCAN_HELPER");
+
+    directory = settings.nixStore + "/" + baseNameOf(tokenPath("out", "deep-scan"));
+    createDirs(directory);
+    writeFile(directory + "/member.gz", readFile(archive));
+    references.clear();
+    settings.set("goonix-deep-scan", "true");
+    if (getEnv("GOONIX_DEEP_SCAN_HELPER").empty())
+        settings.set("goonix-deep-scan-helper", absPath("goonix-ca-scan"));
+    bool rejected = false;
+    try { checkDeepOutput(directory, StringSet{token}); }
+    catch (const Error & error) {
+        string message = error.what();
+        rejected = message.find("decompressed") != string::npos &&
+            message.find("member.gz") != string::npos;
+    }
+    check(rejected, "daemon rejects a found token from the helper");
+
+    settings.set("goonix-deep-scan-helper", root + "/missing-helper");
+    check(throws([&] { checkDeepOutput(directory, StringSet{token}); }),
+        "missing helper refuses finalisation");
+    Path crash = root + "/crash-helper";
+    writeFile(crash, readFile("nix/ca-scan-crash"));
+    chmod(crash.c_str(), 0755);
+    settings.set("goonix-deep-scan-helper", crash);
+    bool crashRefused = false;
+    try { checkDeepOutput(directory, StringSet{token}); }
+    catch (const Error & error) {
+        crashRefused = string(error.what()).find("crashed") != string::npos;
+    }
+    check(crashRefused, "helper crash refuses finalisation");
+    Path stall = root + "/stall-helper";
+    writeFile(stall, readFile("nix/ca-scan-stall"));
+    chmod(stall.c_str(), 0755);
+    settings.set("goonix-deep-scan-helper", stall);
+    settings.set("goonix-deep-scan-timeout", "1");
+    bool timeoutRefused = false;
+    try { checkDeepOutput(directory, StringSet{token}); }
+    catch (const Error & error) {
+        timeoutRefused = string(error.what()).find("exceeded") != string::npos;
+    }
+    check(timeoutRefused, "helper timeout refuses finalisation");
+
+    unsigned cleanups = 0;
+    auto countCleanup = [&] { ++cleanups; };
+    settings.set("goonix-deep-scan-helper", absPath("goonix-ca-scan"));
+    bool foundAgain = false;
+    try {
+        checkDeepOutput(directory, StringSet{token}, (uid_t) -1, (gid_t) -1,
+            countCleanup);
+    } catch (const Error &) { foundAgain = true; }
+    check(foundAgain && cleanups == 1, "deep scan cleanup runs after a refusal");
+    settings.set("goonix-deep-scan-helper", root + "/missing-helper");
+    bool missingAgain = false;
+    try {
+        checkDeepOutput(directory, StringSet{token}, (uid_t) -1, (gid_t) -1,
+            countCleanup);
+    } catch (const Error &) { missingAgain = true; }
+    check(missingAgain && cleanups == 2, "deep scan cleanup runs after helper failure");
+    settings.set("goonix-deep-scan-helper", absPath("goonix-ca-scan"));
+    bool originalError = false;
+    try {
+        checkDeepOutput(directory, StringSet{token}, (uid_t) -1, (gid_t) -1,
+            [] { throw Error("cleanup failure"); });
+    } catch (const Error & error) {
+        originalError = string(error.what()).find("unresolved goonix self token") != string::npos;
+    }
+    check(originalError, "cleanup failure does not replace a scan refusal");
+    settings.set("goonix-deep-scan", "false");
+    checkDeepOutput(directory, StringSet{token}, (uid_t) -1, (gid_t) -1,
+        countCleanup);
+    check(cleanups == 2, "disabled deep scan does not run cleanup");
+}
+
+int main(int argc, char ** argv)
+{
+    if (argc == 3 && string(argv[1]) == "--opaque-utf") {
+        checkOpaqueUtf(argv[2]);
+        return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+    if (argc == 3 && string(argv[1]) == "--inverse-fragment") {
+        checkInverseFragmentBoundary(argv[2]);
+        return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+    if (argc == 3 && string(argv[1]) == "--fragment-boundary") {
+        checkOpaqueFragmentBoundary(argv[2]);
+        return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+    if (argc == 3 && string(argv[1]) == "--deep-scan") {
+        checkDeepCompressedSelfToken(argv[2]);
+        return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+    if (argc == 3 && string(argv[1]) == "--sibling-order") {
+        checkSiblingOrder(argv[2]);
+        return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+    if (argc == 3 && string(argv[1]) == "--staged") {
+        checkStagedToken(argv[2]);
+        return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+    if (argc == 4 && string(argv[1]) == "--shared-vectors") {
+        checkSharedVectors(argv[2], argv[3]);
+        return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+    if (argc == 3 && string(argv[1]) == "--leftover") {
+        checkInvalidLeftoverIsReplaced(argv[2]);
+        return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+    if (argc == 3 && string(argv[1]) == "--final-root") {
+        checkFinalRootBeforeExistence(argv[2]);
+        return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+    if (argc == 3 && string(argv[1]) == "--siblings") {
+        checkSiblingOutputReferences(argv[2]);
+        return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+    if (argc == 3 && string(argv[1]) == "--sibling-already-final") {
+        checkSiblingAlreadyFinal(argv[2]);
+        return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+    if (argc == 3 && string(argv[1]) == "--sibling-mixed-forms") {
+        checkSiblingMixedForms(argv[2]);
+        return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+    if (argc == 3 && string(argv[1]) == "--existing-item") {
+        checkExistingItemIsUntouched(argv[2]);
+        return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+    if (argc == 3 && string(argv[1]) == "--streaming") {
+        checkStreamingFinalisation(argv[2]);
+        return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+    if (argc == 3 && string(argv[1]) == "--symlink-modes") {
+        checkSymlinkModes(argv[2]);
+        return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+    if (argc == 3 && string(argv[1]) == "--path-validation") {
+        checkOutputPathValidation(argv[2]);
+        return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+    if (argc != 1) {
+        /* A check that does not exist must not pass as the vectors below. */
+        std::cerr << "ca-test: unknown check `" << argv[1] << "'\n";
+        return EXIT_FAILURE;
+    }
+    settings.nixStore = "/gnu/store";
+
+    auto out = selfToken("out");
+    check(out.size() == 32 && out[0] != 'e'
+        && out.find_first_not_of("eout") == std::string::npos
+        && out == selfToken("out"), "self token shape and determinism");
+    check(out != selfToken("lib"), "self token depends on output");
+    check(isTokenStorePath(tokenPath("out", "hello-1.0")),
+        "token path has store shape");
+    auto placeholder = makePlaceholder("drv bytes", "out", "hello-1.0");
+    check(isPlaceholderPath(placeholder), "placeholder has store shape");
+    check(!isPlaceholderPath(tokenPath("out", "hello-1.0")),
+        "self token is not placeholder");
+    check(validateTokenPath(out + "-hello-1.0") == out + "-hello-1.0",
+        "token basename validates");
+    check(throws([] { validateTokenPath("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-hello"); }),
+        "unknown placeholder fails closed");
+    check(throws([] { validateTokenPath("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello"); }),
+        "ordinary base32 is not a token");
+
+    /* Upstream's remove-store-references marker is 32 'e' characters.  It is
+       ordinary upstream data, so it is NOT a reserved goonix name; and no
+       goonix name may BE it, so encodeReserved bumps such a placeholder's
+       last character to 'o'.  Vector: an ALL-ZERO digest encodes to a
+       leading 'e', 30 more 'e's and a final 'o'.  Must match reserved-hash
+       in guix/ca.scm, which is checked against the same vector there. */
+    {
+        std::string marker(32, 'e');
+        Hash zero(htSHA256);
+        memset(zero.hash, 0, zero.hashSize);
+        check(encodeReservedForTest(zero, false)
+                  == marker.substr(0, 31) + "o",
+            "all-zero digest encodes to e...eo, never the nuke-refs marker");
+        check(encodeReservedForTest(zero, true)[0] != 'e',
+            "a self token never starts with 'e', even for an all-zero digest");
+        check(!isReservedStorePath(settings.nixStore + "/" + marker + "-hello"),
+            "upstream nuke-refs marker is not a reserved store path");
+        check(!isPlaceholderPath(settings.nixStore + "/" + marker + "-hello"),
+            "upstream nuke-refs marker is not a placeholder");
+        check(isPlaceholderPath(settings.nixStore + "/" + marker.substr(0, 31)
+                                + "o-hello"),
+            "the bumped e...eo encoding is still a placeholder");
+    }
+
+    /* goonix: a hard-linked executable keeps its executable bit through the
+       rewrite.  Measured on CA-8's binutils-mesboot0 and CA-6's gcc: the
+       inverse mapping failed, and the kept trees showed 8 files in
+       i686-unknown-linux-gnu/bin/ at 0444 whose twins in bin/ were 0555, with
+       identical bytes.  Cause: rewriteRegularFile starts with
+       chmod(path, 0600), and chmod changes the mode of the INODE, so every
+       hard link of that file loses S_IXUSR at once.  rewriteTree stats each
+       entry as it reaches it, so the twin visited later computes
+       (st_mode & S_IXUSR) ? 0555 : 0444 from the already-cleared mode and is
+       installed non-executable.  The tree hash covers the executable bit, so
+       the inverse no longer matches and finalisation is refused.
+       Proven separately with a two-link file: chmod(a, 0600) leaves b at 0600
+       with S_IXUSR=0. */
+    {
+        Path root = createTempDir("", "goonix-hardlink-mode");
+        AutoDelete delRoot(root, true);
+        std::string token(32, 't'), replacement(32, 'u');
+        Path bin = root + "/bin", twin = root + "/i686/bin";
+        createDirs(bin);
+        createDirs(twin);
+        Path first = bin + "/ar", second = twin + "/ar";
+        writeFile(first, "/gnu/store/" + token + "-binutils/bin/ar\n");
+        chmod(first.c_str(), 0555);
+        if (link(first.c_str(), second.c_str()))
+            throw SysError("linking the test twin");
+        struct stat before;
+        lstat(second.c_str(), &before);
+        check((before.st_mode & 07777) == 0555 && before.st_nlink == 2,
+            "the test fixture really is a hard-linked executable pair");
+
+        rewriteTreeForTest(root, token, replacement);
+
+        struct stat a, b;
+        lstat(first.c_str(), &a);
+        lstat(second.c_str(), &b);
+        check((a.st_mode & S_IXUSR) != 0,
+            "the first hard-linked executable stays executable");
+        check((b.st_mode & S_IXUSR) != 0,
+            "the hard-linked twin keeps its executable bit through the rewrite");
+        check((a.st_mode & 07777) == (b.st_mode & 07777),
+            "both hard-linked twins end with the same mode");
+    }
+
+    /* goonix: the same property across SEVERAL rewrite passes over one tree.
+       A multi-output derivation rewrites the tree once per sibling output and
+       then once for its own token (finaliseContentOutput), so an executable
+       must survive every pass, not just the first.
+
+       This is a PROPERTY test, not the regression test for the chmod fix:
+       measured, it passes on 460360f28bb as well, because that commit's
+       per-pass capture already restored 0555 before the next pass stat'ed.
+       It is kept because the property is worth pinning now that the capture
+       map is gone and the mode comes straight from the inode. */
+    {
+        Path root = createTempDir("", "goonix-hardlink-passes");
+        AutoDelete delRoot(root, true);
+        std::string sibling(32, 's'), siblingTo(32, 'v');
+        std::string self(32, 't'), selfTo(32, 'u');
+        createDirs(root + "/bin");
+        createDirs(root + "/triplet/bin");
+        Path first = root + "/bin/ld", second = root + "/triplet/bin/ld";
+        writeFile(first, "/gnu/store/" + sibling + "-gcc/lib /gnu/store/"
+                  + self + "-gcc/bin\n");
+        chmod(first.c_str(), 0555);
+        if (link(first.c_str(), second.c_str()))
+            throw SysError("linking the test twin");
+
+        /* Two passes, as a two-output derivation does. */
+        rewriteTreeForTest(root, sibling, siblingTo);
+        rewriteTreeForTest(root, self, selfTo);
+
+        struct stat a, b;
+        lstat(first.c_str(), &a);
+        lstat(second.c_str(), &b);
+        check((a.st_mode & S_IXUSR) != 0,
+            "an executable stays executable across two rewrite passes");
+        check((b.st_mode & S_IXUSR) != 0,
+            "its hard-linked twin stays executable across two rewrite passes");
+    }
+
+    /* goonix: a sibling hash at the END of a file, and across the 128 KiB read
+       boundary.  inverseTree's streaming loop used to retain only `final.size()
+       - 1' bytes and scan prefixes of `final' alone, so a SIBLING hash crossing
+       the cut was split between two inverse() calls and never mapped back to its
+       token.  sameContent then reported false for identical content - a spurious
+       CA collision / verification failure for multi-output derivations whose
+       outputs reference each other.  Found by the Haskell session's sameContent
+       probe.
+
+       THE PROPERTY.  inverse() undoes a realisation: it maps this output's final
+       hash back to its token, and each sibling's final hash back to that
+       sibling's token.  So two realisations of the SAME content, carrying
+       different final hashes, must invert to the SAME canonical tree - both
+       end up expressed in tokens.  (Inverting A to B's hashes and B to A's would
+       produce two SWAPPED trees, which are legitimately different; that was my
+       first, wrong, expectation.)
+
+       Each fixture builds the token-form tree once as the reference, then two
+       realisations of it, and requires both inversions to equal the reference. */
+    {
+        std::string selfTok(32, 't'), sibTok(32, 's');
+        std::string selfA(32, 'a'), selfB(32, 'b');
+        std::string sibA(32, 'c'), sibB(32, 'd');
+
+        /* Build one tree in a given spelling of the two hashes. */
+        auto build = [&](const std::string & self, const std::string & sib,
+                         const std::string & suffix, size_t pad) {
+            Path root = createTempDir("", "goonix-sibling-boundary");
+            createDirs(root + "/bin");
+            writeFile(root + "/bin/w",
+                std::string(pad, 'p')
+                + "#! /bin/sh\nexec /gnu/store/" + sib + "-foo-bin/bin/x \"$@\""
+                + suffix);
+            writeFile(root + "/bin/self", "/gnu/store/" + self + "-foo\n");
+            return root;
+        };
+        /* The sibling map is TOKEN -> FINAL, as finalisation builds it
+           (rewriteTree(physical, sibling.first, sibling.second)); inverse()
+           replaces it->second with it->first. */
+        auto siblings = [&](const std::string & sibFinal) {
+            std::map<Path, Path> m;
+            m["/gnu/store/" + sibTok + "-foo-bin"] =
+                "/gnu/store/" + sibFinal + "-foo-bin";
+            return m;
+        };
+
+        /* (1) The sibling hash ends 0, 1 and 30 bytes before EOF - all inside
+           the old 31-byte retained tail, so the old code split it. */
+        for (unsigned tail : {0u, 1u, 30u}) {
+            std::string suffix(tail, 'x');
+            Path ref = build(selfTok, sibTok, suffix, 0);
+            Path ra = build(selfA, sibA, suffix, 0);
+            Path rb = build(selfB, sibB, suffix, 0);
+            AutoDelete d1(ref, true), d2(ra, true), d3(rb, true);
+            string want = inverseTreeForTest(ref, selfTok, selfTok, {});
+            string gotA = inverseTreeForTest(ra, selfA, selfTok, siblings(sibA));
+            string gotB = inverseTreeForTest(rb, selfB, selfTok, siblings(sibB));
+            check(gotA == want && gotB == want,
+                std::format("a sibling hash {} bytes from EOF inverts to the token tree", tail));
+        }
+
+        /* (2) A sibling hash STRADDLING the 128 KiB read boundary.  The padding
+           places the hash so the read cut falls inside it. */
+        for (unsigned straddle : {1u, 16u, 31u, 32u}) {
+            /* The prefix before the sibling hash is the padding plus the fixed
+               shebang/exec text; shift the padding so the hash spans the cut. */
+            std::string lead = "#! /bin/sh\nexec /gnu/store/";
+            size_t boundary = 128 * 1024;
+            size_t pad = boundary - straddle - lead.size();
+            Path ref = build(selfTok, sibTok, "", pad);
+            Path ra = build(selfA, sibA, "", pad);
+            Path rb = build(selfB, sibB, "", pad);
+            AutoDelete d1(ref, true), d2(ra, true), d3(rb, true);
+            string want = inverseTreeForTest(ref, selfTok, selfTok, {});
+            string gotA = inverseTreeForTest(ra, selfA, selfTok, siblings(sibA));
+            string gotB = inverseTreeForTest(rb, selfB, selfTok, siblings(sibB));
+            check(gotA == want && gotB == want,
+                std::format("a sibling hash straddling the read boundary ({}) inverts to the token tree",
+                    straddle));
+        }
+
+        /* (2b) THE PREFIX-RULE COUNTEREXAMPLES (reviewer, correcting
+           8f646d4969f; Haskell port 057b2a097b9).  A hash that ends EXACTLY at
+           `process' - i.e. 31 bytes before EOF, or 31 bytes before a read end -
+           is COMPLETE, so it must be inverted in this round.  A prefix test
+           instead sees its last byte as a 1-byte prefix of some pattern whenever
+           that byte equals a pattern's first character, pulls `process' back one
+           byte, and splits the complete match: neither half is ever inverted.
+           These fixtures make that happen deliberately, for both border kinds
+           (the file's own hash and a sibling's) and at the first read's end.
+           tail=30 stays as the control: it is outside the window and passed even
+           under the wrong rule. */
+        {
+            /* The sibling's final hash ends with the FIRST character of the
+               file's own final hash, so the 1-byte suffix matches `final'. */
+            std::string sibEndsLikeSelf = std::string(31, 'c') + selfA.substr(0, 1);
+            std::string sibEndsLikeSelfB = std::string(31, 'd') + selfB.substr(0, 1);
+            /* And one that ends with its OWN first character (self-overlap). */
+            std::string sibSelfOverlap = std::string(32, 'c');
+            std::string sibSelfOverlapB = std::string(32, 'd');
+
+            /* `after' is the distance from the HASH END to EOF, not the length
+               of the padding: build() appends "-foo-bin/bin/x \"$@\"" (19 bytes)
+               after the hash, so a padding of N puts the hash end 19+N bytes
+               before EOF.  My first attempt passed 31 as the padding and so
+               tested 50 bytes, which no rule gets wrong - it passed under BOTH
+               the prefix rule and the whole-match rule.  Compute the padding
+               from the wanted distance instead. */
+            const size_t sibTrail = std::string("-foo-bin/bin/x \"$@\"").size();
+            auto padFor = [&](unsigned after) {
+                return std::string(after > sibTrail ? after - sibTrail : 0, 'x');
+            };
+
+            struct Shape { const char * name; std::string a, b; unsigned after; };
+            std::vector<Shape> shapes = {
+                {"sibling ends in the file hash's first char", sibEndsLikeSelf, sibEndsLikeSelfB, 31},
+                {"sibling ends in its own first char", sibSelfOverlap, sibSelfOverlapB, 31},
+                {"sibling ends in the file hash's first char (control)", sibEndsLikeSelf, sibEndsLikeSelfB, 30},
+            };
+            for (auto & shape : shapes) {
+                std::string suffix = padFor(shape.after);
+                Path ref = build(selfTok, sibTok, suffix, 0);
+                Path ra = build(selfA, shape.a, suffix, 0);
+                Path rb = build(selfB, shape.b, suffix, 0);
+                AutoDelete d1(ref, true), d2(ra, true), d3(rb, true);
+                string want = inverseTreeForTest(ref, selfTok, selfTok, {});
+                string gotA = inverseTreeForTest(ra, selfA, selfTok, siblings(shape.a));
+                string gotB = inverseTreeForTest(rb, selfB, selfTok, siblings(shape.b));
+                check(gotA == want && gotB == want,
+                    std::format("{} {} bytes from EOF inverts whole", shape.name, shape.after));
+            }
+
+            /* The FILE's own hash ending in a SIBLING's first character: the
+               border kind is the other way round.  The self reference is last in
+               its file, its hash end exactly `after' bytes before EOF. */
+            {
+                std::string selfEndsLikeSib = std::string(31, 'a') + sibA.substr(0, 1);
+                std::string selfEndsLikeSibB = std::string(31, 'b') + sibB.substr(0, 1);
+                const size_t selfTrail = std::string("-foo").size();
+                auto buildSelfLast = [&](const std::string & self,
+                                         const std::string & sib, unsigned after) {
+                    Path root = createTempDir("", "goonix-self-border");
+                    createDirs(root + "/bin");
+                    writeFile(root + "/bin/sib", "/gnu/store/" + sib + "-foo-bin\n");
+                    writeFile(root + "/bin/w",
+                        "/gnu/store/" + self + "-foo"
+                        + std::string(after > selfTrail ? after - selfTrail : 0, 'x'));
+                    return root;
+                };
+                Path ref = buildSelfLast(selfTok, sibTok, 31);
+                Path ra = buildSelfLast(selfEndsLikeSib, sibA, 31);
+                Path rb = buildSelfLast(selfEndsLikeSibB, sibB, 31);
+                AutoDelete d1(ref, true), d2(ra, true), d3(rb, true);
+                string want = inverseTreeForTest(ref, selfTok, selfTok, {});
+                string gotA = inverseTreeForTest(ra, selfEndsLikeSib, selfTok, siblings(sibA));
+                string gotB = inverseTreeForTest(rb, selfEndsLikeSibB, selfTok, siblings(sibB));
+                check(gotA == want && gotB == want,
+                    "the file hash ending in a sibling's first char 31 bytes from EOF inverts whole");
+            }
+
+            /* The same shape with the hash end exactly 31 bytes before the END
+               OF THE FIRST 128 KiB READ, so the split is at a read boundary
+               rather than at EOF.  Sweep the distance: the read() chunking is
+               not guaranteed to be exactly 128 KiB, so a single offset can miss
+               the window by a byte and pass under BOTH rules (measured). */
+            {
+                std::string lead = "#! /bin/sh\nexec /gnu/store/";
+                size_t boundary = 128 * 1024;
+                for (unsigned after : {30u, 31u, 32u, 33u}) {
+                    /* The hash END sits at pad + lead + 32; the trailing
+                       "-foo-bin/bin/x" text comes AFTER it and is irrelevant to
+                       where the read cut falls.  Subtracting sibTrail here too
+                       put the hash 19+after bytes before the cut, which no rule
+                       gets wrong (measured: all four passed under both rules). */
+                    size_t pad = boundary - after - lead.size() - 32;
+                    /* The file MUST extend past the read end, or read() returns
+                       it whole and there is no boundary to straddle (measured:
+                       with only the 19-byte trailer the file was 131060 bytes,
+                       under 128 KiB, and all four offsets passed under both
+                       rules).  Add a tail so a second read really happens. */
+                    std::string beyond(4096, 'z');
+                    Path ref = build(selfTok, sibTok, beyond, pad);
+                    Path ra = build(selfA, sibSelfOverlap, beyond, pad);
+                    Path rb = build(selfB, sibSelfOverlapB, beyond, pad);
+                    AutoDelete d1(ref, true), d2(ra, true), d3(rb, true);
+                    string want = inverseTreeForTest(ref, selfTok, selfTok, {});
+                    string gotA = inverseTreeForTest(ra, selfA, selfTok, siblings(sibSelfOverlap));
+                    string gotB = inverseTreeForTest(rb, selfB, selfTok, siblings(sibSelfOverlapB));
+                    check(gotA == want && gotB == want,
+                        std::format("a complete sibling hash {} bytes before the first read end inverts whole",
+                            after));
+                }
+            }
+
+            /* A SWEEP of hash-end distances around EOF, with the self-overlapping
+               sibling (32 equal characters).  This is the general form of the
+               counterexample: whatever `keep' is, a complete match ending at
+               `process' must not be pulled apart.  Sweeping rather than picking
+               one offset is deliberate - my first three hand-picked shapes
+               included two that passed under the WRONG rule too, because the
+               distance I computed was not the distance from the hash end. */
+            for (unsigned after = 28; after <= 36; ++after) {
+                std::string suffix = padFor(after);
+                Path ref = build(selfTok, sibTok, suffix, 0);
+                Path ra = build(selfA, sibSelfOverlap, suffix, 0);
+                Path rb = build(selfB, sibSelfOverlapB, suffix, 0);
+                AutoDelete d1(ref, true), d2(ra, true), d3(rb, true);
+                string want = inverseTreeForTest(ref, selfTok, selfTok, {});
+                string gotA = inverseTreeForTest(ra, selfA, selfTok, siblings(sibSelfOverlap));
+                string gotB = inverseTreeForTest(rb, selfB, selfTok, siblings(sibSelfOverlapB));
+                check(gotA == want && gotB == want,
+                    std::format("self-overlapping sibling hash {} bytes from EOF inverts whole", after));
+            }
+        }
+
+        /* (3) The VERDICT, not just the digest: sameContent must accept a
+           realisation whose sibling reference sits at EOF.  This is the
+           observable a multi-output finalisation consults.  The expected hash is
+           the TOKEN tree's, computed independently of the call under test. */
+        {
+            Path ref = build(selfTok, sibTok, "", 0);
+            Path ra = build(selfA, sibA, "", 0);
+            AutoDelete d1(ref, true), d2(ra, true);
+            Hash expected = parseHash(htSHA256,
+                inverseTreeForTest(ref, selfTok, selfTok, {}));
+            check(sameContentForTest(ra, "/gnu/store/" + selfA + "-foo",
+                    "/gnu/store/" + selfTok + "-foo", expected, siblings(sibA)),
+                "sameContent accepts a sibling reference at EOF");
+            /* And it must still REJECT genuinely different content. */
+            writeFile(ra + "/bin/self", "/gnu/store/" + selfA + "-foo CHANGED\n");
+            check(!sameContentForTest(ra, "/gnu/store/" + selfA + "-foo",
+                    "/gnu/store/" + selfTok + "-foo", expected, siblings(sibA)),
+                "sameContent still rejects a real content change");
+        }
+    }
+    /* goonix: the FORWARD rewrite's streaming boundary must give the WHOLE-FILE
+       result, whatever read() did.  Two defects, both from the same prefix rule
+       that inverseTree had (reviewer; c95008b9279 fixed the inverse side):
+
+       (a) A COMPLETE plain self-reference ending exactly at `process' - keep
+           bytes before EOF or before a read end - whose last character equals
+           the token's first, had its last byte held back.  The chunk then held
+           the token minus one byte and the 8-byte fragment check REJECTED a
+           valid file with "opaque self-reference fragment".
+       (b) An opaque occurrence STARTING before `process' and ending after it was
+           split, so neither chunk saw it whole and the file was ACCEPTED with a
+           hidden self reference, while the same file read in one piece was
+           rejected.
+
+       THE EXPECTATION IS COMPUTED FROM THE WHOLE FILE, never from
+       rewriteRegularFile: a reference copy is rewritten in ONE call on a file
+       small enough to be read whole, and the streaming file must agree with it -
+       same bytes, or both rejected.  A test that asked the streaming code what
+       it does would agree with itself. */
+    {
+        /* A token whose last character equals its first: the self-overlap that
+           makes the prefix rule bite.  32 chars, nix-base32-shaped. */
+        std::string from = "z" + std::string(30, 'q') + "z";
+        std::string to   = "y" + std::string(30, 'w') + "y";
+        const size_t keep = from.size() * 4 - 1;      /* 127, as in the code */
+
+        /* Whole-file reference: rewrite a SMALL file in one call. */
+        auto wholeFile = [&](const std::string & body, std::string & out) {
+            Path dir = createTempDir("", "goonix-rewrite-ref");
+            AutoDelete del(dir, true);
+            Path f = dir + "/f";
+            writeFile(f, body);
+            try {
+                checkRewriteForTest(f, from, to);
+                out = readFile(f);
+                return true;
+            } catch (const Error &) { return false; }
+        };
+        /* Streaming: the same body, padded so the interesting occurrence sits at
+           the emit point of a real multi-read file. */
+        auto streaming = [&](const std::string & body, std::string & out) {
+            Path dir = createTempDir("", "goonix-rewrite-stream");
+            AutoDelete del(dir, true);
+            Path f = dir + "/f";
+            writeFile(f, body);
+            try {
+                checkRewriteForTest(f, from, to);
+                out = readFile(f);
+                return true;
+            } catch (const Error &) { return false; }
+        };
+        /* Compare the FULL rewritten output against the same body rewritten in
+           ONE call.  `small' is only used to build the reference when the body
+           itself is small; for a padded body the reference is the SAME body
+           rewritten with a single read, which is what "must equal the whole-file
+           result" means.  Comparing trailing `small.size()' bytes was wrong: the
+           padded body ends in the 4 KiB tail, not in `small', so the comparison
+           was meaningless and failed under both rules (measured). */
+        auto agree = [&](const std::string & body, const std::string & name) {
+            std::string wantBytes, gotBytes;
+            /* Reference: the whole body in memory, rewritten by the same
+               primitive but with no streaming - one replaceWhole call. */
+            bool want = true;
+            try { wantBytes = replaceWholeForTest(body, from, to); }
+            catch (const Error &) { want = false; }
+            bool got = streaming(body, gotBytes);
+            check(want == got && (!want || wantBytes == gotBytes), name);
+        };
+        /* Keep a small-file path too: it proves the reference itself agrees with
+           the on-disk rewrite when there is only one read. */
+        auto agreeSmall = [&](const std::string & body, const std::string & name) {
+            std::string wantBytes, gotBytes;
+            bool want = wholeFile(body, wantBytes);
+            bool got = streaming(body, gotBytes);
+            check(want == got && (!want || wantBytes == gotBytes), name);
+        };
+
+        /* (a) A plain self-reference ending exactly `keep' bytes before EOF, and
+           before the first read's end.  Sweep: the window is one byte wide. */
+        for (unsigned after = keep - 2; after <= keep + 2; ++after) {
+            std::string body = "/gnu/store/" + from + "-p" + std::string(after, 'x');
+            /* Small reference: the same body, no padding, one read. */
+            agreeSmall(body,
+                std::format("a complete self-reference {} bytes from EOF rewrites like the whole file", after));
+        }
+        {
+            /* At the first read's end the file MUST extend past 128 KiB, or
+               read() returns it whole and there is no boundary (the trap I hit
+               on the inverse side). */
+            size_t boundary = 128 * 1024;
+            for (unsigned after = keep - 2; after <= keep + 2; ++after) {
+                size_t pad = boundary - after - 11 - from.size();
+                std::string lead = "/gnu/store/";
+                std::string body = std::string(pad, 'p') + lead + from + "-p"
+                                 + std::string(4096, 'z');
+                agree(body,
+                    std::format("a complete self-reference {} bytes before the first read end rewrites whole", after));
+            }
+        }
+
+        /* (b) Opaque occurrences straddling the emit point: UTF-32LE, UTF-16LE
+           and an 8-byte fragment.  Each must be REJECTED, exactly as the whole
+           file is. */
+        auto encode = [&](unsigned width) {
+            std::string e;
+            for (char c : from) {
+                e.push_back(c);
+                for (unsigned j = 1; j < width; ++j) e.push_back(0);
+            }
+            return e;
+        };
+        struct Opaque { const char * name; std::string bytes; };
+        std::vector<Opaque> opaques = {
+            {"UTF-32LE", encode(4)},
+            {"UTF-16LE", encode(2)},
+            {"8-byte fragment", from.substr(4, 8)},
+        };
+        size_t boundary = 128 * 1024;
+        for (auto & op : opaques) {
+            /* Sweep the START offset around the emit point. */
+            for (int delta = -2; delta <= 2; ++delta) {
+                size_t start = boundary - keep + delta;
+                if (start < 8) continue;
+                std::string body = std::string(start, 'p') + op.bytes
+                                 + std::string(4096, 'z');
+                agree(body,
+                    std::format("{} straddling the emit point ({:+d}) is refused like the whole file",
+                        op.name, delta));
+            }
+        }
+
+        /* (c) A rejection in the FINAL TAIL of a file longer than one read must
+           name the FILE offset, not the offset within the remaining tail.  The
+           final flush used to call replaceWhole directly, which reports from 0
+           of the tail it was handed.  Put an opaque occurrence well past the
+           first read, in what is left when the loop ends, and check the message.
+           The expected offset is computed from the body, not from the code. */
+        for (auto & op : opaques) {
+            /* The occurrence must lie in what is left AFTER the loop's last
+               round, i.e. within the final `keep' bytes of the file, so the
+               flush is what judges it.  At 2 reads + 4096 the UTF-32 case was
+               still caught inside the loop (measured: it passed under both
+               versions), because the loop's last round still had it before its
+               emit point.  Put it near EOF instead, with only a short suffix. */
+            size_t at = 2 * boundary + 4096;
+            std::string body = std::string(at, 'p') + op.bytes;
+            Path dir = createTempDir("", "goonix-rewrite-tail-offset");
+            AutoDelete del(dir, true);
+            Path f = dir + "/f";
+            writeFile(f, body);
+            std::string message;
+            try {
+                checkRewriteForTest(f, from, to);
+            } catch (const Error & e) { message = e.what(); }
+            check(message.find(std::format("at byte {}", at)) != std::string::npos,
+                std::format("{} in the final tail reports the FILE offset {}", op.name, at));
+            /* Measured: only UTF-16LE and the 8-byte fragment go RED without the
+               fix.  A UTF-32LE encoding is 128 bytes and keep is 127, so its
+               START is always < process in the loop's last round - it can never
+               reach the flush, and the loop already reports the file offset
+               correctly.  The case is kept as a control, not as evidence. */
+        }
+    }
+
+    return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+}

@@ -8,6 +8,18 @@ fi
 baseline=$1
 actual=$2
 fail=0
+# A comparison of NOTHING is not agreement.  Both directories empty (a run that
+# died before producing any .trs) used to fall through every loop and exit 0,
+# which the counted gate printed as ALL NAMES IDENTICAL - a green gate with zero
+# tests.  Require at least one recorded suite on each side.
+baseline_count=0
+actual_count=0
+for f in "$baseline"/*.trs; do test -f "$f" && baseline_count=$((baseline_count + 1)); done
+for f in "$actual"/*.trs; do test -f "$f" && actual_count=$((actual_count + 1)); done
+if test "$baseline_count" -eq 0 || test "$actual_count" -eq 0; then
+    printf 'EMPTY_COMPARISON baseline=%s actual=%s\n' "$baseline_count" "$actual_count"
+    exit 1
+fi
 for expected in "$baseline"/*.trs
 do
     test -f "$expected" || continue

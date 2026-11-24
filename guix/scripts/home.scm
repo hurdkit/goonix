@@ -71,6 +71,7 @@
                                       shepherd-service-node-type)
   #:autoload   (guix scripts home edit) (guix-home-edit)
   #:autoload   (guix scripts home import) (import-manifest)
+  #:autoload   (guix scripts flake) (flake-command-action) ;goonix: flakes
   #:use-module ((guix status) #:select (with-status-verbosity))
   #:use-module ((guix build utils) #:select (mkdir-p switch-symlinks))
   #:use-module (guix gexp)
@@ -659,6 +660,8 @@ deploy the home environment described by these files.\n")
 (define-command (guix-home . args)
   (synopsis "build and deploy home environments")
 
+  (define arguments args)                         ;goonix: as they were given
+
   (define (parse-sub-command arg result)
     ;; Parse sub-command ARG and augment RESULT accordingly.
     (if (assoc-ref result 'action)
@@ -735,7 +738,9 @@ deploy the home environment described by these files.\n")
            (command  (assoc-ref opts 'action)))
       (parameterize ((%graft? (assoc-ref opts 'graft?)))
         (with-status-verbosity (verbosity-level opts)
-          (process-command command args opts))))))
+          ;; goonix: on a flake reference, the evaluation is not done here.
+          (or (flake-command-action 'home command args opts arguments)
+              (process-command command args opts)))))))
 
 
 ;;;

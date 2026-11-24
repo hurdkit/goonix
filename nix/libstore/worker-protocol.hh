@@ -6,7 +6,7 @@ namespace nix {
 #define WORKER_MAGIC_1 0x6e697863
 #define WORKER_MAGIC_2 0x6478696f
 
-#define PROTOCOL_VERSION 0x164
+#define PROTOCOL_VERSION 0x166 // goonix: resolved derivation graph records
 #define GET_PROTOCOL_MAJOR(x) ((x) & 0xff00)
 #define GET_PROTOCOL_MINOR(x) ((x) & 0x00ff)
 
@@ -45,7 +45,10 @@ typedef enum {
     wopOptimiseStore = 34,
     wopVerifyStore = 35,
     wopBuiltinBuilders = 80,
-    wopSubstituteURLs = 81
+    wopSubstituteURLs = 81,
+    wopQueryRealisedOutput = 82, // goonix
+    wopQueryBuildRecords = 83, // goonix: signed records for a resolved derivation
+    wopQueryBuildGraph = 84 // goonix: signed records of a whole build graph
 } WorkerOp;
 
 

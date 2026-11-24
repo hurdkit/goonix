@@ -19,9 +19,13 @@ unchanged next to this file.
    from a flake, so a consumer pins one exact commit of goonix in its own
    `flake.lock` and gets the `guix` command of that commit. No `guix pull`,
    no `channels.scm`, no `guix time-machine`.
-2. **A place to change Guix itself.** The first planned change is a
-   Guix-native equivalent of flakes; the design is in
-   [`doc/goonix/flakes-design.md`](doc/goonix/flakes-design.md).
+2. **A place to change Guix itself.** What it changes is described in
+   `doc/goonix/`: evaluation in a container
+   ([`pure-evaluation.md`](doc/goonix/pure-evaluation.md)), a Guix-native
+   equivalent of flakes ([`flakes.md`](doc/goonix/flakes.md); the first
+   design is in [`flakes-design.md`](doc/goonix/flakes-design.md)), and a
+   content-addressed store
+   ([`content-addressing.md`](doc/goonix/content-addressing.md)).
 
 ## Using it
 

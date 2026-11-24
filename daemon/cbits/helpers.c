@@ -7,10 +7,11 @@
 #include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
+#include <fcntl.h>
+#include <grp.h>
 #include <stdio.h>
 
 #include <sys/types.h>
-#include <grp.h>
 
 /* Equivalent to the C++ daemon's killUser: the short-lived child changes to
    the leased uid so kill(-1, SIGKILL) affects only that uid's processes.  On
@@ -199,6 +200,54 @@ int goonix_spawn_discover(const char *program, int *pid_out)
   result = posix_spawn(&pid, program, NULL, &attributes, argv, environ);
   posix_spawnattr_destroy(&attributes);
   if (result != 0) { errno = result; return -1; }
+  *pid_out = (int)pid;
+  return 0;
+}
+
+/* goonix: launch the deep CA scan helper with no daemon privileges.  The child
+   gets a new session, /dev/null on stdin, the output pipe on stdout+stderr, an
+   empty environment, and (when the daemon is root) the build user's uid/gid.
+   An unprivileged daemon cannot assume the build user's identity and must not
+   pretend to have dropped privileges.  Returns the pid; the caller polls the
+   output pipe and waits.  Mirrors nix/libstore/deep-scan.cc runDeepScanHelper. */
+int goonix_spawn_deep_scan(const char *helper, const char *tree,
+                           char *const tokens[], int token_count,
+                           int output_fd, uid_t build_uid, gid_t build_gid,
+                           int *pid_out)
+{
+  int nullfd = open("/dev/null", O_RDWR);
+  if (nullfd < 0) return -1;
+  pid_t pid = fork();
+  if (pid < 0) { close(nullfd); return -1; }
+  if (pid == 0) {
+    /* Only this tiny C shim runs between fork and exec, never Haskell. */
+    if (setsid() < 0) _exit(2);
+    if (dup2(nullfd, STDIN_FILENO) < 0 ||
+        dup2(output_fd, STDOUT_FILENO) < 0 ||
+        dup2(output_fd, STDERR_FILENO) < 0)
+      _exit(2);
+    if (nullfd > STDERR_FILENO) close(nullfd);
+    if (output_fd > STDERR_FILENO) close(output_fd);
+    if (geteuid() == 0) {
+      if (build_uid == (uid_t)-1 || build_gid == (gid_t)-1 || build_uid == 0)
+        _exit(2);
+      if (setgroups(0, NULL) != 0 || setgid(build_gid) != 0 || setuid(build_uid) != 0)
+        _exit(2);
+      if (geteuid() == 0) _exit(2);
+    } else if (build_uid != (uid_t)-1 && build_uid != geteuid()) {
+      _exit(2);
+    }
+    char **argv = calloc((size_t)token_count + 3, sizeof(char *));
+    if (!argv) _exit(2);
+    argv[0] = (char *)helper;
+    argv[1] = (char *)tree;
+    for (int i = 0; i < token_count; i++) argv[i + 2] = tokens[i];
+    argv[token_count + 2] = NULL;
+    char *empty_env[] = {NULL};
+    execve(helper, argv, empty_env);
+    _exit(errno == ENOENT ? 127 : 126);
+  }
+  close(nullfd);
   *pid_out = (int)pid;
   return 0;
 }

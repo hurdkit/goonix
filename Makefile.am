@@ -692,6 +692,9 @@ SH_TESTS =					\
   tests/guix-repl.sh     			\
   tests/guix-lint.sh
 
+# goonix: the modules, tests and rules that the fork adds.
+include goonix.mk
+
 if CAN_RUN_TESTS
 
 TESTS = $(SCM_TESTS) $(SH_TESTS)
@@ -994,6 +997,8 @@ if BUILD_DAEMON
 include daemon/local.mk
 if !BUILD_HASKELL_DAEMON
 include nix/local.mk
+# goonix: optional out-of-process CA decoder.
+include nix/goonix.mk
 endif !BUILD_HASKELL_DAEMON
 
 endif BUILD_DAEMON

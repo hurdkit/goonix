@@ -93,6 +93,18 @@ int goonix_rename(const char *from, const char *to) {
   return rename(from, to);
 }
 
+/* goonix: CA rewrite restores mtime=1, atime unchanged (C++ rewriteTree's
+   utimensat {UTIME_OMIT, {1,0}}); follow links for files/dirs, not for the
+   symlink case (kind 1 uses AT_SYMLINK_NOFOLLOW). */
+int goonix_restore_mtime(const char *path, int nofollow) {
+  struct timespec times[2];
+  times[0].tv_sec = 0;
+  times[0].tv_nsec = UTIME_OMIT;
+  times[1].tv_sec = 1;
+  times[1].tv_nsec = 0;
+  return utimensat(AT_FDCWD, path, times, nofollow ? AT_SYMLINK_NOFOLLOW : 0);
+}
+
 int goonix_mkdir_parents(const char *path, mode_t mode) {
   size_t n = strlen(path);
   char copy[n + 1];

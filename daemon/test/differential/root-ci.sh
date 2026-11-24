@@ -32,6 +32,29 @@ gid=$(id -g)
 # `nix develop`.  A missing compiler stays a FAIL (sqlite-contention.sh exits 2 on
 # "no ghc"); it must never turn into a silent pass.
 (cd "$root" && nix develop "$root#default" -c bash "$here/regressions.sh" "$root") || exit 1
+# --- fixture-tool preflight, BEFORE anything is set up or started ---
+# root-ci-part.sh runs `socat TCP-LISTEN' for builtin:download and `git daemon'
+# for builtin:git-download.  Taking them from the host PATH made the gate depend
+# on the machine: on zergling2 socat was absent, the HTTP fixture never started,
+# and the builder's "Connection refused" was reported as a daemon FAIL.  Resolve
+# them in the DEV SHELL (flake.nix provides socat and git) and refuse to run at
+# all when either is missing, the same way the pidns guard refuses with exit 3.
+fixture_tools=$(cd "$root" && nix develop .#default -c bash -c '
+  for t in socat git; do
+    p=$(command -v "$t" 2>/dev/null) || p=
+    printf "%s=%s\n" "$t" "$p"
+  done')
+socat_bin=$(printf '%s\n' "$fixture_tools" | sed -n 's/^socat=//p')
+git_bin=$(printf '%s\n' "$fixture_tools" | sed -n 's/^git=//p')
+for pair in "socat:$socat_bin" "git:$git_bin"; do
+  tool=${pair%%:*}
+  path=${pair#*:}
+  if test -z "$path" || test ! -x "$path"; then
+    echo "root-ci: MISSING FIXTURE TOOL $tool (not in the dev shell); refusing to run a gate whose fixture cannot start" >&2
+    exit 3
+  fi
+done
+echo "fixture tools: socat=$socat_bin git=$git_bin"
 
 bash "$here/root-ci-setup.sh" "$daemon" "$label" || exit 1
 daemon=$(readlink -f "$daemon")
@@ -56,6 +79,7 @@ timeout 300 unshare --user \
     work="'"$work"'"; root="'"$root"'"; daemon="'"$daemon"'"; mode="'"$mode"'"
     gitrev="'"$gitrev"'"; payload_hash="'"$payload_hash"'"; git_hash="'"$git_hash"'"
     dev_glp="'"$dev_glp"'"; dev_glcp="'"$dev_glcp"'"; ROOT_CI_CLIENT="'"${ROOT_CI_CLIENT:-}"'"
+    socat_bin="'"$socat_bin"'"; git_bin="'"$git_bin"'"
     # Fail fast if a server port is already taken: a busy port must not turn into
     # a FAIL of a download check (the daemon would talk to the wrong server).
     # Loopback is shared with the host, so ss sees host listeners here too.
@@ -96,59 +120,20 @@ timeout 300 unshare --user \
       chmod 755 "$HOME"
       mount --bind "$work/bin" /bin
     fi
-    # Local servers for the builtins (they refuse file:// URLs): HTTP for
-    # builtin:download, git:// for builtin:git-download.  Loopback is shared
-    # with the host (no network namespace), so the daemon reaches them.
-    socat TCP-LISTEN:18080,reuseaddr,fork \
-      EXEC:"$root/daemon/test/differential/root-ci-http.sh $work/payload.txt" \
-      > "$work/http.log" 2>&1 &
-    http_pid=$!
-    git daemon --base-path="$work/gitrepo" --export-all --reuseaddr \
-      --listen=127.0.0.1 --port=19418 "$work/gitrepo" > "$work/gitd.log" 2>&1 &
-    gitd_pid=$!
-    sleep 1
-    # Daemon as namespace root: chroot ON (default), build users, env -i.
-    # installed (CI-like): only TMPDIR, LC_ALL and PATH=/nonexistent - nothing
-    # the runner does not have.  No GUIX_SANDBOX / GUILE_* / GUIX_UNINSTALLED,
-    # no --no-offload: the package must locate its own guix helpers and sandbox.
-    # worktree: the build-tree daemon needs the guile load paths (its helpers
-    # load build-tree modules), GUIX_SANDBOX and --no-offload to run uninstalled.
-    if test "$mode" = worktree; then
-      env -i TMPDIR="$work/build" LC_ALL=C.UTF-8 PATH=/nonexistent \
-        GUILE_LOAD_PATH="$root:$dev_glp" GUILE_LOAD_COMPILED_PATH="$root:$dev_glcp" GUIX_UNINSTALLED=1 \
-        GUIX_SANDBOX="$root/guix-sandbox" \
-        "$daemon" --build-users-group=guixbuild --max-jobs=2 --substitute-urls="" --no-offload \
-        > "$work/daemon.log" 2>&1 &
-    else
-      env -i TMPDIR="$work/build" LC_ALL=C.UTF-8 PATH=/nonexistent \
-        "$daemon" --build-users-group=guixbuild --max-jobs=2 --substitute-urls="" \
-        > "$work/daemon.log" 2>&1 &
-    fi
-    dpid=$!
-    for i in $(seq 1 200); do test -S /var/guix/daemon-socket/socket && break; sleep 0.1; done
-    if ! test -S /var/guix/daemon-socket/socket; then
-      echo "DAEMON DID NOT START"; head -20 "$work/daemon.log"; kill $dpid 2>/dev/null; exit 2
-    fi
-    # Client WITHOUT GUIX_LOG_DIRECTORY (GUILE_LOAD_PATH only locates modules).
-    # ROOT_CI_CLIENT overrides the client script (default: the 6-case CI gate);
-    # the killUser reproduction client takes WORK-DIR and ignores the rest.
-    client=${ROOT_CI_CLIENT:-$root/daemon/test/differential/root-ci-client.scm}
-    env -i LC_ALL=C.UTF-8 PATH=/nonexistent \
-      GUILE_LOAD_PATH="$root:$dev_glp" GUILE_LOAD_COMPILED_PATH="$root:$dev_glcp" GUIX_UNINSTALLED=1 \
-      "$root/guile" --no-auto-compile "$client" \
-      "$work" "$gitrev" "$payload_hash" "$git_hash"
-    rc=$?
-    # Substituter regressions (reviewer point 2): drain the flooded log pipe
-    # (52fe97d8ec7) and keep serving while a helper is silent (b79edc950f1),
-    # against the same installed daemon as namespace root with build users and
-    # the chroot.  Skipped when a custom ROOT_CI_CLIENT is set (e.g. the killUser
-    # reproduction), which is not the standard gate.
-    if test -z "${ROOT_CI_CLIENT:-}"; then
-      bash "$root/daemon/test/differential/root-ci-substitute.sh" \
-        "$daemon" "$work" "$root" "$dev_glp" "$dev_glcp" || rc=1
-    fi
-    exit $rc   # the EXIT trap stops the daemon, socat and git-daemon
-  '
+    # Job isolation: the uid/gid maps are installed, so enter a PRIVATE PID
+    # namespace before the daemon starts.  A daemon kills every process of a
+    # build user before a build and those uids come from the host range, so
+    # without this the kill(-1) of one job reaches the builders of another.
+    # Absolute bash: worktree mode bind-mounts a scratch /bin over /bin, which
+    # hides /bin/bash on a merged-usr host (WSL: the real one is /usr/bin/bash).
+    # root-ci-setup.sh links the real bash into that scratch /bin; prefer the
+    # absolute path of the running shell when it is not under the hidden /bin.
+    part_bash=$BASH
+    case "$part_bash" in /bin/*) part_bash=$(command -v bash) ;; esac
+    exec unshare --pid --fork --kill-child -- "$part_bash" "$0" "$@"
+  ' "$here/root-ci-part.sh" "$work" "$root" "$daemon" "$mode" "$gitrev" \
+    "$payload_hash" "$git_hash" "$dev_glp" "$dev_glcp" "${ROOT_CI_CLIENT:-}" \
+    "$socat_bin" "$git_bin"
 rc=$?
 echo "root-ci[$label] rc=$rc"
 exit $rc

@@ -52,6 +52,8 @@
   #:use-module (gcrypt pk-crypto)
   #:use-module (guix workers)
   #:use-module (guix store)
+  #:autoload (guix ca records)
+             (build-graph-expression) ;goonix: signed graph and choice renderer
   #:use-module ((guix serialization) #:select (write-file))
   #:use-module (zlib)
   #:autoload   (lzlib) (call-with-lzip-output-port
@@ -774,6 +776,28 @@ has the given HASH of type ALGO."
             (not-found request)))
       (not-found request)))
 
+(define (render-goonix-records store request name) ;goonix: signed graph renderer
+  "Render the signed build-record graph for the derivation named NAME."
+  (let ((derivation (string-append (%store-prefix) "/" name)))
+    (if (and (string-suffix? ".drv" name)
+             (valid-path? store derivation))
+        (values '((content-type . (text/plain (charset . "UTF-8"))))
+                (call-with-output-string
+                  (lambda (port)
+                    (write (build-graph-expression store derivation) port)
+                    (newline port))))
+        (not-found request))))
+
+(define (render-goonix-files store request name) ;goonix: file-level list
+  "Render the file list of the store item named NAME for file-level substitution."
+  ((module-ref (resolve-module '(guix ca files)) 'render-file-list)
+   store request name))
+
+(define (render-goonix-file store request name path) ;goonix: file-level fetch
+  "Render the raw bytes of one file (PATH, relative) of the store item NAME."
+  ((module-ref (resolve-module '(guix ca files)) 'render-file)
+   store request name path))
+
 (define (render-log-file store request name)
   "Render the log file for NAME, the base name of a store item.  Don't attempt
 to compress or decompress the log file; just return it as-is."
@@ -1131,6 +1155,19 @@ headers."
              (let ((hash (nix-base32-string->bytevector hash)))
                (render-content-addressed-file store request
                                               name 'sha256 hash))))
+
+          ;; /goonix/records/DERIVATION
+          (("goonix" "records" name)
+           (render-goonix-records store request name)) ;goonix: signed graph facts
+
+          ;; /goonix/files/STORE-ITEM — file-level substitution list
+          (("goonix" "files" name)
+           (render-goonix-files store request name)) ;goonix: file-level list
+
+          ;; /goonix/file/STORE-ITEM/RELATIVE-PATH — one file's bytes
+          (("goonix" "file" name . path)
+           (render-goonix-file store request name
+                               (string-join path "/"))) ;goonix: file-level fetch
 
           ;; /log/OUTPUT
           (("log" name)

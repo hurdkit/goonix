@@ -42,6 +42,7 @@
             %config-directory
 
             %system
+            %guile                         ;goonix: contained evaluator
             %git
             %gzip
             %bzip2
@@ -109,6 +110,9 @@
 
 (define %system
   "@guix_system@")
+
+(define %guile ;goonix: contained evaluator used by pure evaluation
+  "@GUILE@")
 
 (define %git
   "@GIT@")

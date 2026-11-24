@@ -43,6 +43,9 @@
             graft-derivation
             graft-derivation/shallow
 
+            non-self-references                   ;goonix: adoption recursion
+            reference-origins                     ;goonix: adoption recursion
+
             %graft-with-utf8-locale?)
   #:re-export (%graft?                            ;for backward compatibility
                without-grafting
@@ -116,14 +119,16 @@ are not recursively applied to dependencies of DRV."
 
 
   (define build
-    (with-imported-modules '((guix build graft)
-                             (guix build utils)
-                             (guix build debug-link)
-                             (guix elf))
+    (with-imported-modules ((@ (guix ca graft) goonix-graft-modules) ;goonix: CA graft module
+                            drv '((guix build graft)
+                                  (guix build utils)
+                                  (guix build debug-link)
+                                  (guix elf)))
       #~(begin
           (use-modules (guix build graft)
                        (guix build utils)
                        (ice-9 match))
+          #+@((@ (guix ca graft) goonix-graft-load) drv) ;goonix: CA graft module load
 
           (define %outputs
             (ungexp (outputs->gexp outputs)))
@@ -140,7 +145,8 @@ are not recursively applied to dependencies of DRV."
                                           (cons (assoc-ref old-outputs name)
                                                 file)))
                                        %outputs))))
-            (graft old-outputs %outputs mapping)))))
+            ((ungexp ((@ (guix ca graft) goonix-graft-procedure) drv)) ;goonix: CA graft procedure
+             old-outputs %outputs mapping)))))
 
 
   (define properties
@@ -156,6 +162,7 @@ are not recursively applied to dependencies of DRV."
                     #:local-build? #t
                     #:substitutable? #f
 
+                    #:addressing ((@ (guix ca graft) goonix-graft-addressing) drv) ;goonix: CA graft addressing
                     #:properties properties))
 
 (define graft-derivation/shallow*
@@ -173,7 +180,9 @@ references."
       (append-map (cut references/cached store <>) items)))
 
   (let* ((self (map (cut derivation->output-path drv <>) outputs))
-         (refs (references* self)))
+         (refs (or ((@ (guix ca graft) goonix-non-self-references) ;goonix: hook
+                    store drv outputs)
+                   (references* self))))
     (remove (cut member <> self) refs)))
 
 (define %graft-cache
@@ -280,7 +289,9 @@ derivations to the corresponding set of grafts."
                      (cumulative-grafts store drv grafts
                                         #:guile guile
                                         #:system system)))))
-            (reference-origins drv items)))
+            (or ((@ (guix ca graft) goonix-reference-origins*) ;goonix: hook
+                 store drv items)
+                (reference-origins drv items))))
 
     (with-cache (list (derivation-file-name drv) outputs grafts)
       (match (non-self-references store drv outputs)
@@ -290,7 +301,11 @@ derivations to the corresponding set of grafts."
          (mlet %state-monad ((grafts (dependency-grafts deps)))
            (let ((grafts (delete-duplicates (concatenate grafts) equal?)))
              (match (filter (lambda (graft)
-                              (member (graft-origin-file-name graft) deps))
+                              (member (or ((@ (guix ca graft) goonix-graft-origin) ;goonix:
+                                           store drv outputs (graft-origin graft)
+                                           (graft-origin-output graft))
+                                          (graft-origin-file-name graft))
+                                      deps))
                             grafts)
                (()
                 (return grafts))

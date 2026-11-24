@@ -959,6 +959,10 @@ INSTALLER_MODULES =                             \
   %D%/installer/newt/welcome.scm		\
   %D%/installer/newt/wifi.scm
 
+# goonix: the secrets service system test.
+GNU_SYSTEM_MODULES +=				\
+  %D%/tests/goonix-secrets.scm
+
 if HAVE_GUILE_SSH
 
 GNU_SYSTEM_MODULES +=         			\

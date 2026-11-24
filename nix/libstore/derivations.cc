@@ -1,6 +1,7 @@
 #include "derivations.hh"
 #include "store-api.hh"
 #include "globals.hh"
+#include "local-store.hh" // goonix: resolved derivation registration
 #include "util.hh"
 
 #include <format>
@@ -40,9 +41,14 @@ Path writeDerivation(StoreAPI & store,
        held during a garbage collection). */
     string suffix = name + drvExtension;
     string contents = unparseDerivation(drv);
-    return settings.readOnlyMode
-        ? computeStorePathForText(suffix, contents, references)
-        : store.addTextToStore(suffix, contents, references, repair);
+    if (settings.readOnlyMode)
+        return computeStorePathForText(suffix, contents, references);
+    // goonix: resolved/token outputs do not obey the historical output hash.
+    if (drv.env.find("goonixAddressing") != drv.env.end()) {
+        auto local = dynamic_cast<LocalStore *>(&store);
+        if (local) return local->addResolvedDerivation(suffix, contents, references);
+    }
+    return store.addTextToStore(suffix, contents, references, repair);
 }
 
 
@@ -113,6 +119,11 @@ static Derivation parseDerivation(const string & s)
     return drv;
 }
 
+
+Derivation parseDerivationText(const string & contents) // goonix: parse resolved bytes
+{
+    return parseDerivation(contents);
+}
 
 Derivation readDerivation(const Path & drvPath)
 {

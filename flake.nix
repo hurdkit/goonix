@@ -23,6 +23,9 @@
           pname = "goonix";
           version = "${baseVersion}-goonix.${rev}";
           src = self;
+          # goonix: the optional CA decoder is a separate helper program.
+          buildInputs = (old.buildInputs or [ ]) ++ [ pkgs.libarchive ];
+
           # goonix: the daemon choice is explicit, not configure's auto probe.
           nativeBuildInputs = old.nativeBuildInputs ++ [ pkgs.haskell.packages.ghc910.ghc ];
           configureFlags = (old.configureFlags or []) ++ [ "--enable-haskell-daemon" ];
@@ -59,13 +62,33 @@
               drvAttrs = {
                 nativeBuildInputs = [ nixpkgs.legacyPackages.${system}.guile nixpkgs.legacyPackages.${system}.gcc ];
                 postInstall = ''
+                  # goonix: the out-of-process CA decoder ships in libexec, as in
+                  # the make build (daemon/local.mk).  The daemon's default helper
+                  # path is the make-expanded libexecdir (Goonix.Config).  The
+                  # libutil sources include config.h; the Cabal build has no
+                  # configure run, so provide the few macros they read.
+                  mkdir -p $out/libexec ca-scan-build
+                  printf '%s\n' \
+                    '#define HAVE_SCHED_H 1' \
+                    '#define HAVE_SCHED_SETAFFINITY 1' \
+                    '#define HAVE_STATX 1' \
+                    '#define HAVE_CLOSE_RANGE 1' \
+                    '#define HAVE_LINUX_CLOSE_RANGE_H 1' \
+                    '#define HAVE_STRSIGNAL 1' \
+                    '#define HAVE_POSIX_FALLOCATE 1' \
+                    > ca-scan-build/config.h
+                  g++ -O2 -std=c++20 -DHAVE_CONFIG_H \
+                    -Ica-scan-build -I${./nix/libutil} \
+                    ${./nix/goonix-ca-scan.cc} ${./nix/libutil/util.cc} \
+                    ${./nix/libutil/affinity.cc} \
+                    -lz -larchive -o $out/libexec/goonix-ca-scan
                   g++ -O2 -std=c++17 ${./daemon/sandbox/guix-sandbox.cc} -o $out/bin/guix-sandbox
                 '';
                 preConfigure = ''
                   mkdir -p src/Goonix
                   guile --no-auto-compile make-config.scm \
                     src/Goonix/Config.hs /gnu/store /var/guix /var/log/guix \
-                    /etc/guix /bin /share/locale x86_64-linux \
+                    /etc/guix /bin /libexec /share/locale x86_64-linux \
                     'https://bordeaux.guix.gnu.org https://ci.guix.gnu.org' \
                     ${./guix/store/schema.sql}
                 '';
@@ -75,6 +98,7 @@
                 nixpkgs.legacyPackages.${system}.sqlite
                 nixpkgs.legacyPackages.${system}.zlib
                 nixpkgs.legacyPackages.${system}.bzip2
+                nixpkgs.legacyPackages.${system}.libarchive
               ];
             };
             autoWire = [ ];
@@ -133,8 +157,38 @@
           guixClient = (mkGoonix pkgs).overrideAttrs (old: { src = clientSource; });
         };
       });
+
+      # Everything needed to build the checkout by hand:
+      #   ./bootstrap && ./configure --localstatedir=/var --sysconfdir=/etc && make
+      #   ./pre-inst-env guix ...
       devShells = forAllSystems (pkgs: {
-        default = pkgs.mkShell { inputsFrom = [ (mkGoonix pkgs) ]; };
+        default = pkgs.mkShell {
+          inputsFrom = [ (mkGoonix pkgs) ];
+          # age/openssh for the build; socat and git are FIXTURE tools the
+          # root-ci gate needs (root-ci-part.sh runs `socat TCP-LISTEN' for
+          # builtin:download and `git daemon' for builtin:git-download).
+          # Without them here the gate depends on the host PATH: on zergling2
+          # socat was absent, the HTTP fixture never started, and the builder's
+          # "Connection refused" read as a daemon FAIL.
+          packages = [ pkgs.age pkgs.openssh pkgs.socat pkgs.git ];
+
+          # The bootstrap Guile 2.0 scripts in tests/gexp.scm must not load
+          # Guile 3.0's own ice-9/boot-9.go.  Keep the Guile libraries'
+          # compiled paths, but remove only the interpreter's private cache.
+          shellHook = ''
+            goonix_guile=${pkgs.guile}
+            GUILE_LOAD_COMPILED_PATH=$(IFS=:
+              result=
+              for path in ''${GUILE_LOAD_COMPILED_PATH-}; do
+                if [ "$path" != "$goonix_guile/lib/guile/3.0/ccache" ]; then
+                  result=''${result:+$result:}$path
+                fi
+              done
+              printf '%s' "$result")
+            export GUILE_LOAD_COMPILED_PATH
+            unset goonix_guile
+          '';
+        };
       });
     };
 }

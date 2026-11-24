@@ -21,6 +21,7 @@
   #:use-module (guix scripts)
   #:use-module (guix derivations)
   #:use-module ((guix store) #:select (derivation-path? store-path?))
+  #:use-module (guix download-cache)       ;goonix: the download cache
   #:use-module ((guix build utils) #:select (store-file-name?
                                              strip-store-file-name))
   #:autoload   (guix build download) (%download-methods url-fetch)
@@ -150,7 +151,8 @@ Note: OUTPUT may differ from the 'out' value of DRV, notably for 'bmCheck' or
                             (and download-methods
                                  (call-with-input-string download-methods
                                    read/safe))))
-              (url-fetch url output
+              ;; goonix: ask the download cache first, when there is one.
+              (url-fetch (cache-first url output algo hash mirrors) output
                          #:print-build-trace? print-build-trace?
                          #:mirrors (if mirrors
                                        (call-with-input-file/no-symlinks

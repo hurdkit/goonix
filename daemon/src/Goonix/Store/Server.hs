@@ -26,6 +26,7 @@ import qualified Data.ByteString.Char8 as C
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import qualified Data.Set as Set
 import Data.Word (Word32, Word64)
+import Goonix.Store.GuixProgram (absPath)
 import Goonix.Store.Database (Value (Bytes))
 import Goonix.Store.Base32 (encodeBase16)
 import Goonix.Store.Config (ServerConfig (..), defaultConfig)
@@ -43,6 +44,10 @@ import Goonix.Store.Wire
 import Goonix.Store.Writing
 import qualified Goonix.Store.Collector as Collector
 import Goonix.Store.Path (validateStoreName)
+import Goonix.Store.Ca (assertNotReserved)
+import Goonix.Store.CaStore (initCaRecords, realisedOutputPath, queryGoonixBuildGraph, goonixRecordFields)
+import Goonix.Store.Derivation (parseDerivation)
+import Goonix.Store.Records (queryRecords)
 import System.Posix.Env.ByteString (getEnv)
 import Goonix.Store.Files (withTempRootFile, withCollectorGCLock, withOtherTemporaryRoots, appendTempRoot, deleteTree, mkdirParents, directoryEntries, catchMissing, deduplicateTree)
 import System.Posix.IO (closeFd)
@@ -144,7 +149,9 @@ handleClient config counter client = do
     pure (next, C.pack (show pid <> "-" <> show next))
   catch
     (withTempRootFile (temporaryRootsPath config <> "/" <> rootName) (storeGcLockPath config) $ \rootFd ->
-      bracket (openStore (configStore config) (configDatabase config) (configStateDirectory config)) closeStore $ \store ->
+      bracket (openStore (configStore config) (configDatabase config) (configStateDirectory config)) closeStore $ \store -> do
+        -- goonix: the records tables are created if absent (HS-11).
+        initCaRecords store
         catch (handleConnection config store client settingsRef rootFd (temporaryRootsPath config <> "/" <> rootName)) report)
     report
   where
@@ -207,7 +214,11 @@ dispatch config store client settingsRef rootFd rootPath clientVersion operation
     fixed <- readIntSocket client
     recursiveField <- readIntSocket client
     algorithmField <- readStringSocket client
-    let recursive = recursiveField == 1
+    -- Compatibility hack (nix-daemon.cc wopAddToStore): when the obsolete
+    -- `fixed' field is not 1, C++ forces BOTH sha256 AND recursive = true.
+    -- Overriding only the algorithm leaves recursive false and changes the
+    -- resulting path.
+    let recursive = fixed /= 1 || recursiveField == 1
         algorithmName' = if fixed /= 1 then "sha256" else algorithmField
     algorithm <- either (throwIO . storeError) pure (algorithmFromName algorithmName')
     either (throwIO . storeError) pure (validateStoreName name)
@@ -224,8 +235,7 @@ dispatch config store client settingsRef rootFd rootPath clientVersion operation
     writeFrame client stderrLast
     writeSocket client (encodeInt 1)
   10 -> do
-    path <- readStringSocket client
-    _ <- assertStorePath store path
+    path <- readStorePath store client
     settings <- readIORef settingsRef
     ensureStorePath config rootFd store settings (buildTrace settings client) path
     writeFrame client stderrLast
@@ -238,13 +248,16 @@ dispatch config store client settingsRef rootFd rootPath clientVersion operation
     writeFrame client stderrLast
     writeSocket client (encodeString path)
   11 -> do
-    path <- readStringSocket client
-    _ <- assertStorePath store path
+    path <- readStorePath store client
     appendTempRoot rootFd path
     writeFrame client stderrLast
     writeSocket client (encodeInt 1)
   12 -> do
-    path <- readStringSocket client
+    -- C++ wopAddIndirectRoot: `Path path = absPath(readString(from))'.  The
+    -- auto root's name is SHA1 of THIS string, so an uncanonicalised value
+    -- registers a second root under a different name -- and that root does not
+    -- protect the item, because findRoots resolves the link the client made.
+    path <- readStringSocket client >>= absPath
     addIndirectRoot store path
     writeFrame client stderrLast
     writeSocket client (encodeInt 1)
@@ -252,7 +265,7 @@ dispatch config store client settingsRef rootFd rootPath clientVersion operation
     writeFrame client stderrLast
     writeSocket client (encodeInt 1)
   16 -> do
-    path <- readStringSocket client
+    path <- readStorePath store client
     sign <- readIntSocket client
     -- Stream the export to the socket in bounded STDERR_WRITE frames (C++
     -- TunnelSink), never materialising the whole NAR: a large output must not
@@ -281,21 +294,37 @@ dispatch config store client settingsRef rootFd rootPath clientVersion operation
     (deleted, freed) <- withCollectorGCLock (storeGcLockPath config) $ do
       roots <- findRoots store
       withOtherTemporaryRoots (temporaryRootsPath config) rootFd $ \temporary -> do
-        live <- Collector.livePaths (map snd roots ++ temporary) store
+        let rootPaths = map snd roots ++ temporary
         if action == 3
-          then Collector.deleteSpecificPaths settings live paths minFreed store rootPath
+          then do
+            live <- Collector.livePaths rootPaths store
+            Collector.deleteSpecificPaths settings live paths minFreed store rootPath
           else do
             allPaths <- queryAllValidPaths store
             case action of
-              0 -> pure (live, 0)
-              1 -> pure (filter (`notElem` live) allPaths, 0)
-              2 -> Collector.collectPaths settings live minFreed store rootPath
+              -- C++ gcReturnLive / gcReturnDead return state.alive / state.dead,
+              -- populated by canReachRoot, which honours gc-keep-outputs and
+              -- gc-keep-derivations — not just the forward closure of the roots.
+              0 -> do
+                live <- Collector.livePathsWithSettings settings rootPaths store
+                pure (live, 0)
+              1 -> do
+                live <- Collector.livePathsWithSettings settings rootPaths store
+                pure (filter (`notElem` live) allPaths, 0)
+              2 -> Collector.collectPaths settings rootPaths minFreed store rootPath
               _ -> throwIO (storeError "unsupported garbage-collection action")
     writeFrame client stderrLast
     writeSocket client (encodeStrings deleted <> encodeWord64 freed <> encodeWord64 0)
-  1 -> queryOnePath $ \_ path -> do
+  -- C++ wopIsValidPath (nix-daemon.cc:315) is the ONE single-path op that
+  -- reads with readString + assertStorePath, NOT readStorePath: it does not
+  -- refuse reserved names, so querying a placeholder answers #f instead of
+  -- an error (the ca-grafts unrealised-placeholder tests rely on this).
+  1 -> do
+    path <- readStringSocket client
     _ <- assertStorePath store path
-    encodeBool <$> isValidPath store path
+    reply <- encodeBool <$> isValidPath store path
+    writeFrame client stderrLast
+    writeSocket client reply
   4 -> queryOnePath $ \_ path -> encodeString . encodeBase16 <$> queryPathHash store path
   5 -> queryOnePath $ \_ path -> encodeStrings <$> queryReferences store path
   6 -> queryOnePath $ \_ path -> encodeStrings <$> queryReferrers store path
@@ -321,8 +350,7 @@ dispatch config store client settingsRef rootFd rootPath clientVersion operation
     writeFrame client stderrLast
     writeSocket client (encodeString path)
   3 -> do
-    path <- readStringSocket client
-    _ <- assertStorePath store path
+    path <- readStorePath store client
     settings <- readIORef settingsRef
     result <- if settingBool "build-use-substitutes" False settings
       then substitutablePaths config settings (stderrEmit client) [path] else pure []
@@ -369,8 +397,31 @@ dispatch config store client settingsRef rootFd rootPath clientVersion operation
     settings <- readIORef settingsRef
     writeFrame client stderrLast
     writeSocket client (encodeStrings (substituteURLs settings))
+  -- goonix: resolved-output and signed-record queries (HS-11).  No choice
+  -- mutation in a query and no client registration (C++ nix-daemon.cc).
+  82 -> do
+    drvPath <- readStorePathStrict store client
+    output <- readStringSocket client
+    drv <- readDerivationFile drvPath
+    path <- realisedOutputPath store drvPath drv output
+    writeFrame client stderrLast
+    writeSocket client (encodeString path)
+  83 -> do
+    resolvedHash <- readStringSocket client
+    output <- readStringSocket client
+    records <- queryRecords (database store) resolvedHash output
+    writeFrame client stderrLast
+    writeSocket client (encodeStrings (goonixRecordFields records False))
+  84 -> do
+    drvPath <- readStorePathStrict store client
+    (records, hints) <- queryGoonixBuildGraph store drvPath
+    writeFrame client stderrLast
+    writeSocket client (encodeStrings (goonixRecordFields records True) <> encodeStrings hints)
   _ -> throwIO (StoreError (C.pack ("invalid operation " ++ show operation)) 1)
   where
+    readDerivationFile path = do
+      bytes <- B.readFile (C.unpack path)
+      either (throwIO . storeError) pure (parseDerivation bytes)
     encodeInfo (path, deriver, references, downloadSize, narSize) = encodeString path
       <> encodeString deriver <> encodeStrings references <> encodeWord64 downloadSize <> encodeWord64 narSize
     queryAll action = do
@@ -378,8 +429,7 @@ dispatch config store client settingsRef rootFd rootPath clientVersion operation
       writeFrame client stderrLast
       writeSocket client reply
     queryOnePath action = do
-      path <- readStringSocket client
-      _ <- assertStorePath store path
+      path <- readStorePath store client
       reply <- action store path
       writeFrame client stderrLast
       writeSocket client reply
@@ -568,6 +618,27 @@ readArchiveChunk client = do
 
 readStorePathsSocket :: Socket -> IO [ByteString]
 readStorePathsSocket = readStringsSocket
+
+-- | C++ readStorePath (store-api.cc:337): read one store path, asserting the
+-- store prefix AND that it is not a goonix reserved name (placeholder/self
+-- token).  The path-set reads (readStorePathsSocket) deliberately do NOT refuse
+-- reserved names, matching C++ readStorePaths.  The Haskell daemon answers a
+-- reserved path with a store error and keeps the connection (C++ rethrows while
+-- parsing and drops it); the refusal itself is the parity requirement.
+readStorePath :: Store -> Socket -> IO ByteString
+readStorePath store client = do
+  path <- readStringSocket client
+  _ <- assertStorePath store path
+  either (throwIO . storeError) pure (assertNotReserved (storeDirectory store) path)
+  pure path
+
+-- | C++ readStorePathStrict (store-api.cc:357): the strict single-path read.
+readStorePathStrict :: Store -> Socket -> IO ByteString
+readStorePathStrict store client = do
+  path <- readStringSocket client
+  _ <- assertStorePathStrict store path
+  either (throwIO . storeError) pure (assertNotReserved (storeDirectory store) path)
+  pure path
 
 readStringsSocket :: Socket -> IO [ByteString]
 readStringsSocket client = do

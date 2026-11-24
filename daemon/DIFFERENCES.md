@@ -124,3 +124,25 @@ supplementary groups. UID 0 and the daemon's own UID are rejected. Each lease
 holds the nonblocking `STATE/userpool/UID` lock through the shared file-lock
 table, so another daemon process cannot use the same build user. Unrelated
 malformed passwd/group lines are ignored; selected identities are validated.
+
+## Embedded builder-file names: a trailing slash is refused earlier
+
+`materialiseGoonixFiles` rejects the same NAMES as C++ on all 21 probed cases,
+including every traversal form (`..`, `a/../b`, `./a`, `a/.`, `a/..`, absolute
+paths, backslashes, interior empty components). The empty name is accepted by
+both. Pinned by `daemon/test/embedded-mode.sh`, which drives the real C++
+function and compares the accept/reject verdict.
+
+For a name ending in `/` (`a/`, `a/b/`, `x/`) the two sides differ in WHERE the
+refusal happens, not in whether it happens:
+
+- C++ `std::getline` yields no trailing empty field, so the component check
+  passes; `createDirs` then creates the directory and `writeFile` fails with
+  `writing file '.../a/': Is a directory`. The directory is left behind.
+- Haskell splits with `C.split '/'`, which keeps the trailing empty component,
+  so the name check refuses it first with `invalid embedded builder file 'a/'`
+  and nothing is created.
+
+Both refuse the write, so no builder file is ever materialised through a
+trailing-slash name. The Haskell message is the name-validation one and no stray
+directory is created. Not treated as a defect.

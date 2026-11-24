@@ -1,0 +1,80 @@
+{
+    "format"               : 1,
+    "alphabet"             : "eout",
+    "tokens"               : {
+        "out" : "ttteoeueuuottuuotutetetooueeoutu",
+        "lib" : "teuttuuueeuttoototeeeutooeeeuout"
+    },
+    "placeholder"          : {
+        "derivationBytes" : "drv bytes",
+        "output"          : "out",
+        "name"            : "hello-1.0",
+        "hash"            : "eutuotetteeuuottttouuuteeutttuut"
+    },
+    "trees"                : [{
+        "name"       : "empty",
+        "kind"       : "regular",
+        "bytes"      : [],
+        "executable" : 0,
+        "sha256"     : "e9af47ca501ef1fa917417af3a6b6943e227a92536e97037c23c2c673b45ddf2"
+    },{
+        "name"       : "executable",
+        "kind"       : "regular",
+        "bytes"      : [35,33,47,98,105,110,47,115,104,10,101,120,105,116,32,48,10],
+        "executable" : 1,
+        "sha256"     : "92e1d51948515c965b7dbd19e7d3f0444bceaed6f39c51293844b5bc28ae931f"
+    },{
+        "name"       : "arbitrary",
+        "kind"       : "regular",
+        "bytes"      : [0,1,2,10,13,127,128,255,0,65],
+        "executable" : 0,
+        "sha256"     : "561594f09221a427dd826439e3bc311c42495df30ed6f1a1f915763c85925e15"
+    },{
+        "name"   : "link",
+        "kind"   : "symlink",
+        "target" : "target",
+        "sha256" : "5ef2f8b90d0ca186d4b49cc6bbf69533d7bfe13bdc86bd4e7a2ef354ffb6812c"
+    },{
+        "name"    : "empty-dir",
+        "kind"    : "directory",
+        "entries" : [],
+        "sha256"  : "d7906fe2e5e7ecb21ec4665ccf9afbd6d0de6d534e828d8db3ca6e0c4abe4e87"
+    },{
+        "name"    : "dir",
+        "kind"    : "directory",
+        "entries" : [{
+            "name"  : "empty",
+            "bytes" : []
+        }],
+        "sha256"  : "4d906c085e9d72c6732872daeafd12323257f240329e76da0e9550d1ec24a2dd"
+    }],
+    "orderedDirectory"     : {
+        "sha256" : "e722a883e4f9e3c95b31151cde3ff4465dc6bf33e3acb7420f01097b29686d6e"
+    },
+    "contentPaths"         : {
+        "withoutReferences" : "/gnu/store/kq0f52qvhdwr2a7a5ycvrra8b124sdw4-hello",
+        "withReferences"    : "/gnu/store/zjwppa7pivbz7qy9ygi6jnacc64jjkvf-hello",
+        "references"        : ["/gnu/store/00000000000000000000000000000000-input","/gnu/store/11111111111111111111111111111111-other"]
+    },
+    "resolvedDerivation"   : {
+        "bytes"           : "Derive([(\"out\",\"/gnu/store/ttteoeueuuottuuotutetetooueeoutu-hello\",\"\",\"\")],[],[\"/gnu/store/00000000000000000000000000000000-input\"],\"x86_64-linux\",\"/gnu/store/00000000000000000000000000000000-builder\",[\"--flag\"],[(\"goonixAddressing\",\"resolved\"),(\"goonixResolved\",\"1\"),(\"out\",\"/gnu/store/ttteoeueuuottuuotutetetooueeoutu-hello\")])",
+        "resolvedPath"    : "/gnu/store/06lvvwmzank31h4mi6q5bxxbnfymd07x-hello",
+        "resolvedLibPath" : "/gnu/store/rxv2pr8k57p5r5xri0sp9jwsc6w4qkmc-hello-lib"
+    },
+    "unresolvedDerivation" : {
+        "bytes"           : "Derive([(\"lib\",\"/gnu/store/teuttuuueeuttoototeeeutooeeeuout-unresolved-lib\",\"\",\"\"),(\"out\",\"/gnu/store/ttteoeueuuottuuotutetetooueeoutu-unresolved\",\"\",\"\")],[(\"/gnu/store/22222222222222222222222222222222-input.drv\",[\"out\"])],[\"/gnu/store/33333333333333333333333333333333-source\"],\"x86_64-linux\",\"/gnu/store/33333333333333333333333333333333-builder\",[\"$NIX_BUILD_TOP/builder.scm\"],[(\"GUILE_LOAD_PATH\",\"/gnu/store/44444444444444444444444444444444-modules\"),(\"__file:builder.scm\",\"(call-with-output-file (getenv \\\"out\\\") (lambda (p) (display \\\"hello\\\" p)))\"),(\"__files\",\"builder.scm\"),(\"goonixAddressing\",\"content\"),(\"lib\",\"/gnu/store/teuttuuueeuttoototeeeutooeeeuout-unresolved-lib\"),(\"out\",\"/gnu/store/ttteoeueuuottuuotutetetooueeoutu-unresolved\")])",
+        "output"          : "lib",
+        "name"            : "unresolved-lib",
+        "placeholderHash" : "eoououeouooeeoooeteouteeuteuuueu"
+    },
+    "record"               : {
+        "resolvedHash"      : "resolved",
+        "derivation"        : "derivation",
+        "output"            : "out",
+        "path"              : "path",
+        "origin"            : "origin",
+        "relocationChecked" : 1,
+        "payload"           : [103,111,111,110,105,120,45,114,101,99,111,114,100,45,118,49,0,1,0,0,0,0,0,0,0,8,0,0,0,0,0,0,0,114,101,115,111,108,118,101,100,10,0,0,0,0,0,0,0,100,101,114,105,118,97,116,105,111,110,3,0,0,0,0,0,0,0,111,117,116,4,0,0,0,0,0,0,0,112,97,116,104,6,0,0,0,0,0,0,0,111,114,105,103,105,110,1,0,0,0,0,0,0,0],
+        "sha256"            : "da6009a94a97ea3c50f7528283ec6cc5f0f8d35ff413e0f5b0b562fa561a5002"
+    }
+}

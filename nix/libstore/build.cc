@@ -9,6 +9,8 @@
 #include "archive.hh"
 #include "builtins.hh"
 #include "spawn.hh"
+#include "ca.hh" // goonix: resolution and content finalisation
+#include "build-ca.hh" // goonix: build-state and finalisation helpers
 
 #include <map>
 #include <algorithm>
@@ -136,6 +138,8 @@ typedef map<Path, WeakGoalPtr> WeakGoalMap;
 class Goal : public std::enable_shared_from_this<Goal>
 {
 public:
+    size_t waiteeCount() const { return waitees.size(); } // goonix: stall diagnostics
+    const string & goalName() const { return name; } // goonix: scheduler diagnostics
     typedef enum {ecBusy, ecSuccess, ecFailed, ecNoSubstituters, ecIncompleteClosure} ExitCode;
 
 protected:
@@ -237,6 +241,7 @@ struct Child
     bool inBuildSlot;
     time_t lastOutput; /* time we last got output on stdout/stderr */
     time_t timeStarted;
+    time_t deadline = 0; // goonix: graph requests have an independent deadline
 };
 
 typedef map<pid_t, Child> Children;
@@ -270,6 +275,7 @@ private:
        same derivation / path. */
     WeakGoalMap derivationGoals;
     WeakGoalMap substitutionGoals;
+    WeakGoalMap goonixGraphGoals; // goonix: asynchronous record requests
 
     /* Goals waiting for busy paths to be unlocked. */
     WeakGoals waitingForAnyGoal;
@@ -300,6 +306,8 @@ public:
     /* Make a goal (with caching). */
     GoalPtr makeDerivationGoal(const Path & drvPath, const StringSet & wantedOutputs, BuildMode buildMode = bmNormal);
     GoalPtr makeSubstitutionGoal(const Path & storePath, bool repair = false);
+    bool isTopGoal(const GoalPtr & goal) const { return topGoals.count(goal); } // goonix: roots only request graphs
+    GoalPtr makeGoonixGraphGoal(const Path & path); // goonix: graph factory
 
     /* Remove a dead goal. */
     void removeGoal(GoalPtr goal);
@@ -316,6 +324,7 @@ public:
        the process counts towards the jobs limit. */
     void childStarted(GoalPtr goal, pid_t pid,
         const set<int> & fds, bool inBuildSlot, bool respectTimeouts);
+    void goonixSetChildDeadline(pid_t pid, time_t deadline); // goonix: graph deadline
 
     /* Unregisters a running child process.  `wakeSleepers' should be
        false if there is no sense in waking up goals that are sleeping
@@ -595,6 +604,7 @@ string rewriteHashes(string s, const HashRewrites & rewrites)
 typedef enum {rpAccept, rpDecline, rpPostpone} HookReply;
 
 class SubstitutionGoal;
+#include "build-goonix-goal.hh" // goonix: graph goal visible to its factory
 
 class DerivationGoal : public Goal
 {
@@ -721,7 +731,8 @@ public:
            i.e. a derivation named "aardvark" always comes before
            "baboon". And substitution goals always happen before
            derivation goals (due to "b$"). */
-        return "b$" + storePathToName(drvPath) + "$" + drvPath;
+        return "b$" + storePathToName(originalDrvPath.empty() ? drvPath : originalDrvPath) // goonix: one goal per original derivation
+            + "$" + (originalDrvPath.empty() ? drvPath : originalDrvPath);
     }
 
     void work() override;
@@ -743,6 +754,7 @@ private:
     void outputsSubstituted();
     void closureRepaired();
     void inputsRealised();
+#include "build-goonix.hh" // goonix: private CA members, defined in our file
     void tryToBuild();
     void buildDone();
 
@@ -790,6 +802,8 @@ private:
 };
 
 
+#include "build-goonix.inc" // goonix: member definitions for CA-only hooks
+
 DerivationGoal::DerivationGoal(const Path & drvPath, const StringSet & wantedOutputs, Worker & worker, BuildMode buildMode)
     : Goal(worker)
     , wantedOutputs(wantedOutputs)
@@ -801,6 +815,7 @@ DerivationGoal::DerivationGoal(const Path & drvPath, const StringSet & wantedOut
     , bzLogFile(0)
 #endif
     , useChroot(false)
+    , fixedOutput(false) // goonix: initialized for every addressing mode
     , buildMode(buildMode)
 {
     this->drvPath = drvPath;
@@ -930,6 +945,7 @@ void DerivationGoal::haveDerivation()
 
     /* Get the derivation. */
     drv = derivationFromPath(worker.store, drvPath);
+    if (goonixHaveDerivation()) return; // goonix: CA goal preparation in our file
 
     for (auto& i : drv.outputs)
         worker.store.addTempRoot(i.second.path);
@@ -982,6 +998,8 @@ void DerivationGoal::outputsSubstituted()
         return;
     }
 
+    if (goonixSelectedOutputsSubstituted()) return; // goonix: imported candidate fetched
+    if (goonixRealiseInputsFirst()) return; // goonix: placeholders resolve inputs first
     unsigned int nrInvalid = checkPathValidity(false, buildMode == bmRepair).size();
     if (buildMode == bmNormal && nrInvalid == 0) {
         done(BuildResult::Substituted);
@@ -996,6 +1014,7 @@ void DerivationGoal::outputsSubstituted()
 
     /* Otherwise, at least one of the output paths could not be
        produced using a substitute.  So we have to build instead. */
+    goonixPrepareLocalBuild(); // goonix: restore token outputs for local builds
 
     /* Make sure checkPathValidity() from now on checks all
        outputs. */
@@ -1088,6 +1107,7 @@ void DerivationGoal::inputsRealised()
         return;
     }
 
+    if (goonixResolveInputs()) return; // goonix: resolve CA inputs and reschedule
     if (retrySubstitution) {
         haveDerivation();
         return;
@@ -1209,6 +1229,7 @@ void DerivationGoal::tryToBuild()
        omitted, but that would be less efficient.)  Note that since we
        now hold the locks on the output paths, no other process can
        build this derivation, so no further checks are necessary. */
+    if (goonixRecheckRealised()) return; // goonix: recheck records under output locks
     validPaths = checkPathValidity(true, buildMode == bmRepair);
     if (buildMode != bmCheck && validPaths.size() == drv.outputs.size()) {
         debug(std::format("skipping build of derivation `{}', someone beat us to it", drvPath));
@@ -2589,6 +2610,8 @@ void DerivationGoal::startBuilder()
     for (auto& i : drv.env)
         ctx.env[i.first] = i.second;
 
+    // goonix: reserved entries and embedded files are daemon metadata.
+    removeGoonixEnvironment(ctx.env);
     /* Create a temporary directory where the build will take
        place. */
     auto drvName = storePathToName(drvPath);
@@ -2631,6 +2654,8 @@ void DerivationGoal::startBuilder()
        getdents returns the inode of the mount point). */
     ctx.env["PWD"] = tmpDirInSandbox;
 
+    // goonix: materialise __files after placeholder resolution.
+    materialiseGoonixFiles(drv, ctx.args, tmpDir, tmpDirInSandbox);
     /* *Only* if this is a fixed-output derivation, propagate the
        values of the environment variables specified in the
        `impureEnvVars' attribute to the builder.  This allows for
@@ -3143,6 +3168,7 @@ void DerivationGoal::registerOutputs()
        outputs to allow hard links between outputs. */
     InodesSeen inodesSeen;
 
+    goonixRegisterOutputs(inodesSeen, infos); // goonix: finalise CA outputs in our file
     Path checkSuffix = "-check";
 
     /* Check whether the output paths were created, and grep each
@@ -3151,6 +3177,7 @@ void DerivationGoal::registerOutputs()
     for (auto& i : drv.outputs) {
         Path path = i.second.path;
         if (missingPaths.find(path) == missingPaths.end()) continue;
+        if (goonixOutputResult.finalOutputs.count(path)) continue; // goonix: already finalised
 
         Path actualPath = path;
         if (useChroot) {
@@ -3342,6 +3369,7 @@ void DerivationGoal::registerOutputs()
             worker.store.markContentsGood(path);
         }
 
+        goonixRecordResolvedOutput(i.first, path); // goonix: signed fact after checks
         ValidPathInfo info;
         info.path = path;
         info.hash = hash.first;
@@ -3388,13 +3416,14 @@ void DerivationGoal::registerOutputs()
 
     if (curRound < nrRounds) {
         prevInfos = infos;
+        goonixDiscardOutputs(); // goonix: discard unregistered staged outputs between rounds
         return;
     }
 
     /* Register each output path as valid, and register the sets of
        paths referenced by each of them.  If there are cycles in the
        outputs, this will fail. */
-    worker.store.registerValidPaths(infos);
+    goonixRegisterValidPaths(infos); // goonix: register, commit facts and clean on failure
 }
 
 
@@ -3635,6 +3664,7 @@ PathSet DerivationGoal::checkPathValidity(bool returnValid, bool checkHash)
     for (auto& i : drv.outputs) {
         if (!wantOutput(i.first, wantedOutputs)) continue;
         bool good =
+            !isReservedStorePath(i.second.path) && // goonix: never a realised output
             worker.store.isValidPath(i.second.path) &&
             (!checkHash || worker.store.pathContentsGood(i.second.path));
         if (good == returnValid) result.insert(i.second.path);
@@ -3645,7 +3675,8 @@ PathSet DerivationGoal::checkPathValidity(bool returnValid, bool checkHash)
 
 bool DerivationGoal::pathFailed(const Path & path)
 {
-    if (!settings.cacheFailure) return false;
+    /* goonix: reserved-path failures are not shared between derivations. */
+    if (!settings.cacheFailure || isReservedStorePath(path)) return false;
 
     if (!worker.store.hasPathFailed(path)) return false;
 
@@ -4157,6 +4188,7 @@ void Worker::removeGoal(GoalPtr goal)
 {
     nix::removeGoal(goal, derivationGoals);
     nix::removeGoal(goal, substitutionGoals);
+    nix::removeGoal(goal, goonixGraphGoals); // goonix: graph goal lifecycle
     if (topGoals.find(goal) != topGoals.end()) {
         topGoals.erase(goal);
         /* If a top-level goal failed, then kill all other goals
@@ -4289,7 +4321,11 @@ void Worker::run(const Goals & _topGoals)
             if (awake.empty() && settings.maxBuildJobs == 0) throw Error(
                 "unable to start any build; either increase `--max-jobs' "
                 "or enable distributed builds");
-            assert(!awake.empty());
+            if (awake.empty()) { // goonix: diagnose a scheduler stall instead of hanging
+                for (auto & goal : topGoals)
+                    printMsg(lvlError, std::format("stalled top goal `{}' with {} waitees", goal->goalName(), goal->waiteeCount()));
+                throw Error("goonix: goal scheduler stalled without a wake-up");
+            }
         }
     }
 
@@ -4323,6 +4359,8 @@ void Worker::waitForInput()
     assert(sizeof(time_t) >= sizeof(long));
     time_t nearest = LONG_MAX; // nearest deadline
     for (auto& i : children) {
+        if (i.second.deadline) // goonix: graph-specific deadline
+            nearest = std::min(nearest, i.second.deadline);
         if (!i.second.respectTimeouts) continue;
         if (settings.maxSilentTime != 0)
             nearest = std::min(nearest, i.second.lastOutput + settings.maxSilentTime);
@@ -4404,7 +4442,14 @@ void Worker::waitForInput()
             }
         }
 
-        if (goal->getExitCode() == Goal::ecBusy &&
+        if (goal->getExitCode() == Goal::ecBusy && j->second.deadline && // goonix: graph deadline
+            after >= j->second.deadline)
+        {
+            printMsg(lvlError, std::format("{} reached its graph deadline",
+                                          goal->getName()));
+            goal->timedOut();
+        }
+        else if (goal->getExitCode() == Goal::ecBusy &&
             settings.maxSilentTime != 0 &&
             j->second.respectTimeouts &&
             after - j->second.lastOutput >= (time_t) settings.maxSilentTime)

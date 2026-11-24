@@ -54,6 +54,7 @@ libutil_a_CPPFLAGS =				\
   -I$(top_srcdir)/%D%/libutil			\
   $(LIBGCRYPT_CPPFLAGS)
 
+# goonix: CA store modules.
 libstore_a_SOURCES =				\
   %D%/libstore/gc.cc				\
   %D%/libstore/globals.cc			\
@@ -68,6 +69,21 @@ libstore_a_SOURCES =				\
   %D%/libstore/builtins.cc			\
   %D%/libstore/sqlite.cc
 
+# goonix: CA store modules.
+libstore_a_SOURCES +=				\
+  %D%/libstore/records.cc			\
+  %D%/libstore/ca.cc				\
+  %D%/libstore/local-store-ca.cc			\
+  %D%/libstore/build-ca.cc			\
+  %D%/libstore/build-ca.hh			\
+  %D%/libstore/build-goonix.hh			\
+  %D%/libstore/build-goonix-goal.hh		\
+  %D%/libstore/build-goonix-response.cc		\
+  %D%/libstore/build-goonix-response.hh		\
+  %D%/libstore/local-store-goonix.hh		\
+  %D%/libstore/build-goonix.inc			\
+  %D%/libstore/deep-scan.cc
+
 libstore_headers =				\
   %D%/libstore/references.hh			\
   %D%/libstore/pathlocks.hh			\
@@ -80,6 +96,12 @@ libstore_headers =				\
   %D%/libstore/builtins.hh			\
   %D%/libstore/store-api.hh
 
+# goonix: CA store headers.
+libstore_headers +=				\
+  %D%/libstore/ca.hh				\
+  %D%/libstore/records.hh			\
+  %D%/libstore/deep-scan.hh
+
 libstore_a_CPPFLAGS =				\
   $(libutil_a_CPPFLAGS)				\
   -I$(top_srcdir)/%D%/libstore			\
@@ -91,10 +113,25 @@ libstore_a_CPPFLAGS =				\
   -DNIX_BIN_DIR=\"$(bindir)\"			\
   -DDEFAULT_CHROOT_DIRS="\"\""
 
+libstore_a_CPPFLAGS += -DGOONIX_LIBEXEC_DIR=\"$(libexecdir)\" # goonix: expanded helper directory.
+
 libstore_a_CXXFLAGS = $(AM_CXXFLAGS)		\
   $(SQLITE3_CFLAGS)
 
 bin_PROGRAMS = guix-daemon
+# goonix: tests for CA finalisation and signed records.
+noinst_PROGRAMS = nix/ca-test nix/records-test
+
+nix_ca_test_SOURCES = %D%/libstore/ca-test.cc
+nix_ca_test_CPPFLAGS = $(guix_daemon_CPPFLAGS) # goonix: helper path for tests.
+nix_ca_test_LDADD = libstore.a libutil.a -lz $(SQLITE3_LIBS) $(LIBGCRYPT_LIBS)
+nix_records_test_SOURCES = %D%/libstore/records-test.cc
+nix_records_test_CPPFLAGS = $(guix_daemon_CPPFLAGS)
+nix_records_test_LDADD = $(nix_ca_test_LDADD)
+if HAVE_LIBBZ2
+nix_ca_test_LDADD += -lbz2
+nix_records_test_LDADD += -lbz2
+endif HAVE_LIBBZ2
 
 guix_daemon_SOURCES =				\
   %D%/nix-daemon/nix-daemon.cc			\

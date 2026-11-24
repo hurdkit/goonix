@@ -511,6 +511,27 @@ bool LocalStore::canReachRoot(GCState & state, PathSet & visited, const Path & p
         PathSet derivers = queryValidDerivers(path);
         for (auto& i : derivers)
             incoming.insert(i);
+        // goonix: an output keeps every derivation whose build records name
+        // it, not just the single historical deriver (plan 10).  An output
+        // can have several derivers; facts survive collection of the .drv.
+        PathSet recordDerivers = goonixDerivationsForPath(path);
+        for (auto& i : recordDerivers)
+            if (isValidPath(i)) incoming.insert(i);
+        PathSet originals = goonixOriginalsForPath(path);
+        for (auto& i : originals)
+            if (isValidPath(i)) incoming.insert(i);
+    }
+
+    // goonix: a live derivation keeps the outputs its records/choices name
+    // (gc-keep-derivations), even though CA output paths are not historical
+    // output:ID rows.  Records survive collection of the output itself.
+    if (state.gcKeepDerivations && isDerivation(path)) {
+        PathSet chosen = goonixChosenPaths(path);
+        for (auto& i : chosen)
+            if (isValidPath(i)) incoming.insert(i);
+        /* A resolved derivation keeps the outputs of its own build facts. */
+        for (auto & record : queryGoonixRecordsByResolved(path))
+            if (isValidPath(record.path)) incoming.insert(record.path);
     }
 
     for (auto& i : incoming)

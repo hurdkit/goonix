@@ -13,7 +13,27 @@ bin_PROGRAMS =
 noinst_LIBRARIES =
 BUILT_SOURCES += daemon/src/Goonix/Config.hs
 CLEANFILES += daemon/src/Goonix/Config.hs guix-daemon guix-sandbox \
-  guix-daemon.tmp guix-sandbox.tmp
+  guix-daemon.tmp guix-sandbox.tmp goonix-ca-scan goonix-ca-scan.tmp
+
+# goonix: the out-of-process CA decoder must ship in the Haskell package too.
+# The C++ target graph (nix/local.mk, nix/goonix.mk) is not included in this
+# mode, so build the helper here from the same sources, against the same
+# libutil objects and libarchive, and install it into libexec.  The daemon's
+# default helper path is the make-expanded libexecdir (Goonix.Config), so the
+# installed package finds it with no GOONIX_DEEP_SCAN_HELPER override.
+if HAVE_LIBARCHIVE
+BUILT_SOURCES += goonix-ca-scan
+goonix-ca-scan: $(top_srcdir)/nix/goonix-ca-scan.cc \
+    $(top_srcdir)/nix/libutil/util.cc $(top_srcdir)/nix/libutil/affinity.cc \
+    nix/config.h
+	$(AM_V_CXX)$(CXX) $(DEFS) $(DEFAULT_INCLUDES) \
+	  -I$(top_srcdir)/nix/libutil $(LIBARCHIVE_CFLAGS) \
+	  $(CPPFLAGS) -std=c++20 -O2 -Wall $(CXXFLAGS) $(LDFLAGS) \
+	  -o $@.tmp $(top_srcdir)/nix/goonix-ca-scan.cc \
+	  $(top_srcdir)/nix/libutil/util.cc $(top_srcdir)/nix/libutil/affinity.cc \
+	  -lz $(LIBARCHIVE_LIBS); \
+	  mv $@.tmp $@
+endif HAVE_LIBARCHIVE
 
 # The sandbox helper is built in the source tree with the daemon, so Guix's
 # existing GUIX_SANDBOX override and tests can select this exact binary.
@@ -48,17 +68,24 @@ install-exec-local: guix-daemon guix-sandbox
 	$(MKDIR_P) "$(DESTDIR)$(bindir)"
 	$(INSTALL_PROGRAM) guix-daemon "$(DESTDIR)$(bindir)/guix-daemon"
 	$(INSTALL_PROGRAM) guix-sandbox "$(DESTDIR)$(bindir)/guix-sandbox"
+if HAVE_LIBARCHIVE
+	$(MKDIR_P) "$(DESTDIR)$(libexecdir)"
+	$(INSTALL_PROGRAM) goonix-ca-scan "$(DESTDIR)$(libexecdir)/goonix-ca-scan"
+endif HAVE_LIBARCHIVE
 
 uninstall-local: uninstall-haskell-daemon
 uninstall-haskell-daemon:
 	rm -f "$(DESTDIR)$(bindir)/guix-daemon" "$(DESTDIR)$(bindir)/guix-sandbox"
+if HAVE_LIBARCHIVE
+	rm -f "$(DESTDIR)$(libexecdir)/goonix-ca-scan"
+endif HAVE_LIBARCHIVE
 
 daemon/src/Goonix/Config.hs: Makefile guix/store/schema.sql
 	$(AM_V_GEN)$(MKDIR_P) daemon/src/Goonix; \
 	$(GUILE) --no-auto-compile $(top_srcdir)/daemon/make-config.scm \
 	  "$@" "$(storedir)" "$(localstatedir)/guix" \
 	  "$(localstatedir)/log/guix" "$(sysconfdir)/guix" "$(bindir)" \
-	  "$(localedir)" "$(guix_system)" "$(GUIX_SUBSTITUTE_URLS)" \
+	  "$(libexecdir)" "$(localedir)" "$(guix_system)" "$(GUIX_SUBSTITUTE_URLS)" \
 	  "$(top_srcdir)/guix/store/schema.sql"
 
 else !BUILD_HASKELL_DAEMON
@@ -79,6 +106,36 @@ EXTRA_DIST += \
   daemon/src/Goonix/Store/Substitute.hs daemon/src/Goonix/Store/Archive.hs daemon/src/Goonix/Build/Engine.hs daemon/src/Goonix/Build/Offload.hs daemon/src/Goonix/Build/Scheduler.hs daemon/src/Goonix/Build/Shared.hs daemon/src/Goonix/Build/Wait.hs daemon/cbits/sockets.c daemon/cbits/files.c \
   daemon/src/Goonix/Store/Path.hs daemon/src/Goonix/Store/Derivation.hs \
   daemon/src/Goonix/Store/Nar.hs daemon/src/Goonix/Store/References.hs \
+  daemon/src/Goonix/Store/Ca.hs \
+  daemon/src/Goonix/Store/DeepScan.hs \
+  daemon/test/ca-vectors/Main.hs \
+  daemon/test/ca-leftover/Main.hs daemon/test/ca-leftover.sh \
+  daemon/test/rewrite-mode/Main.hs daemon/test/rewrite-mode.sh \
+  nix/libstore/rewrite-mode-probe.cc \
+  daemon/test/dedup-mode/Main.hs daemon/test/dedup-mode.sh \
+  nix/libstore/dedup-probe.cc \
+  daemon/test/delete-mode/Main.hs daemon/test/delete-mode.sh \
+  nix/libstore/delete-probe.cc \
+  daemon/test/register-mode/Main.hs daemon/test/register-mode.sh \
+  nix/libstore/register-probe.cc \
+  daemon/test/reserved-mode/Main.hs daemon/test/reserved-mode.sh \
+  nix/libstore/reserved-probe.cc \
+  daemon/test/inverse-mode/Main.hs daemon/test/inverse-mode.sh \
+  nix/libstore/inverse-probe.cc \
+  daemon/test/order-mode/Main.hs daemon/test/order-mode.sh \
+  nix/libstore/order-probe.cc \
+  daemon/test/same-mode/Main.hs daemon/test/same-mode.sh \
+  nix/libstore/same-probe.cc \
+  daemon/test/inverse-sibling-boundary.hs daemon/test/inverse-sibling-boundary.sh \
+  daemon/test/symlink-concurrent.hs daemon/test/symlink-concurrent.sh \
+  daemon/test/rewrite-boundary.hs daemon/test/rewrite-boundary.sh \
+  daemon/test/rewrite-speed/Main.hs daemon/test/rewrite-speed.sh \
+  nix/libstore/rewrite-speed-probe.cc \
+  daemon/test/rewrite-boundary-mode/Main.hs daemon/test/rewrite-boundary-mode.sh \
+  nix/libstore/rewrite-boundary-probe.cc \
+  daemon/test/gcroot-mode/Main.hs daemon/test/gcroot-mode.sh \
+  nix/libstore/gcroot-probe.cc \
+  daemon/test/deep-scan-timeout.hs daemon/test/deep-scan-timeout.sh \
   daemon/proxy/Main.hs \
   daemon/test/wire-proxy/Main.hs daemon/test/wire-proxy/run.sh \
   daemon/test/wire-proxy/inventory.scm daemon/test/check-build-flags.scm \
@@ -125,6 +182,12 @@ EXTRA_DIST += \
   daemon/test/differential/root-ci.sh daemon/test/differential/root-ci-setup.sh \
   daemon/test/differential/root-ci-client.scm daemon/test/differential/root-ci-http.sh \
   daemon/test/differential/root-ci-killuser.scm daemon/test/differential/root-ci-substitute.sh \
+  daemon/test/differential/ca-counted-gate.sh \
+  daemon/test/differential/ca-counted-gate-part.sh \
+  daemon/test/differential/ca-deep-scan-installed.sh \
+  daemon/test/differential/ca-deep-scan-installed-part.sh \
+  daemon/test/differential/root-ci-part.sh \
+  daemon/test/differential/pidns-guard.sh daemon/test/differential/pidns-isolation.sh \
   daemon/sandbox/README.md daemon/sandbox/guix-sandbox.cc \
   daemon/sandbox/Makefile daemon/test/lib.sh daemon/test/seed-restore.scm \
   daemon/test/sandbox-helper-cleanup.sh daemon/test/sandbox-helper-cleanup.scm \
@@ -138,6 +201,8 @@ EXTRA_DIST += \
   daemon/test/vectors/hash-nar.cc daemon/test/vectors/inspect-item.cc \
   daemon/test/vectors/hash-derivations.cc \
   daemon/test/vectors/generate.sh daemon/test/compare-trs.sh \
+  daemon/test/scan-real-store-fixture.sh daemon/test/scan-real-store-fixture.scm \
+  daemon/test/scan-real-store.sh daemon/test/scan-real-store.scm \
   daemon/test/RESULTS.md \
   daemon/test/transcripts/README.md \
   daemon/test/transcripts/inventory.wire.log \

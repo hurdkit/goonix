@@ -144,6 +144,9 @@ struct Plan {
     gid_t gidMapInside = 0;
     gid_t gidMapOutside = 0;
     bool allowSetgroups = false;
+    /* C++ CloneSpawnContext.lockMountsMapAll: identity-map every range the
+       parent namespace had, instead of a single id. */
+    bool mapAllIds = false;
     Bytes root;
     Bytes storeDirectory;
     Bytes hostname = "localhost";
@@ -485,7 +488,7 @@ void mkdirParents(const Bytes & path)
 std::vector<char *> stringPointers(std::vector<Bytes> & strings);
 void mountIntoSandbox(const Plan & plan, const Bytes & source,
                       const Bytes & target, bool readOnly);
-void unshareAndInitUserns(Plan & plan);
+void unshareAndInitUserns(Plan & plan, const Bytes & context = "userns");
 
 /* Fixed-output networking follows setupTap and spawnSlirp4netns in
    nix/libstore/build.cc.  The descriptor never crosses exec: only the
@@ -597,16 +600,23 @@ void slirpChild(Plan & plan, int tap, int readyFd)
        mounts are private; a read-only tmpfs root prevents self-overwrite. */
     const Bytes oldRoot = plan.root;
     plan.root += "/slirp";
-    /* The slirp child starts in the daemon's namespaces.  Create its own
-       user namespace first, with the host identity mapped, before creating
-       the mount/PID/IPC/UTS namespaces.  This is the C++ cloneFlags plus
-       lockMounts ordering. */
-    Plan initialIdentity = plan;
-    initialIdentity.uidMapInside = plan.uidMapOutside;
-    initialIdentity.uidMapOutside = plan.uidMapOutside;
-    initialIdentity.gidMapInside = plan.gidMapOutside;
-    initialIdentity.gidMapOutside = plan.gidMapOutside;
-    unshareAndInitUserns(initialIdentity);
+    /* The slirp child starts in the daemon's namespaces.  C++ spawnSlirp4netns
+       sets newUserNS = !amRoot (build.cc): the initial user namespace exists
+       only when the daemon is NOT root, to gain the capabilities needed to
+       create the other namespaces.  As root those capabilities are already
+       there, and creating the namespace anyway adds a nesting level that makes
+       the later setgroups write fail EPERM.  Map the CURRENT identity (C++
+       initializeUserNamespace(slirpPid, getuid(), getgid(), getuid(), getgid()));
+       mapping the build user's uid would leave the daemon's own uid unmapped,
+       stripping CAP_SYS_ADMIN and failing the tmpfs mount with EOVERFLOW. */
+    if (geteuid() != 0) {
+        Plan initialIdentity = plan;
+        initialIdentity.uidMapInside = geteuid();
+        initialIdentity.uidMapOutside = geteuid();
+        initialIdentity.gidMapInside = getegid();
+        initialIdentity.gidMapOutside = getegid();
+        unshareAndInitUserns(initialIdentity, "slirp-initial");
+    }
     if (unshare(CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWIPC | CLONE_NEWUTS) == -1)
         sysError("creating slirp namespaces");
     const pid_t child = fork();
@@ -656,22 +666,29 @@ void slirpChild(Plan & plan, int tap, int readyFd)
         sysError("preparing slirp root");
     if (prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0) == -1 ||
         prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == -1) sysError("dropping slirp privileges");
-    /* Match remapIdsTo0Action: map the requested slirp uid/gid to root in
-       a fresh user namespace.  setgroups must remain enabled for slirp's
-       --enable-sandbox parent setup. */
+    /* Match remapIdsTo0Action and lockMountsAction: C++ sets
+       slirpCtx.lockMountsMapAll = true ("So that later setuid will work") and
+       lockMountsAllowSetgroups = amRoot.  Identity-mapping EVERY range the
+       parent namespace had is what makes "allow" writable: with only one gid
+       mapped the kernel refuses it with EPERM, which is what a namespace-root
+       daemon (the counted gate) hit.  Map the CURRENT uid/gid, not the build
+       user's, so the daemon's own identity stays mapped. */
     Plan lockIdentity = plan;
-    lockIdentity.uidMapInside = plan.uidMapOutside;
-    lockIdentity.uidMapOutside = plan.uidMapOutside;
-    lockIdentity.gidMapInside = plan.gidMapOutside;
-    lockIdentity.gidMapOutside = plan.gidMapOutside;
-    unshareAndInitUserns(lockIdentity);
+    lockIdentity.uidMapInside = geteuid();
+    lockIdentity.uidMapOutside = geteuid();
+    lockIdentity.gidMapInside = getegid();
+    lockIdentity.gidMapOutside = getegid();
+    lockIdentity.mapAllIds = true;
+    lockIdentity.allowSetgroups = geteuid() == 0;
+    unshareAndInitUserns(lockIdentity, "slirp-lock");
     Plan identity = plan;
     identity.uidMapInside = 0;
-    identity.uidMapOutside = plan.uidMapOutside;
+    identity.uidMapOutside = geteuid();
     identity.gidMapInside = 0;
-    identity.gidMapOutside = plan.gidMapOutside;
+    identity.gidMapOutside = getegid();
+    identity.mapAllIds = true;
     identity.allowSetgroups = geteuid() == 0;
-    unshareAndInitUserns(identity);
+    unshareAndInitUserns(identity, "slirp-identity");
     if (setgid(0) == -1)
         sysError("setting slirp gid to root");
     if (setuid(0) == -1)
@@ -869,9 +886,58 @@ void enterSandbox(Plan & plan)
     plan.gid = plan.gidMapInside;
 }
 
+/* Read a small procfs file whole (C++ readFile(path, true)). */
+static Bytes readWholeFile(const Bytes & path)
+{
+    Fd fd(open(path.c_str(), O_RDONLY | O_CLOEXEC));
+    if (fd.get() == -1) sysError("opening " + path);
+    Bytes out;
+    unsigned char buffer[4096];
+    while (true) {
+        const ssize_t got = read(fd.get(), buffer, sizeof(buffer));
+        if (got < 0) {
+            if (errno == EINTR) continue;
+            sysError("reading " + path);
+        }
+        if (got == 0) break;
+        out.append(reinterpret_cast<const char *>(buffer), static_cast<size_t>(got));
+    }
+    return out;
+}
+
+/* C++ idMapToIdentityMap (spawn.cc): rewrite each "inside outside count" line
+   of an existing map as "inside inside count", preserving every range.  Used
+   by lockMounts when lockMountsMapAll is set, so the new namespace keeps all
+   the ids the parent had mapped -- including the whole supplementary gid
+   range, without which writing "allow" to setgroups fails EPERM. */
+static Bytes idMapToIdentityMap(const Bytes & map)
+{
+    Bytes out;
+    size_t start = 0;
+    while (start < map.size()) {
+        size_t end = map.find('\n', start);
+        if (end == Bytes::npos) end = map.size();
+        const Bytes line = map.substr(start, end - start);
+        start = end + 1;
+        if (line.empty()) continue;
+        std::vector<Bytes> fields;
+        size_t at = 0;
+        while (at < line.size()) {
+            while (at < line.size() && (line[at] == ' ' || line[at] == '\t')) at++;
+            size_t from = at;
+            while (at < line.size() && line[at] != ' ' && line[at] != '\t') at++;
+            if (at > from) fields.push_back(line.substr(from, at - from));
+        }
+        if (fields.size() != 3)
+            throw Error("malformed id map line `" + line + "'");
+        out += fields[0] + " " + fields[0] + " " + fields[2] + "\n";
+    }
+    return out;
+}
+
 /* Retain spawn.cc's external map-writer handshake.  No daemon code runs
    after fork; the child only executes the C++ map-writing routine. */
-void unshareAndInitUserns(Plan & plan)
+void unshareAndInitUserns(Plan & plan, const Bytes & context)
 {
     const pid_t target = getpid();
     const Bytes pid = std::to_string(target);
@@ -884,18 +950,37 @@ void unshareAndInitUserns(Plan & plan)
             toChild.writeSide.reset();
             fromChild.readSide.reset();
             waitForMessage(toChild.readSide.get(), "ready\n");
-            writeFile("/proc/" + pid + "/uid_map",
-                std::to_string(plan.uidMapInside) + " " +
-                std::to_string(plan.uidMapOutside) + " 1\n");
-            writeFile("/proc/" + pid + "/setgroups", plan.allowSetgroups ? "allow\n" : "deny\n");
-            writeFile("/proc/" + pid + "/gid_map",
-                std::to_string(plan.gidMapInside) + " " +
-                std::to_string(plan.gidMapOutside) + " 1\n");
+            /* Name the file and the mapping in the error: "Operation not
+               permitted" alone does not say which of the three writes failed,
+               and the slirp child makes three nested namespaces. */
+            const Bytes uidMap = plan.mapAllIds
+                ? idMapToIdentityMap(readWholeFile("/proc/self/uid_map"))
+                : Bytes(std::to_string(plan.uidMapInside) + " " +
+                    std::to_string(plan.uidMapOutside) + " 1\n");
+            const Bytes gidMap = plan.mapAllIds
+                ? idMapToIdentityMap(readWholeFile("/proc/self/gid_map"))
+                : Bytes(std::to_string(plan.gidMapInside) + " " +
+                    std::to_string(plan.gidMapOutside) + " 1\n");
+            try {
+                writeFile("/proc/" + pid + "/uid_map", uidMap);
+            } catch (const std::exception & error) {
+                throw Error(Bytes("uid_map `") + uidMap + "': " + error.what());
+            }
+            try {
+                writeFile("/proc/" + pid + "/setgroups", plan.allowSetgroups ? "allow\n" : "deny\n");
+            } catch (const std::exception & error) {
+                throw Error(Bytes("setgroups: ") + error.what());
+            }
+            try {
+                writeFile("/proc/" + pid + "/gid_map", gidMap);
+            } catch (const std::exception & error) {
+                throw Error(Bytes("gid_map `") + gidMap + "': " + error.what());
+            }
             writeFull(fromChild.writeSide.get(), "go\n");
         } catch (const std::exception & error) {
             try {
                 writeFull(STDERR_FILENO,
-                    Bytes("guix-sandbox: user namespace map writer: ") + error.what() + "\n");
+                    Bytes("guix-sandbox: user namespace map writer [") + context + "]: " + error.what() + "\n");
             } catch (...) { }
             _exit(1);
         } catch (...) {

@@ -1,0 +1,3 @@
+# Scratch trees written by the counted runners: private stores, databases and
+# logs, several GiB each.  Never commit them.
+work/

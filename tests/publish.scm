@@ -23,6 +23,10 @@
 
 (define-module (test-publish)
   #:use-module (guix scripts publish)
+  #:autoload (guix ca records)
+             (build-graph-records build-records->expression
+                                  expression->build-records
+                                  expression->graph-choices) ;goonix: record transport
   #:use-module (guix tests)
   #:use-module (guix config)
   #:use-module ((guix utils) #:select (call-with-temporary-directory))
@@ -30,6 +34,7 @@
   #:use-module (gcrypt hash)
   #:use-module (guix store)
   #:use-module (guix derivations)
+  #:use-module (guix packages) ;goonix: CA fixture lowering
   #:use-module (guix gexp)
   #:use-module (guix base32)
   #:use-module (guix base64)
@@ -65,6 +70,23 @@
 (define %reference (add-text-to-store %store "ref" "foo"))
 
 (define %item (add-text-to-store %store "item" "bar" (list %reference)))
+
+(define %ca-derivation ;goonix: CA publish fixture
+  (let* ((guile-drv (package-derivation %store (@ (gnu packages bootstrap)
+                                                 %bootstrap-guile)))
+         (guile (string-append (derivation->output-path guile-drv)
+                               "/bin/guile")))
+    (derivation %store "publish-ca" guile
+                '("--no-auto-compile" "-c"
+                  "(call-with-output-file (getenv \"out\") (lambda (p) (display \"published\" p)))")
+                #:inputs (list (derivation-input guile-drv))
+                #:addressing 'content)))
+
+(build-derivations %store (list %ca-derivation))
+(define %ca-output
+  (realised-output-path %store %ca-derivation "out"))
+(define %ca-record
+  (build-graph-records %store (derivation-file-name %ca-derivation)))
 
 (define (http-get-body uri)
   (call-with-values (lambda () (http-get uri))
@@ -191,6 +213,23 @@ FileSize: ~a\n"
    (http-get-body
     (publish-uri
      (string-append "/" (store-path-hash-part %item) ".narinfo")))))
+
+(define %ca-record-expression
+  (call-with-input-string
+      (http-get-body
+       (publish-uri (string-append "/goonix/records/"
+                                   (basename
+                                    (derivation-file-name %ca-derivation)))))
+    read))
+
+(test-equal "/goonix/records/DERIVATION serves the signed graph" ;goonix: HTTP records
+  %ca-record
+  (expression->build-records %ca-record-expression))
+
+(test-assert "/goonix/records/DERIVATION serves unsigned choice hints"
+  (equal? (list (list (derivation-file-name %ca-derivation) "out"
+                      (realised-output-path %store %ca-derivation "out")))
+          (expression->graph-choices %ca-record-expression)))
 
 (test-equal "/*.narinfo pipeline"
   (make-list 500 200)

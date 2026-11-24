@@ -25,6 +25,8 @@ module Goonix.Store.ReadOnly
   , hasPathFailed
   , storePath
   , assertStorePath
+  , storePathStrict
+  , assertStorePathStrict
   , storeError
   ) where
 
@@ -44,9 +46,10 @@ import qualified System.Posix.Files.ByteString as Files
 import Data.Word (Word32, Word64)
 import qualified Goonix.Config as Config
 import Goonix.Store.Files (mkdirParents)
-import Goonix.Store.Base32 (decodeBase16)
+import Goonix.Store.Base32 (decodeBase16, base32Alphabet)
 import Goonix.Store.Database
 import Goonix.Store.Hash
+import Goonix.Store.Path (validateStoreName)
 
 data Store = Store
   { storeDirectory :: !ByteString
@@ -84,6 +87,24 @@ storeError message = StoreError (C.pack message) 1
 
 assertStorePath :: Store -> ByteString -> IO ByteString
 assertStorePath store path = either (throwIO . storeError) pure (storePath store path)
+
+-- | C++ assertStorePathStrict (store-api.cc): a store path whose 32-character
+-- hash part uses the base32 alphabet and whose name is valid.  Stricter than
+-- storePath (which only checks the prefix); used by the strict single-path reads.
+storePathStrict :: Store -> ByteString -> Either String ByteString
+storePathStrict store path
+  | B.length path > B.length dir + 1
+    && B.take (B.length dir + 1) path == dir <> "/"
+    && let basename = B.drop (B.length dir + 1) path
+           hash = B.take 32 basename
+       in B.length basename >= 34 && B.index basename 32 == 45
+          && B.all (`B.elem` base32Alphabet) hash
+          && either (const False) (const True) (validateStoreName (B.drop 33 basename)) = Right path
+  | otherwise = Left ("path `" ++ C.unpack path ++ "' is not a valid store path")
+  where dir = storeDirectory store
+
+assertStorePathStrict :: Store -> ByteString -> IO ByteString
+assertStorePathStrict store path = either (throwIO . storeError) pure (storePathStrict store path)
 
 openStore :: ByteString -> FilePath -> ByteString -> IO Store
 openStore directory databasePath state = withSchemaLock $ do

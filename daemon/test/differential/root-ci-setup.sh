@@ -24,7 +24,19 @@ daemon=${1:?usage: root-ci.sh DAEMON [LABEL]}
 label=${2:-$(basename "$daemon")}
 root=$(CDPATH= cd -- "$(dirname "$0")/../../.." && pwd)
 work=/tmp/pr6-root-ci/$label
-rm -rf "$work"
+# Store items are read-only (dirs 0555), so `rm -rf` alone cannot unlink their
+# entries: it fails EACCES per file and leaves the previous run's store standing
+# while the script goes on to seed and test it.  The counted gate hit exactly
+# this (see ca-counted-gate.sh setup_ns).  Labels here are reused across runs, so
+# make the tree writable first and refuse to continue on a leftover store.
+if test -e "$work"; then
+  chmod -R u+rwX "$work" 2>/dev/null || true
+  rm -rf "$work"
+  if test -e "$work"; then
+    echo "root-ci setup FAILED: could not clear $work; refusing to test a leftover store" >&2
+    exit 1
+  fi
+fi
 mkdir -p "$work"/{gnu-store,var-guix,log-guix,etc,build,bin,cache,gitrepo,substituter-data}
 mkdir -p "$work/var-guix"/{db,gcroots,profiles,temproots,daemon-socket}
 
@@ -54,6 +66,10 @@ printf 7 > "$work/var-guix/db/schema"
 cp "$root/scripts/guix" "$work/bin/guix"
 chmod +x "$work/bin/guix"
 ln -sf "$(command -v sh)" "$work/bin/sh"
+# bash too: the runner execs the PID-namespace part with bash AFTER this
+# scratch /bin is bind-mounted over /bin, so a bare `bash` (or $BASH=/bin/bash
+# on a merged-usr host) would be hidden.  Link the real one in.
+ln -sf "$(command -v bash)" "$work/bin/bash"
 
 # --- a local git repo for builtin:git-download ---
 git init -q "$work/gitrepo"

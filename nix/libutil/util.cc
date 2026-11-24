@@ -1491,7 +1491,8 @@ void commonChildInit(Pipe & logPipe)
 
 //////////////////////////////////////////////////////////////////////
 
-Agent::Agent(const string &command, const Strings &args, const std::map<string, string> &env)
+Agent::Agent(const string &command, const Strings &args, // goonix: separate binary replies from logs
+    const std::map<string, string> &env, bool separateStderr)
 {
     debug(std::format("starting agent '{}'", command));
 
@@ -1508,6 +1509,22 @@ Agent::Agent(const string &command, const Strings &args, const std::map<string, 
     pid = startProcess([&]() {
 
         commonChildInit(fromAgent);
+
+        /* goonix: binary protocols never share replies with logging. */
+        if (separateStderr &&
+            dup2(builderOut.writeSide, STDERR_FILENO) == -1)
+            throw SysError("cannot pipe standard error into log file");
+
+        /* goonix: diagnostics stay inspectable outside the protocol. */
+        if (separateStderr) {
+            Path log = getEnv("GOONIX_AUTHENTICATION_LOG");
+            if (log != "") {
+                int fd = open(log.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0600);
+                if (fd == -1 || dup2(fd, STDERR_FILENO) == -1)
+                    throw SysError("cannot open authentication log");
+                close(fd);
+            }
+        }
 
 	for (auto pair: env) {
 	    setenv(pair.first.c_str(), pair.second.c_str(), 1);

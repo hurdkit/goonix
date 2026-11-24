@@ -6,10 +6,15 @@
 
 #include "pathlocks.hh"
 #include "store-api.hh"
+#include "records.hh" // goonix: build-record types
 #include "util.hh"
 
 
 namespace nix {
+
+class Worker;
+class Goal;
+typedef std::shared_ptr<Goal> GoalPtr; // goonix: asynchronous graph goal factory
 
 
 /* Nix store and database schema version.  Version 1 (or 0) was Nix <=
@@ -47,6 +52,10 @@ private:
     /* Ensure the substituter is running and return it.  */
     std::shared_ptr<Agent> substituter();
 
+public:
+#include "local-store-goonix.hh" // goonix: content-addressing API
+
+private:
     Path linksDir;
 
 public:
@@ -200,6 +209,9 @@ private:
     SQLiteStmt stmtQueryDerivationOutputs;
     SQLiteStmt stmtQueryPathFromHashPart;
     SQLiteStmt stmtQueryValidPaths;
+
+    // goonix: records and choices are not keyed by collectible ValidPaths rows.
+    std::unique_ptr<class BuildRecords> goonixRecords;
 
     /* Cache for pathContentsGood(). */
     std::map<Path, bool> pathContentsGoodCache;

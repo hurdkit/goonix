@@ -44,6 +44,9 @@ export PATH
 
 # The daemon invokes 'guix'; tell it which one to use.
 GUIX="$abs_top_builddir/scripts/guix"
+# goonix: use the build-tree decoder; installed daemons use libexec.
+GOONIX_DEEP_SCAN_HELPER="$abs_top_builddir/goonix-ca-scan"
+export GOONIX_DEEP_SCAN_HELPER
 export GUIX
 
 # Sanity check.

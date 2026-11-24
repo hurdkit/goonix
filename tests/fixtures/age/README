@@ -1,0 +1,6 @@
+Published C2SP/CCTV age test vectors.
+Source: https://github.com/C2SP/CCTV/tree/4448f2097b2d/age/testdata
+Revision: 4448f2097b2d (module used by age testkit).
+License: the vectors in age/testdata are available under Zero-Clause BSD,
+CC0 1.0, or the Unlicense, at the recipient's choice, as stated in
+https://github.com/C2SP/CCTV/blob/4448f2097b2d/age/README.md#license.

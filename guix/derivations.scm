@@ -42,6 +42,7 @@
   #:use-module (guix i18n)
   #:use-module (guix monads)
   #:autoload   (gcrypt hash) (sha256)
+  #:autoload   (guix ca) (token-path placeholder) ;goonix: explicit addressing
   #:use-module (guix sets)
   #:export (<derivation>
             derivation?
@@ -89,11 +90,13 @@
             derivation-input-fold
             substitution-oracle
             derivation-hash
+            derivation/masked-inputs           ;goonix: compatibility oracle
             derivation-properties
 
             read-derivation
             read-derivation-from-file
             write-derivation
+            derivation->bytevector           ;goonix: masked bytes for placeholders
             derivation->output-path
             derivation->output-paths
             derivation-path->output-path
@@ -102,6 +105,7 @@
             raw-derivation
             invalidate-derivation-caches!
 
+            realised-output-path           ;goonix: query the daemon's chosen path
             map-derivation
 
             build-derivations
@@ -569,7 +573,18 @@ things as appropriate and is thus more efficient."
   ;; and because the same argument is read more than 15 times on average
   ;; during something like (package-derivation s gdb).
   (or (and file (hash-ref %derivation-cache file))
-      (let ((drv (call-with-input-file file read-derivation)))
+      (let ((drv (call-with-input-file file
+                   (lambda (port)
+                     (let ((drv (read-derivation port)))
+                       ;; goonix: preserve canonical file identity for resolution.
+                       (make-derivation (derivation-outputs drv)
+                                        (derivation-inputs drv)
+                                        (derivation-sources drv)
+                                        (derivation-system drv)
+                                        (derivation-builder drv)
+                                        (derivation-builder-arguments drv)
+                                        (derivation-builder-environment-vars drv)
+                                        (canonicalize-path file)))))))
         (hash-set! %derivation-cache file drv)
         drv)))
 
@@ -805,6 +820,7 @@ name of each input with that input's hash."
                      allowed-references disallowed-references
                      leaked-env-vars local-build?
                      (substitutable? #t)
+                     (addressing 'input) ;goonix: input|content|resolved
                      (properties '())
                      (%deprecation-warning? #t))
   "Build a derivation with the given arguments, and return the resulting
@@ -895,6 +911,8 @@ derivation.  It is kept as-is, uninterpreted, in the derivation."
                           (() '())
                           (lst `(("guix properties"
                                   . ,(object->string properties)))))
+                      ,@((module-ref (resolve-interface '(guix ca derivation))
+                                     'addressing-environment) addressing) ;goonix: addressing marker
                       ,@env-vars)))
       (match references-graphs
         (((file . path) ...)
@@ -973,7 +991,25 @@ derivation.  It is kept as-is, uninterpreted, in the derivation."
                              (string<? (car e1) (car e2)))))
          (drv-masked (make-derivation outputs inputs sources
                                       system builder args env-vars #f))
-         (drv        (add-output-paths drv-masked)))
+         (drv        (if (eq? addressing 'input) ;goonix: preserve upstream input paths
+                           (add-output-paths drv-masked)
+                           ((module-ref (resolve-interface '(guix ca derivation))
+                                        'add-addressed-output-paths)
+                            drv-masked name addressing output-path
+                            (lambda (output-name algo hash rec?)
+                              (fixed-output-path name hash #:hash-algo algo
+                                                 #:output output-name
+                                                 #:recursive? rec?))
+                            derivation-output-path
+                            derivation-output-hash derivation-output-hash-algo
+                            derivation-output-recursive? make-derivation-output
+                            (lambda (drv)
+                              (list (derivation-outputs drv) (derivation-inputs drv)
+                                    (derivation-sources drv) (derivation-system drv)
+                                    (derivation-builder drv) (derivation-builder-arguments drv)
+                                    (derivation-builder-environment-vars drv)))
+                            derivation->bytevector derivation-hash
+                            store-path-package-name make-derivation))))
 
     (let* ((file (add-data-to-store store (string-append name ".drv")
                                     (derivation->bytevector drv)
@@ -1118,6 +1154,10 @@ recursively."
 ;;;
 ;;; Store compatibility layer.
 ;;;
+
+(define (realised-output-path store drv output)
+  "Return DRV's chosen realised OUTPUT from STORE, never a placeholder."
+  (query-realised-output/direct store (derivation-file-name drv) output)) ;goonix: daemon choice
 
 (define* (build-derivations store derivations
                             #:optional (mode (build-mode normal)))

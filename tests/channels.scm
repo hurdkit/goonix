@@ -32,7 +32,7 @@
                           formatted-message?
                           formatted-message-string
                           formatted-message-arguments))
-  #:use-module ((guix build utils) #:select (which))
+  #:use-module ((guix build utils) #:select (which delete-file-recursively)) ;goonix: cleanup
   #:use-module (git)
   #:use-module (guix git)
   #:use-module (guix git-authenticate)
@@ -58,12 +58,20 @@
 
 
 (test-begin "channels")
+;; goonix: every checkout 'make-instance' creates is removed when the group
+;; ends, whether the tests passed, failed or raised.
+(define %instance-directories '())
+(test-runner-on-group-end!
+ (test-runner-current)
+ (lambda (runner)
+   (for-each delete-file-recursively %instance-directories)))
 
 (define* (make-instance #:key
                         (name 'fake)
                         (commit "cafebabe")
                         (spec #f))
   (define instance-dir (mkdtemp! "/tmp/checkout.XXXXXX"))
+  (set! %instance-directories (cons instance-dir %instance-directories)) ;goonix: cleanup
   (when spec
     (call-with-output-file (string-append instance-dir "/.guix-channel")
       (lambda (port) (write spec port))))

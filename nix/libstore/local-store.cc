@@ -5,6 +5,9 @@
 #include "pathlocks.hh"
 #include "worker-protocol.hh"
 #include "derivations.hh"
+#include "ca-auth.hh" // goonix: narrow signature-verification bridge
+#include "records.hh" // goonix: resolved build records
+#include "ca.hh"
 
 #include <algorithm>
 #include <format>
@@ -297,6 +300,10 @@ void LocalStore::openDB(bool create)
     stmtQueryPathFromHashPart.create(db,
         "select path from ValidPaths where path >= ? limit 1;");
     stmtQueryValidPaths.create(db, "select path from ValidPaths");
+
+    // goonix: no FK to paths or derivations: facts survive their collection.
+    goonixRecords = std::make_unique<BuildRecords>(db);
+    goonixRecords->initialise();
 }
 
 
@@ -522,7 +529,13 @@ uint64_t LocalStore::addValidPath(const ValidPathInfo & info, bool checkOutputs)
            derivations).  Note that if this throws an error, then the
            DB transaction is rolled back, so the path validity
            registration above is undone. */
-        if (checkOutputs) checkDerivationOutputs(info.path, drv);
+        // goonix: address-specific validation is ours; the ordinary check stays upstream.
+        if (checkOutputs && drv.env.find("goonixAddressing") != drv.env.end())
+            checkGoonixRegistration(info.path, drv);
+        else if (checkOutputs) {
+            checkDerivationOutputs(info.path, drv);
+            checkInputAddressedPolicy(*this, drv); // goonix: mixed policy
+        }
 
         for (auto & i : drv.outputs) {
             stmtAddDerivationOutput.use()
@@ -979,7 +992,14 @@ void LocalStore::registerValidPaths(const ValidPathInfos & infos)
                 // FIXME: inefficient; we already loaded the
                 // derivation in addValidPath().
                 Derivation drv = readDerivation(i.path);
-                checkDerivationOutputs(i.path, drv);
+                // goonix: validate output identities after references are valid.
+                if (drv.env.find("goonixAddressing") != drv.env.end() ||
+                    resolvedDerivation(drv))
+                    checkGoonixBatchRegistration(*this, i.path, drv);
+                else {
+                    checkDerivationOutputs(i.path, drv);
+                    checkInputAddressedPolicy(*this, drv);
+                }
             }
 
         /* Do a topological sort of the paths.  This will throw an
@@ -1160,7 +1180,10 @@ static std::shared_ptr<Agent> authenticationAgent()
 
     if (!agent) {
 	Strings args = { "authenticate" };
-	agent = std::make_shared<Agent>(settings.guixProgram, args);
+        const std::map<string, string> env = { // goonix: authenticate with this store's keys
+            { "GUIX_CONFIGURATION_DIRECTORY", settings.nixConfDir }
+        };
+	agent = std::make_shared<Agent>(settings.guixProgram, args, env, true);
     }
 
     return agent;
@@ -1236,6 +1259,20 @@ static std::string verifySignature(const string &signature)
 	    std::format("verify {}:{}", signature.size(), signature));
 
     return readAuthenticateReply(agent->fromAgent.readSide);
+}
+
+// goonix: sign the canonical record, not a client-supplied path mapping.
+string LocalStore::signBuildRecord(const string & payload)
+{
+    Path secretKey = settings.nixConfDir + "/signing-key.sec";
+    checkSecrecy(secretKey);
+    return signHash(secretKey, hashString(htSHA256, payload));
+}
+
+// goonix: forward only the store-authenticated digest to the record module.
+string verifyGoonixRecordSignature(LocalStore &, const string & signature)
+{
+    return verifySignature(signature);
 }
 
 void LocalStore::exportPath(const Path & path, bool sign,
@@ -1565,7 +1602,9 @@ void LocalStore::verifyPath(const Path & path, const PathSet & store,
         return;
     }
 
-    if (store.find(baseNameOf(path)) == store.end()) {
+    // goonix: STORE was listed before the valid paths were read, so an item
+    // registered in between is valid and absent from it; ask the file system.
+    if (store.find(baseNameOf(path)) == store.end() && !pathExists(path)) {
         /* Check any referrers first.  If we can invalidate them
            first, then we can invalidate this path as well. */
         bool canInvalidate = true;

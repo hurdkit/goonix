@@ -46,8 +46,9 @@ import System.Environment (lookupEnv)
 import System.IO.Unsafe (unsafePerformIO)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as B
+import qualified Data.ByteString.Char8 as C
 import Foreign.Marshal.Alloc (allocaBytes)
-import Foreign.C.Error (Errno (..), eAGAIN, eACCES, eNOENT, getErrno)
+import Foreign.C.Error (Errno (..), eAGAIN, eACCES, eNOENT, eEXIST, getErrno)
 import Foreign.C.String (CString)
 import Foreign.C.Types (CInt (..), CUInt (..), CSize (..))
 import Data.Word (Word64, Word8)
@@ -64,6 +65,7 @@ import qualified System.Posix.Files.ByteString as Files
 import System.IO.Error (isDoesNotExistError)
 import System.Posix.IO.ByteString (closeFd, openFd, OpenMode (WriteOnly), OpenFileFlags (..), defaultFileFlags, fdWrite)
 import System.Posix.Types (Fd (..), FileMode)
+import System.Posix.Process (getProcessID)
 
 foreign import ccall unsafe "goonix_restore_node"
   c_restore_node :: CString -> CInt -> CInt -> Ptr () -> Word64 -> IO CInt
@@ -579,15 +581,53 @@ deduplicateTree store path = do
       hash <- hashNar p
       pure (encodeBase32 (hashDigest hash))
 
+-- | A process-wide counter for temporary names.  The daemon serves every client
+-- in a THREAD of one process (Server.hs forkFinally handleClient), so getpid()
+-- alone does not distinguish callers: two clients adding the same indirect root
+-- shared one fixed ".tmp-goonix" name and one of them failed with EEXIST on
+-- symlink(), or lost its temp to the other's removeLink, or its rename() found
+-- ENOENT.  C++ forks a process per client and uses link.tmp-<pid>-<rand>
+-- (gc.cc makeSymlink); the pid plus this counter gives the same uniqueness
+-- inside one process.
+{-# NOINLINE symlinkTempCounter #-}
+symlinkTempCounter :: TVar Word64
+symlinkTempCounter = unsafePerformIO (newTVarIO 0)
+
+nextSymlinkTempSuffix :: IO Word64
+nextSymlinkTempSuffix = atomically $ do
+  n <- readTVar symlinkTempCounter
+  writeTVar symlinkTempCounter (n + 1)
+  pure (n + 1)
+
 makeSymlinkAtomic :: RawFilePath -> RawFilePath -> IO ()
 makeSymlinkAtomic target link = do
   mkdirParents (parent link)
-  let temporary = link <> ".tmp-goonix"
-  Files.removeLink temporary `catchMissing` pure ()
-  withCStringBytes target $ \target' -> withCStringBytes temporary $ \temporary' ->
-    checkIO "cannot create symbolic link" (c_make_symlink target' temporary')
-  withCStringBytes temporary $ \from -> withCStringBytes link $ \to ->
-    checkIO "cannot rename symbolic link" (c_rename from to)
+  pid <- getProcessID
+  let attempt :: Int -> IO ()
+      attempt n = do
+        suffix <- nextSymlinkTempSuffix
+        let temporary = link <> ".tmp-" <> C.pack (show pid) <> "-" <> C.pack (show suffix)
+        created <- withCStringBytes target $ \target' ->
+          withCStringBytes temporary $ \temporary' -> c_make_symlink target' temporary'
+        if created < 0
+          then do
+            errno <- getErrno
+            -- Someone else holds this name: take a fresh one.  Never remove a
+            -- temp we did not create - it may belong to another thread.
+            if errno == eEXIST && n < 100
+              then attempt (n + 1)
+              else errnoIO "cannot create symbolic link"
+          else do
+            renamed <- withCStringBytes temporary $ \from ->
+              withCStringBytes link $ \to -> c_rename from to
+            when (renamed < 0) $ do
+              -- Read errno NOW: the cleanup below is another syscall and would
+              -- overwrite it, so the message could report the unlink's errno
+              -- (e.g. ENOENT) instead of the rename's.
+              Errno number <- getErrno
+              Files.removeLink temporary `catchMissing` pure ()
+              ioError (userError ("cannot rename symbolic link: errno=" ++ show number))
+  attempt 0
 
 mkdirParents :: RawFilePath -> IO ()
 mkdirParents path = withCStringBytes path $ \path' -> checkIO "cannot create directories" (c_mkdir_parents path' 0o755)
@@ -622,6 +662,7 @@ deleteTree path = do
           -- exec of the same file (e.g. the bootstrap bash builder) fails EACCES
           -- while the GC deletes a different link to it.  Leave the file mode
           -- untouched; removing this directory entry never changes the inode.
+          -- (The GC-vs-build EACCES race, 00a5faa26db.)
           Files.removeLink path
             `finally` Files.setFileMode directory (Files.fileMode parentStatus)
 

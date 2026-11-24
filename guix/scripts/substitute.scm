@@ -68,6 +68,8 @@
   #:use-module (web uri)
   #:use-module (web response)
   #:use-module (guix http-client)
+  #:use-module ((guix ca sharing) #:select (run-graph-loop)) ; goonix: helper-only graph transport
+  #:use-module ((guix ca files) #:select (substitute-files/nar)) ; goonix: file-level substitution
   #:export (%allow-unauthenticated-substitutes?
             %allow-unsafe-substitute-uris?
             %reply-file-descriptor
@@ -491,13 +493,30 @@ PORT."
                     (G_ "retrying download of '~a' with other substitute URLs...~%")
                     store-item)
                    (fallback)))
-             (download-nar narinfo destination
-                           #:deduplicate? deduplicate?
-                           #:print-build-trace? print-build-trace?
-                           #:fast-decompression? fast-decompression?
-                           #:open-connection-for-uri
-                           open-connection-for-uri/cached
-                           #:keep-alive? #t)))
+             ;; goonix: file-level substitution.  When the cache offers a file
+             ;; list, assemble the item from its files (hard-linking those
+             ;; already in the store's .links, fetching the rest) instead of
+             ;; fetching the whole NAR.  The expected/actual NAR-hash pair is
+             ;; returned exactly as download-nar does, so the caller's
+             ;; bytevector=? check below is unchanged and still guards the
+             ;; result.  A cache with no file list yields (#f #f) and we fall
+             ;; back to the NAR.
+             (let ((links-dir (string-append (%store-prefix) "/.links")))
+               (let ((file-expected
+                      file-actual
+                      (if deduplicate?
+                          (substitute-files/nar narinfo destination
+                                                #:links-dir links-dir)
+                          (values #f #f))))
+                 (if file-expected
+                     (values file-expected file-actual)
+                     (download-nar narinfo destination
+                                   #:deduplicate? deduplicate?
+                                   #:print-build-trace? print-build-trace?
+                                   #:fast-decompression? fast-decompression?
+                                   #:open-connection-for-uri
+                                   open-connection-for-uri/cached
+                                   #:keep-alive? #t))))))
           (else
            (fallback)))))
     (values narinfo
@@ -748,6 +767,9 @@ This requires that, in the case that FROM is a directory, it is readable."
                                  #:cache-urls (substitute-urls)
                                  #:acl acl)
                   (loop (read-line)))))))
+       (("--goonix-graph")
+        (run-graph-loop reply-port (substitute-urls)
+                        open-connection-for-uri/cached %fetch-timeout)) ; goonix: graph-only helper agent
        (("--substitute")
         ;; Download STORE-PATH and store it as a Nar in file DESTINATION.
         ;; Specify the number of columns of the terminal so the progress

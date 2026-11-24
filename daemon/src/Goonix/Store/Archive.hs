@@ -7,6 +7,8 @@ module Goonix.Store.Archive
   , importPaths
   , importPathsFrom
   , rewriteNarPaths
+  , signHash
+  , verifySignature
   ) where
 
 import Control.Exception (SomeException, throwIO, try)

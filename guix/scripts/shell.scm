@@ -21,6 +21,9 @@
   #:use-module (guix ui)
   #:use-module ((guix diagnostics) #:select (location))
   #:use-module (guix scripts environment)
+  #:autoload   (guix scripts flake) (resolve-flake-shell-reference ;goonix: flake shells
+                                     flake-default-shell-options)
+  #:autoload   (guix pure-eval) (pure-shell-options) ;goonix: --pure-eval
   #:autoload   (guix scripts build) (show-build-options-help
                                      show-native-build-options-help)
   #:autoload   (guix transformations) (options->transformation
@@ -69,6 +72,8 @@ interactive shell in that environment.\n"))
   -q                     inhibit loading of 'guix.scm' and 'manifest.scm'"))
   (display (G_ "
       --rebuild-cache    rebuild cached environment, if any"))
+  (display (G_ "
+      --pure-eval        evaluate in a container that sees tracked files only")) ;goonix: CLI hook
   (display (G_ "
       --export-manifest  print a manifest for the given options"))
   (display (G_ "
@@ -145,6 +150,9 @@ interactive shell in that environment.\n"))
               (option '("rebuild-cache") #f #f
                       (lambda (opt name arg result)
                         (alist-cons 'rebuild-cache? #t result)))
+              (option '("pure-eval") #f #f         ;goonix: CLI hook
+                      (lambda (opt name arg result)
+                        (alist-cons 'pure-eval? #t result)))
 
               (option '(#\F "emulate-fhs") #f #f
                       (lambda (opt name arg result)
@@ -182,11 +190,14 @@ interactive shell in that environment.\n"))
                                  args-parsed)
                      args-parsed)))
       (options-with-caching
-       (auto-detect-manifest
-        (match command
-          (() opts)
-          (("--") opts)
-          (("--" command ...) (alist-cons 'exec command opts))))))))
+       (pure-shell-options              ;goonix: --pure-eval, a profile of its own
+        (auto-detect-manifest
+        ;; goonix: a flake reference stands for the profile of its shell.
+        (resolve-flake-shell-reference
+         (match command
+           (() opts)
+           (("--") opts)
+           (("--" command ...) (alist-cons 'exec command opts))))))))))
 
 (define (find-file-in-parent-directories candidates)
   "Find one of CANDIDATES in the current directory or one of its ancestors."
@@ -296,7 +307,9 @@ Return the modified OPTS."
           disallow-implicit-load?
           (options-contain-payload? opts))
       opts
-      (match (find-file-in-parent-directories '("manifest.scm" "guix.scm"))
+      ;; goonix: a flake.scm is found like the other two, and comes first.
+      (match (find-file-in-parent-directories
+              '("flake.scm" "manifest.scm" "guix.scm"))
         (#f
          (warning (G_ "no packages specified; creating an empty environment~%"))
          opts)
@@ -305,6 +318,8 @@ Return the modified OPTS."
              (begin
                (info (G_ "loading environment from '~a'...~%") file)
                (match (basename file)
+                 ;; goonix: the default shell of the flake.
+                 ("flake.scm" (flake-default-shell-options file opts))
                  ("guix.scm" (alist-cons 'load `(package ,file) opts))
                  ("manifest.scm" (alist-cons 'manifest file opts))))
              (begin

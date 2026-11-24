@@ -13,6 +13,7 @@ module Goonix.Store.GuixProgram
   ( guixProgram
   , stateDirectory
   , canonPath
+  , absPath
   ) where
 
 import qualified Data.ByteString as B
@@ -21,6 +22,7 @@ import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import qualified Goonix.Config as Config
 import System.IO.Unsafe (unsafePerformIO)
 import System.Posix.Env.ByteString (getEnv)
+import System.Posix.Directory.ByteString (getWorkingDirectory)
 
 -- | Resolved once per process, like the C++ settings.guixProgram computed in
 -- processEnvironment at start-up.  The daemon's environment does not change
@@ -74,3 +76,14 @@ canonPath path
     step acc "." = acc
     step acc ".." = if null acc then [] else init acc
     step acc component = acc ++ [component]
+
+-- | C++ absPath (util.cc): make the path absolute against the process cwd when
+-- it is relative, then canonPath it.  The daemon applies this to wire values
+-- before using them, so a client's "./" segment or trailing slash cannot change
+-- a derived name (addIndirectRoot hashes this result).
+absPath :: B.ByteString -> IO B.ByteString
+absPath path
+  | not (B.null path) && B.index path 0 == 47 = pure (canonPath path)
+  | otherwise = do
+      cwd <- getWorkingDirectory
+      pure (canonPath (cwd <> "/" <> path))

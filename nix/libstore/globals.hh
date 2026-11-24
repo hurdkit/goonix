@@ -109,6 +109,7 @@ struct Settings {
     /* The maximum duration in seconds that a builder can run.  0
        means infinity.  */
     time_t buildTimeout;
+    time_t goonixGraphTimeout = 15; // goonix: worker-enforced cache deadline
 
     /* Whether to use build hooks (for distributed builds).  Sometimes
        users want to disable this from the command-line. */

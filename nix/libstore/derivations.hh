@@ -61,6 +61,7 @@ Path writeDerivation(StoreAPI & store,
 
 /* Read a derivation from a file. */
 Derivation readDerivation(const Path & drvPath);
+Derivation parseDerivationText(const string & contents); // goonix: resolved bytes
 
 /* Print a derivation. */
 string unparseDerivation(const Derivation & drv);

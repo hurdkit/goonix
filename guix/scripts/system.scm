@@ -91,7 +91,9 @@
   #:use-module (ice-9 format)
   #:use-module (ice-9 match)
   #:use-module (rnrs bytevectors)
+  #:autoload   (guix scripts flake) (flake-command-action) ;goonix: flakes
   #:export (guix-system
+            process-action               ;goonix: for the evaluator
             read-operating-system
 
             profile-boot-parameters
@@ -1012,6 +1014,8 @@ Some ACTIONS support additional ARGS.\n"))
   (display (G_ "
   -d, --derivation       return the derivation of the given system"))
   (display (G_ "
+      --pure-eval        evaluate in a container that sees tracked files only")) ;goonix: CLI hook
+  (display (G_ "
   -e, --expression=EXPR  consider the operating-system EXPR evaluates to
                          instead of reading FILE, when applicable"))
   (display (G_ "
@@ -1108,6 +1112,9 @@ Some ACTIONS support additional ARGS.\n"))
          (option '(#\d "derivation") #f #f
                  (lambda (opt name arg result)
                    (alist-cons 'derivations-only? #t result)))
+         (option '("pure-eval") #f #f              ;goonix: CLI hook
+                 (lambda (opt name arg result)
+                   (alist-cons 'pure-eval? #t result)))
          (option '("allow-downgrades") #f #f
                  (lambda (opt name arg result)
                    (alist-cons 'validate-reconfigure
@@ -1474,6 +1481,8 @@ argument list and OPTS is the option alist."
 (define-command (guix-system . args)
   (synopsis "build and deploy full operating systems")
 
+  (define arguments args)                         ;goonix: as they were given
+
   (define (parse-sub-command arg result)
     ;; Parse sub-command ARG and augment RESULT accordingly.
     (cond ((assoc-ref result 'action)
@@ -1534,7 +1543,10 @@ argument list and OPTS is the option alist."
            (command  (assoc-ref opts 'action)))
       (parameterize ((%graft? (assoc-ref opts 'graft?)))
         (with-status-verbosity (verbosity-level opts)
-          (process-command command args opts))))))
+          ;; goonix: with '--pure-eval' or a flake reference, the
+          ;; evaluation is not done here.
+          (or (flake-command-action 'system command args opts arguments)
+              (process-command command args opts)))))))
 
 ;;; Local Variables:
 ;;; eval: (put 'with-store* 'scheme-indent-function 1)

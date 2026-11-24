@@ -172,6 +172,10 @@
             topologically-sorted
             valid-derivers
             query-derivation-outputs
+            ;; goonix: resolved-output and signed-record queries.
+            query-realised-output/direct
+            query-build-records
+            query-build-graph
             live-paths
             dead-paths
             collect-garbage
@@ -703,6 +707,10 @@ definitions."
   (query-substitutable-paths => substitutable-paths)
   (query-substitutable-path-infos => substitutable-path-info)
   (built-in-builders => built-in-builders/direct)
+  ;; goonix: resolved-output and signed-record queries.
+  query-realised-output/direct
+  query-build-records
+  query-build-graph
   optimize-store
   (verify-store => verify-store/direct)
   (collect-garbage => run-gc/direct)
@@ -759,6 +767,8 @@ definitions."
 
                             build-cores
                             (use-substitutes? #t)
+                            ;; goonix: opt into deep CA scans on this connection.
+                            (deep-scan? #f)
 
                             ;; Client-provided substitute URLs.  If it is #f,
                             ;; the daemon's settings are used.  Otherwise, it
@@ -790,7 +800,9 @@ definitions."
                #:print-build-trace print-build-trace
                #:use-substitutes? use-substitutes?
                #:settings
-               `( ;; This option is honored by 'guix substitute' et al.
+               ;; goonix: opt into deep CA scans on this connection.
+               `(("goonix-deep-scan" . ,(if deep-scan? "true" "false"))
+                 ;; This option is honored by 'guix substitute' et al.
                  ,@(if print-build-trace
                        `(("print-extended-build-trace"
                           . ,(if print-extended-build-trace? "1" "0")))
@@ -2047,7 +2059,10 @@ that would be accepted by 'add-to-store' & co."
   (define hash-len 32)
 
   (and (> (string-length item) (+ hash-len 1))
-       (string-every %nix-base32-charset item 0 hash-len)
+       ;; goonix: reserved e/o/u/t tokens are valid *syntactic* store paths;
+       ;; they remain unacceptable for ordinary daemon store operations.
+       (or (string-every %nix-base32-charset item 0 hash-len)
+           (string-every (string->char-set "eout") item 0 hash-len))
        (eqv? (string-ref item hash-len) #\-)
        (valid-store-name? (string-drop item (+ hash-len 1)))))
 
