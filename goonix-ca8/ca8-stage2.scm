@@ -40,7 +40,27 @@
              (srfi srfi-13))
 
 (define commencement (resolve-module '(gnu packages commencement)))
-(define (stage name) (false-if-exception (module-ref commencement name)))
+(define (stage name)
+  "The commencement stage NAME, or #f if it does not resolve to a package.
+Most stages are plain private variables, so module-ref gives a package directly.
+The ones defined with define/system-dependent - glibc-final among them - are
+identifier-syntax over a memoised thunk NAME/memoized, so the module variable
+holds a SYNTAX TRANSFORMER, not a package.  Passing that transformer on to
+package->bag fails with
+  struct-vtable: Wrong type argument in position 1 (expecting struct):
+  #<syntax-transformer glibc-final>
+which is what ended the 2026-11-24 stage2 run one second after it started.
+Take the transformer only when it IS a package, else call NAME/memoized with
+%current-system.  Same fallback as .scratch/ca8-dry-run.scm:26-36 and
+.scratch/ca8-glibc-diag.scm:14-19, where it was verified to lower glibc-final
+cleanly (three outputs out, debug, static)."
+  (or (false-if-exception
+       (let ((value (module-ref commencement name)))
+         (and (package? value) value)))
+      (false-if-exception
+       (let ((thunk (module-ref commencement
+                                (symbol-append name '/memoized))))
+         (thunk (%current-system))))))
 (define (addressing drv)
   (assoc-ref (derivation-builder-environment-vars drv) "goonixAddressing"))
 (define (fixed-output? drv)
