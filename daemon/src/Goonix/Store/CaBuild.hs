@@ -654,7 +654,11 @@ finaliseContentOutput store storeDir token output name allPaths finalOutputs act
         size <- fromIntegral . B.length <$> dumpNar path
         pure (Set.toList references, nar, size)
       reuseExisting = do
-        same <- sameContent final final token built siblings
+        -- C++ ca.cc:961/974 call sameContent(final, final, token, built) with
+        -- the siblings parameter DEFAULTED to {}.  Passing the sibling map here
+        -- makes inverseTree reverse sibling hashes the C++ side leaves alone,
+        -- so the digest differs and a legitimate reuse reads as a collision.
+        same <- sameContent final final token built Map.empty
         unless same (caError ("CA content address collision at `" ++ C.unpack final ++ "': existing item differs"))
         deleteTree physical
         (references, nar, size) <- scanAndHash final
@@ -667,7 +671,7 @@ finaliseContentOutput store storeDir token output name allPaths finalOutputs act
       finaliseFresh = do
         rewriteTree physical oldHash newHash
         Files.rename physical final
-        good <- sameContent final final token built siblings
+        good <- sameContent final final token built Map.empty
         unless good (deleteTree final >> caError ("CA inverse mapping failed for `" ++ C.unpack final ++ "'"))
         (references, nar, size) <- scanAndHash final
         pure (Finalised final references nar size True)
