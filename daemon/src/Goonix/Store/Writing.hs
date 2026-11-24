@@ -13,7 +13,7 @@ module Goonix.Store.Writing
   ) where
 
 import Control.Exception (finally, throwIO)
-import Control.Monad (forM_, unless, when)
+import Control.Monad (forM_, unless, when, foldM)
 import Data.Char (toUpper)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as B
@@ -25,7 +25,7 @@ import Goonix.Store.Base32 (encodeBase16, encodeBase32)
 import Goonix.Store.Ca (goonixAddressed, resolvedDerivation)
 import Goonix.Store.CaBuild (checkGoonixDerivationOutputs, checkInputAddressedPolicy)
 import Goonix.Store.Database
-import Goonix.Store.Derivation (parseDerivation, outputs, outputPath, outputHash, parseHashInfo, environment)
+import Goonix.Store.Derivation (parseDerivation, outputs, outputPath, outputHash, parseHashInfo, environment, derivationOutputPaths, hashDerivationModulo, blankOutputPaths, inputDrvs, Derivation)
 import Goonix.Store.Files
 import Goonix.Store.Hash
 import Goonix.Store.Nar
@@ -141,11 +141,25 @@ registerPath store path (Hash algorithm digest) size references deriver = do
             -- checkInputAddressedPolicy for a non-CA derivation at registration,
             -- so an input-addressed derivation with a CA input is refused before
             -- any build (the ca-sharing mixed-policy case).
-            else checkInputAddressedPolicy derivation $ \input -> do
-              inputValid <- isValidPath store input
-              if not inputValid then pure Nothing else do
-                inputBytes <- B.readFile (C.unpack input)
-                pure (either (const Nothing) Just (parseDerivation inputBytes))
+            else do
+              -- goonix: C++ registerValidPaths (local-store.cc:1000) runs
+              -- checkDerivationOutputs BEFORE the addressing policy for every
+              -- non-CA derivation.  Recompute each output path from the
+              -- derivation itself: without this an unmarked forged derivation
+              -- could name ANY store path and have it registered as valid
+              -- (tests/store-path-check.scm, "an unmarked derivation with a
+              -- chosen output path is refused", which the HS daemon used to
+              -- answer 'poisoned).
+              checkDerivationOutputs store path derivation
+              -- goonix: C++ registerValidPaths (local-store.cc:1001) runs
+              -- checkInputAddressedPolicy for a non-CA derivation at registration,
+              -- so an input-addressed derivation with a CA input is refused before
+              -- any build (the ca-sharing mixed-policy case).
+              checkInputAddressedPolicy derivation $ \input -> do
+                inputValid <- isValidPath store input
+                if not inputValid then pure Nothing else do
+                  inputBytes <- B.readFile (C.unpack input)
+                  pure (either (const Nothing) Just (parseDerivation inputBytes))
           forM_ (Map.elems (outputs derivation)) $ \output ->
             unless (B.null (outputHash output)) $ do
               (_, algorithm, digest) <- either (throwIO . storeError) pure (parseHashInfo output)
@@ -155,6 +169,57 @@ registerPath store path (Hash algorithm digest) size references deriver = do
             execute (database store) "insert or replace into DerivationOutputs(drv,id,path) values (?,?,?);"
               [Integer identifier, Bytes name, Bytes (outputPath output)]
       _ -> throwIO (storeError "registered path has no database id")
+
+-- | C++ LocalStore::checkDerivationOutputs (nix/libstore/local-store.cc:468-505).
+-- Every output path of a NON-CA derivation is a function of the derivation, not
+-- of its author: a fixed output is makeFixedOutputPath over its declared hash,
+-- anything else is makeOutputPath over hashDerivationModulo of the derivation
+-- with its output paths blanked (local-store.cc:489-498).  C++ also requires
+-- the environment entry for each output to name that same path
+-- (local-store.cc:499-501).  Registration throws on any mismatch, and its
+-- transaction rolls back.
+checkDerivationOutputs :: Store -> ByteString -> Derivation -> IO ()
+checkDerivationOutputs store drvPath drv = do
+  -- C++ hashDerivationModulo (nix/libstore/derivations.cc:259-266) replaces each
+  -- input derivation path by that derivation's OWN modulo hash, reading it from
+  -- the store and recursing.  Do those reads in IO first, so the pure function
+  -- gets a lookup table rather than an IO callback it cannot run.
+  hashes <- foldM collect Map.empty (Map.keys (inputDrvs drv))
+  expected <- either (throwIO . storeError) pure
+    (derivationOutputPaths (storeDirectory store) drvPath drv (lookupHash hashes))
+  forM_ (Map.toList (outputs drv)) $ \(name, output) -> do
+    let wanted = Map.findWithDefault "" name expected
+        actual = outputPath output
+        envValue = Map.findWithDefault "" name (environment drv)
+    when (actual /= wanted || envValue /= wanted) $
+      throwIO (storeError ("derivation `" ++ C.unpack drvPath ++ "' has incorrect output `"
+        ++ C.unpack actual ++ "', should be `" ++ C.unpack wanted ++ "'"))
+  where
+    lookupHash hashes path = Map.findWithDefault
+      (Left ("cannot read input derivation `" ++ C.unpack path ++ "'")) path hashes
+    -- C++ memoises in drvHashes (derivations.cc:260-266) and so visits each
+    -- derivation once.  Without that memo the accumulator is dropped at every
+    -- level and a diamond-shaped input graph is re-read and re-hashed
+    -- exponentially; tests/gexp.scm and tests/graph.scm hung on it.
+    collect acc path
+      | Map.member path acc = pure acc
+      | otherwise = do
+          present <- isValidPath store path
+          if not present
+            then pure (Map.insert path
+              (Left ("input derivation `" ++ C.unpack path ++ "' is not valid")) acc)
+            else do
+              bytes <- B.readFile (C.unpack path)
+              case parseDerivation bytes of
+                Left message -> pure (Map.insert path (Left message) acc)
+                Right input -> do
+                  nested <- foldM collect acc (Map.keys (inputDrvs input))
+                  -- Do NOT blank the input here: derivationOutputPaths already
+                  -- blanked THIS derivation's outputs, and hashDerivationModulo
+                  -- (derivations.cc:259-266) hashes each input derivation as it
+                  -- is stored.  Blanking again hashes a different derivation.
+                  pure (Map.insert path
+                    (hashDerivationModulo input (lookupHash nested)) nested)
 
 addIndirectRoot :: Store -> ByteString -> IO ()
 addIndirectRoot store link = do
