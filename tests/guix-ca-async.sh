@@ -38,6 +38,7 @@ perl -MIO::Socket::INET -e '
   my $s=IO::Socket::INET->new(LocalAddr=>"127.0.0.1",LocalPort=>'"$port"',Listen=>20,ReuseAddr=>1) or die $!;
   open my $f,">>","'$root'/events" or die $!;
   select((select($f),$|=1)[0]);
+  $SIG{CHLD} = "IGNORE";
   while (my $c=$s->accept) {
     my $pid=fork(); die "fork: $!" unless defined $pid;
     if ($pid==0) {

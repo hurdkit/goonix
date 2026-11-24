@@ -6,7 +6,10 @@
              (rnrs io ports))
 (define store (open-connection))
 (set-build-options store #:use-substitutes? #t #:max-build-jobs 1
-                   #:substitute-urls (list (getenv "GOONIX_ASYNC_URL")))
+                   #:substitute-urls
+                   (let ((first (getenv "GOONIX_ASYNC_URL"))
+                         (second (getenv "GOONIX_ASYNC_URL_SECOND")))
+                     (if second (list first second) (list first))))
 (define (realised d) (realised-output-path store d "out"))
 (define shell (add-to-store store "async-shell" #t "sha256"
                             (getenv "GOONIX_SHELL_SOURCE")))
