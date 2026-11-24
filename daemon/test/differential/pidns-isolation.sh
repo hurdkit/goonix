@@ -66,6 +66,11 @@ for pair in \
 do
   set -- $pair
   runner="$here/$1"; part="$here/$2"
+  # A branch carries only some of the runners; check the ones it has.
+  if test ! -f "$runner"; then
+    echo "skip $1 (not on this branch)"
+    continue
+  fi
   if grep -qE 'exec unshare --pid --fork --kill-child -- (bash|"\$part_bash")' "$runner"; then
     echo "ok   $1 enters a private PID namespace"
   else
@@ -85,9 +90,16 @@ done
 # 5. The part script really refuses when it is NOT PID 1: run it directly with
 #    arguments that would otherwise reach the daemon.  The guard is SOURCED, so
 #    its own exit 1 ends the part script before any daemon starts.
-bash "$here/ca-counted-gate-part.sh" /nonexistent-ns "$root" /nonexistent-daemon \
-  regression /nonexistent-guile "" "" "" "" "" "" "ca" > /dev/null 2>&1
-check "the counted gate part refuses to start a daemon outside a PID namespace" 1 $?
+if test -f "$here/ca-counted-gate-part.sh"; then
+  bash "$here/ca-counted-gate-part.sh" /nonexistent-ns "$root" /nonexistent-daemon \
+    regression /nonexistent-guile "" "" "" "" "" "" "ca" > /dev/null 2>&1
+  check "the counted gate part refuses to start a daemon outside a PID namespace" 1 $?
+fi
+if test -f "$here/stress-gate-part.sh"; then
+  bash "$here/stress-gate-part.sh" /nonexistent-work "$root" /nonexistent-daemon \
+    installed "" "" "" > /dev/null 2>&1
+  check "the stress gate part refuses to start a daemon outside a PID namespace" 1 $?
+fi
 
 # 6. The scratch-/bin hazard (found on WSL by the lanes session): worktree mode
 #    bind-mounts a scratch /bin over /bin, so the runner must exec an ABSOLUTE

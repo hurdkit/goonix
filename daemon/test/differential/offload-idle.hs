@@ -67,6 +67,16 @@ main = do
     writeIORef survived True
   takeMVar ready
   threadDelay 50000
+  -- Baseline: the SAME loop with nothing waiting on a pipe, on THIS host.  The
+  -- property is that receiveLine parks through the IO manager instead of
+  -- holding a capability; a held capability freezes the loop, a slow host just
+  -- takes longer.  An absolute 1.0s bound conflated the two (measured 1.25s and
+  -- FINISHED on a 2-core box, reported as "loop frozen").
+  baseStart <- getMonotonicTime
+  let !baseChecksum = allocLoop 50000
+  unless (baseChecksum >= 0) (hPutStrLn stderr "x")
+  baseEnd <- getMonotonicTime
+  let baseSeconds = baseEnd - baseStart
   _ <- forkIO $ do
     s <- getMonotonicTime
     let !c = allocLoop 50000
@@ -76,12 +86,24 @@ main = do
     writeIORef done True
   threadDelay 3000000                 -- peer silent 3s
   _ <- fdWrite peerFd "# accept\n"    -- now receiveLine can return
-  threadDelay 300000
+  -- WAIT for BOTH the loop and receiveLine, rather than sampling once after a
+  -- fixed 300ms: on a slow host either can still be in flight, and reporting
+  -- that as "frozen"/"crashed" is the very signal this check is for.
+  let waitForBoth :: Int -> IO ()
+      waitForBoth n = do
+        finished <- readIORef done
+        answered <- readIORef survived
+        if (finished && answered) || n >= 600
+          then pure ()
+          else threadDelay 100000 >> waitForBoth (n + 1)
+  waitForBoth 0
   d <- readIORef done
   sv <- readIORef survived
   l <- readIORef secs
+  let budget = baseSeconds * 8
   hPutStrLn stderr ("offload-idle: loop " ++ show l ++ "s, receiveLine survived=" ++ show sv)
-  if d && l < 1.0 && sv
+  hPutStrLn stderr ("offload-idle: uncontended " ++ show baseSeconds ++ "s, budget " ++ show budget ++ "s (8x)")
+  if d && l < budget && sv
     then hPutStrLn stderr "OFFLOAD_IDLE_PASS (receiveLine waited through the IO manager; loop ran)"
     else do
       hPutStrLn stderr "OFFLOAD_IDLE_FAIL (loop frozen, or receiveLine crashed on EAGAIN)"
