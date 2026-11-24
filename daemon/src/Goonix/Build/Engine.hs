@@ -549,8 +549,18 @@ trySubstitute config rootFd store settings trace path = do
       ((_, deriver, references, _, _):_) -> do
         mapM_ (appendTempRoot rootFd) (path:references)
         present <- mapM (isValidPath store) references
-        unless (and present) (throwIO (storeError ("substitute references of `" ++ C.unpack path ++ "' are not valid")))
-        withPathLock path $ do
+        -- C++ SubstitutionGoal::referencesValid (nix/libstore/build.cc:3878-3894)
+        -- does NOT raise when a reference is not realised: it finishes with
+        -- ecIncompleteClosure or ecNoSubstituters, and the CALLER then builds.
+        -- Throwing a store-protocol-error here aborted the whole client request
+        -- (tests/guix-ca-files.sh) instead of letting the build proceed.
+        if not (and present)
+          then do
+            traceOutput trace ("@ substituter-failed " <> path <> " incomplete-closure\n")
+            pure False
+          else withPathLock path $ substituteNow deriver references
+        where
+        substituteNow deriver references = do
           validNow <- isValidPath store path
           if validNow then pure True else do
             deleteTree path

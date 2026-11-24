@@ -85,6 +85,15 @@ fdNumber (Fd value) = value
 
 packSettings :: Settings -> ByteString
 packSettings settings = B.concat [key <> "=" <> value <> "\n" | (key, value) <- Map.toAscList (values settings)]
+  -- C++ SubstitutionGoal::tryToRun hands the substituter
+  -- settings.pack() + "deduplicate=" + (autoOptimiseStore ? "yes" : "no")
+  -- (nix/libstore/build.cc:3946-3952), and guix-daemon defaults
+  -- autoOptimiseStore to true (nix/nix-daemon/guix-daemon.cc:505).
+  -- guix/scripts/substitute.scm:723-725 reads that option and only attempts
+  -- FILE-LEVEL substitution when it is set (substitute.scm:507-512).  Without
+  -- it the HS daemon silently fetched whole NARs, so tests/guix-ca-files.sh saw
+  -- zero /goonix/file/ requests.
+  <> "deduplicate=" <> (if settingBool "build-deduplicate" True settings then "yes\n" else "no\n")
 
 substitutablePaths :: ServerConfig -> Settings -> (ByteString -> IO ()) -> [ByteString] -> IO [ByteString]
 substitutablePaths config settings emit paths
