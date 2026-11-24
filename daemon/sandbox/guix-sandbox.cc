@@ -686,7 +686,13 @@ void slirpChild(Plan & plan, int tap, int readyFd)
     identity.uidMapOutside = geteuid();
     identity.gidMapInside = 0;
     identity.gidMapOutside = getegid();
-    identity.mapAllIds = true;
+    /* C++ remapIdsTo0Action passes the SINGLE mapping "0 <uid> 1" /
+       "0 <gid> 1", not an identity map of every range: only lockMountsAction
+       uses lockMountsMapAll.  Mapping every range here maps the caller's gid
+       to ITSELF, so gid 0 is not its alias and setgid(0) fails EINVAL for an
+       unprivileged daemon.  The lock namespace above still maps every range,
+       which is what a namespace-root daemon needs for its "allow" write. */
+    identity.mapAllIds = false;
     identity.allowSetgroups = geteuid() == 0;
     unshareAndInitUserns(identity, "slirp-identity");
     if (setgid(0) == -1)
