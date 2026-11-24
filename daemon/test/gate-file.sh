@@ -21,7 +21,17 @@ test_file=${2:?test file}
 case "$test_file" in tests/*.scm|tests/*.sh) ;; *) echo 'not a Guix test file' >&2; exit 2;; esac
 name=${test_file##*/}
 name=${name%.*}
-scratch="$root/.scratch/gate-$mode-$name"
+# Automake writes a test's result BESIDE the test file: tests/import/foo.scm
+# produces tests/import/foo.trs, not tests/foo.trs.  Deriving the result path
+# from the basename made every tests/import/* run report NO_RESULT_PRODUCED on
+# both daemons, which the parity sweep then read as a CHANGED verdict.  The
+# scratch directory also keys off the whole path (slashes as dashes), so
+# tests/foo.scm and tests/x/foo.scm cannot share one result slot.
+base=${test_file%.*}
+trs_file="$base.trs"
+log_file="$base.log"
+slot=$(printf '%s' "$base" | tr '/.' '--')
+scratch="$root/.scratch/gate-$mode-$slot"
 mkdir -p "$scratch"
 export GOONIX_TEST_TIMEOUT=${3:-${GOONIX_TEST_TIMEOUT:-600}}
 
@@ -102,7 +112,7 @@ chmod -R u+rwX test-tmp 2>/dev/null || true
 rm -rf test-tmp
 # Remove the previous run's artefacts BEFORE running, so a run that produces
 # nothing cannot leave an old file to be read as its result.
-rm -f "tests/$name.trs" "tests/$name.log" "$scratch/result.trs" "$scratch/result.log"
+rm -f "$trs_file" "$log_file" "$scratch/result.trs" "$scratch/result.log"
 if ! ./test-env guile --no-auto-compile /home/wrath/hurdkit/tmp-plans/goonix/tools/seed-restore.scm >"$scratch/seed.log" 2>&1; then
   # `set -e` used to abort here with a bare exit 1 and no explanation, which is
   # how a failed seed came to look like a run that had produced results.
@@ -121,12 +131,12 @@ printf 'mode=%s file=%s timeout=%s elapsed=%s status=%s\n' "$mode" "$test_file" 
 # A result must have been PRODUCED by this run.  No .trs at all means the run
 # never reached the test (a failed seed, a compile error, a killed driver), and
 # reporting the previous file would be a false verdict.
-if test ! -f "tests/$name.trs"; then
-  echo "NO_RESULT_PRODUCED $mode $name: tests/$name.trs is absent; this run produced no result" >&2
+if test ! -f "$trs_file"; then
+  echo "NO_RESULT_PRODUCED $mode $test_file: $trs_file is absent; this run produced no result" >&2
   tail -5 "$scratch/seed.log" 2>/dev/null >&2 || true
   tail -5 "$scratch/run.log" 2>/dev/null >&2 || true
   exit 2
 fi
-cp "tests/$name.trs" "$scratch/result.trs"
-cp "tests/$name.log" "$scratch/result.log" 2>/dev/null || true
+cp "$trs_file" "$scratch/result.trs"
+cp "$log_file" "$scratch/result.log" 2>/dev/null || true
 exit "$status"
