@@ -19,6 +19,14 @@ set -euo pipefail
 IMPL=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 cd "$IMPL"
 
+# Lane guard, FIRST - before the dev-shell re-exec, before prepare, before any
+# daemon.  A "quick check" of this script's clean path IS a gate run and must not
+# happen outside heavy-turn.sh.  Three times on 2026-11-24 a check did exactly
+# that; the last took ca8-laptop's store from 305 to 525 items.  Make it
+# mechanical instead of a note in STATUS.
+source "$IMPL/goonix-ca6/gate-lib.sh"
+goonix_gate_require_lane "goonix-ca8/ca8-core-run.sh"
+
 if [ -z "${IN_NIX_SHELL:-}" ]; then
   # goonix: the shell MUST come from this worktree's own flake.  The main
   # checkout /home/wrath/goonix (branch goonix, the pinned base) has no

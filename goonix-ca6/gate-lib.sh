@@ -76,6 +76,41 @@ goonix_gate_require_compiled() {
   return 0
 }
 
+# goonix_gate_require_lane SCRIPT-NAME
+#
+# Refuse to start a gate unless the caller is in a lane.  This is mechanical
+# because recording the rule did NOT stop it being broken: on 2026-11-24 a
+# "quick check" of a script's clean path started a real daemon OUTSIDE
+# heavy-turn.sh three separate times, the last one reaching START and taking
+# ca8-laptop's store from 305 to 525 substituted items.  A clean-path invocation
+# IS a gate run, and every gate run goes through heavy-turn.sh inside a
+# memory-capped systemd scope.
+#
+# Two legitimate contexts, either is enough:
+#   (a) a LAPTOP lane job: heavy-turn.sh exports HEAVY_TURN_SLOT (since 07:17),
+#       and it names an existing lock directory.  A value pointing at a missing
+#       directory is a forgery or a stale env and is REFUSED, so exporting a
+#       bare name does not buy a free pass.
+#   (b) a ZERGLING2 job: /proc/self/cgroup contains "z2run-".  heavy-turn's env
+#       is not forwarded into the remote unit, so the cgroup is the evidence.
+#       This is what lets a z2-submitted counted run start at all.
+#
+# Place the call at the very TOP of the runner, before prepare and before any
+# daemon, so a mistake costs milliseconds rather than a 39-minute prepare build.
+goonix_gate_require_lane() {
+  local who=${1:-this runner}
+  if [ -n "${HEAVY_TURN_SLOT:-}" ] && [ -d "${HEAVY_TURN_SLOT}" ]; then
+    return 0
+  fi
+  if grep -q 'z2run-' /proc/self/cgroup 2>/dev/null; then
+    return 0
+  fi
+  echo "REFUSE: $who starts a daemon/build and must run in a lane." >&2
+  echo "  Use HEAVY_LANE=build bash heavy-turn.sh NAME PURPOSE -- $who ..." >&2
+  echo "  (HEAVY_TURN_SLOT='${HEAVY_TURN_SLOT:-unset}' is not an existing directory, and /proc/self/cgroup has no z2run- unit)" >&2
+  exit 1
+}
+
 # goonix_gate_exit VERDICT
 #
 # Print the verdict and exit with it, so the caller's unit fails when the gate

@@ -13,6 +13,13 @@ cd "$IMPL"
 # load path and can fail on upstream macro hygiene (jq/oniguruma, DECISIONS 37).
 # Refuse before anything is wiped or any daemon starts.
 source "$HERE/gate-lib.sh"
+
+# Lane guard, FIRST - before the compiled-tree check, before the wipe, before any
+# daemon.  CA-6 is a daemon starter too, and the same three outside-the-lane
+# slips on 2026-11-24 prompted this.  A z2-submitted CA-6 counted run is admitted
+# by the z2run- cgroup check, since heavy-turn's env is not forwarded there.
+goonix_gate_require_lane "goonix-ca6/run.sh"
+
 goonix_gate_require_compiled "$IMPL" || exit 1
 
 if ! unshare --user --map-root-user --mount true 2>/dev/null; then
