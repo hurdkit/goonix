@@ -96,7 +96,31 @@ graph_count=$(grep -c '^GET /goonix/records/' "$root/publish.log" || true)
 test "$graph_count" -eq 2
 grep -F "GET /goonix/records/$(sed -n 's/.*(later "\([^"]*\)").*/\1/p' "$root/fixture.scm" | xargs basename)" "$root/publish.log"
 grep -F "GET /goonix/records/$(sed -n 's/.*(dependent "\([^"]*\)").*/\1/p' "$root/fixture.scm" | xargs basename)" "$root/publish.log"
-test "$(grep -c '^GET /nar/' "$root/publish.log" || true)" -ge 2
+
+# Each expected path must have been served FROM THE SERVER.  How it was served
+# is not the property under test: guix-daemon substitutes with deduplicate=yes
+# by default, so the substituter fetches FILE BY FILE (/goonix/files/ for the
+# list, /goonix/file/ for the bytes) instead of fetching whole NARs.  An
+# assertion written as `grep -c '^GET /nar/' -ge 2` therefore counted 0 and
+# failed even though every path had been fetched and the client builder had
+# never run.  Accept either transport, and name the item in the request so a
+# fetch of something unrelated cannot satisfy it.
+#
+#   $1 = a store-item name fragment, e.g. "-two-store-earlier"
+#   $2 = the publish log to inspect (default "$root/publish.log")
+served_from_server() {
+  local fragment=$1 log=${2:-$root/publish.log}
+  grep -E "^GET (/nar/[^ ]*${fragment}|/goonix/files?/[^ ]*${fragment})" "$log" |
+    head -1
+}
+# At least two items fetched, by whichever transport the log shows.
+served_count() {
+  local log=${1:-$root/publish.log}
+  grep -cE '^GET (/nar/|/goonix/files?/)' "$log" || true
+}
+test "$(served_count)" -ge 2
+served_from_server -two-store-earlier
+served_from_server -two-store-dependent
 cp "$root/publish.log" "$root/plain-publish.log"
 
 # A local result of the same non-reproducible input takes precedence.  The
@@ -252,7 +276,7 @@ export _NIX_OPTIONS=build-graph-timeout=3" "$root/retry-$mode-part.sh"
     test "$(grep -c '^GET /goonix/records/' "$root/empty-publish.log")" -eq 1
     publisher_after=$(grep -c '^GET /goonix/records/' "$root/publish.log" || true)
     test "$publisher_after" -eq "$((publisher_before + 1))"
-    grep '^GET /nar/.*-two-store-earlier' "$root/publish.log" | tail -1
+    served_from_server -two-store-earlier
   else
     test "$(grep -c '^GET /goonix/records/' "$root/bad-publish.log")" -eq 1
   fi
@@ -300,13 +324,14 @@ for i in \$(seq 1 100); do test -S "\$GUIX_DAEMON_SOCKET" && break; sleep .1; do
 ./pre-inst-env guile --no-auto-compile tests/ca-two-store-fixture.scm \
   dead "$root/fixture.scm"
 EOF
-before=$(grep -c '^GET /nar/' "$root/publish.log" || true)
+before=$(served_count)
 unshare --user --map-root-user --mount bash -c \
   "mount --bind '$client/dead-store' '$store' && exec unshare --user --map-user=$(id -u) --map-group=$(id -g) bash '$root/dead-part.sh'"
-after=$(grep -c '^GET /nar/' "$root/publish.log" || true)
+after=$(served_count)
 test "$after" -gt "$before"
-# The client log is the observable build output; the request count and nar
-# response prove that graph failure did not disable ordinary substitution.
+# The client log is the observable build output; the fetch count proves that
+# graph failure did not disable ordinary substitution, by NAR or by file-level
+# fetches, whichever transport the daemon used.
 
 for mode in daemon client; do
   before=$(grep -c '^GET /goonix/records/' "$root/publish.log" || true)
