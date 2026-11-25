@@ -952,6 +952,17 @@ static bool pathExists(const Bytes & path)
     return stat(path.c_str(), &status) == 0;
 }
 
+static gid_t hostKvmGid()
+{
+    const char *value = getenv("GOONIX_HOST_KVM_GID");
+    if (!value || !*value) return gid_t(-1);
+    char *end = nullptr;
+    errno = 0;
+    unsigned long gid = std::strtoul(value, &end, 10);
+    if (errno || !end || *end || gid > UINT32_MAX) return gid_t(-1);
+    return gid_t(gid);
+}
+
 void unshareAndInitUserns(Plan & plan, const Bytes & context)
 {
     const pid_t target = getpid();
@@ -981,7 +992,7 @@ void unshareAndInitUserns(Plan & plan, const Bytes & context)
             } catch (const std::exception & error) {
                 throw Error(Bytes("uid_map `") + uidMap + "': " + error.what());
             }
-            gid_t hostKvm = gid_t(-1);
+            gid_t hostKvm = hostKvmGid();
             const bool mappedKvm = plan.has(sandboxFlag) && !plan.mapAllIds &&
                 !plan.allowSetgroups && pathExists("/dev/kvm") &&
                 goonix_map_kvm_gid(target, plan.gidMapOutside,

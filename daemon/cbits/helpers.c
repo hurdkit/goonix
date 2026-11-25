@@ -11,6 +11,25 @@
 #include <grp.h>
 #include <stdio.h>
 
+/* Write a short diagnostic without stdio allocation or a Haskell callback.
+   This helper runs in the sandbox's forked parent-map writer. */
+static void kvm_mapping_diagnostic(const char *message, int error)
+{
+  const char *reason = error ? strerror(error) : "";
+  char text[256];
+  int count = snprintf(text, sizeof(text),
+    "guix-sandbox: kvm mapping: %s%s%s\n", message, error ? ": " : "", reason);
+  if (count <= 0) return;
+  size_t length = (size_t)count < sizeof(text) ? (size_t)count : sizeof(text) - 1;
+  const char *rest = text;
+  while (length != 0) {
+    ssize_t written = write(STDERR_FILENO, rest, length);
+    if (written > 0) { rest += written; length -= (size_t)written; }
+    else if (written < 0 && errno == EINTR) continue;
+    else break;
+  }
+}
+
 #include <sys/types.h>
 
 /* Equivalent to the C++ daemon's killUser: the short-lived child changes to
@@ -80,33 +99,11 @@ int goonix_kill_user(uid_t uid, char *diag, size_t diag_len)
    keeps the zombie and its pid allocated during that transition, so the
    deadline thread cannot signal a pid that has already been reaped. */
 /* C++ initializeUserNamespace's extraGIDs path (build.cc:1666-1709).
-   guix-sandbox's parent map-writer calls this before its setgroups/gid_map
-   writes, so the optional group is authorized without an early deny. */
+   The caller supplies the host KVM gid observed before this helper forked.
+   Do not inspect libc NSS state or group vectors in this post-fork child. */
 int goonix_map_kvm_gid(pid_t target, gid_t daemon_gid, gid_t primary_guest,
                        gid_t host_gid, gid_t guest_gid)
 {
-  struct group *kvm = getgrnam("kvm");
-  if (!kvm || kvm->gr_gid != host_gid) return 1;
-  gid_t groups[64];
-  int count = getgroups(64, groups);
-  if (count < 0) return 1;
-  if (count == 64) {
-    int more = getgroups(0, NULL);
-    if (more < 0) return 1;
-    gid_t *all = calloc((size_t)more, sizeof(gid_t));
-    if (!all) return 1;
-    int total = getgroups(more, all);
-    for (int i = 0; i < total; i++) if (all[i] == host_gid) {
-      free(all);
-      goto found;
-    }
-    free(all);
-    return 1;
-  }
-  int member = 0;
-  for (int i = 0; i < count; i++) if (groups[i] == host_gid) member = 1;
-  if (!member) return 1;
-found:
   char pid[32], daemon[32], primary[32], guest[32], host[32];
   snprintf(pid, sizeof(pid), "%d", (int)target);
   snprintf(daemon, sizeof(daemon), "%u", (unsigned)daemon_gid);
@@ -117,12 +114,28 @@ found:
     (char *)"1", guest, host, (char *)"1", NULL};
   pid_t child;
   int result = posix_spawnp(&child, "newgidmap", NULL, NULL, argv, environ);
-  if (result != 0) return 1;
+  if (result != 0) {
+    kvm_mapping_diagnostic("newgidmap spawn failed", result);
+    return 1;
+  }
   int status;
   while (waitpid(child, &status, 0) < 0) {
-    if (errno != EINTR) return 1;
+    if (errno != EINTR) {
+      kvm_mapping_diagnostic("newgidmap wait failed", errno);
+      return 1;
+    }
   }
-  return WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : 1;
+  if (WIFEXITED(status) && WEXITSTATUS(status) == 0) return 0;
+  if (WIFEXITED(status)) {
+    char message[128];
+    snprintf(message, sizeof(message), "newgidmap exited %d", WEXITSTATUS(status));
+    kvm_mapping_diagnostic(message, 0);
+  } else if (WIFSIGNALED(status)) {
+    char message[128];
+    snprintf(message, sizeof(message), "newgidmap received signal %d", WTERMSIG(status));
+    kvm_mapping_diagnostic(message, 0);
+  }
+  return 1;
 }
 
 int goonix_waitid_nowait(pid_t pid)
@@ -135,12 +148,20 @@ int goonix_waitid_nowait(pid_t pid)
 }
 
 int goonix_spawn_sandbox(const char *program, const char *plan,
-                        int log_fd, int *pid_out)
+                        int log_fd, gid_t host_kvm_gid, int *pid_out)
 {
   int pid = fork();
   if (pid < 0) return -1;
   if (pid == 0) {
-    /* Do not run Haskell between fork and exec.  Only this tiny C shim runs. */
+    /* Do not run Haskell between fork and exec.  Only this tiny C shim runs.
+       This value belongs to the sandbox's parent map writer, not the builder
+       environment: the plan parser reads it before replacing the environment. */
+    if (host_kvm_gid != (gid_t)-1) {
+      char text[64];
+      int n = snprintf(text, sizeof(text), "%u", (unsigned)host_kvm_gid);
+      if (n <= 0 || n >= (int)sizeof(text)) _exit(127);
+      if (setenv("GOONIX_HOST_KVM_GID", text, 1) < 0) _exit(127);
+    }
     if (setpgid(0, 0) < 0) _exit(127);
     if (dup2(log_fd, STDOUT_FILENO) < 0 || dup2(log_fd, STDERR_FILENO) < 0)
       _exit(127);

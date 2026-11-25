@@ -970,7 +970,7 @@ runBuilderWithUser buildUser rootFd store settings trace mode originalPath drvPa
       throwIO (StoreError (C.pack ("build of " ++ C.unpack drvPath ++ " " ++ reason)) status)
 
 foreign import ccall unsafe "goonix_spawn_sandbox"
-  c_spawn_sandbox :: CString -> CString -> CInt -> Ptr CInt -> IO CInt
+  c_spawn_sandbox :: CString -> CString -> CInt -> CGid -> Ptr CInt -> IO CInt
 
 foreign import ccall unsafe "goonix_spawn_builtin"
   c_spawn_builtin :: CString -> Ptr CString -> Ptr CString -> CString -> CInt -> CInt
@@ -1049,6 +1049,9 @@ spawnSandboxedBuilder buildUser settings store work drvPath drv command env (Fd 
       lockMountsFlag = if hostIdentities then 0 else sandboxFlagLockMounts
   network <- fixedOutputNetwork settings drv
   kvmExists <- Files.fileExist "/dev/kvm"
+  hostKvm <- if kvmExists
+    then Just . fileGroup <$> Files.getSymbolicLinkStatus "/dev/kvm"
+    else pure Nothing
   let (networkFlags, slirpProgram, slirpFilter) = case network of
         Nothing -> (0, "", [])
         Just (program, ipv6, isolate) ->
@@ -1117,7 +1120,7 @@ spawnSandboxedBuilder buildUser settings store work drvPath drv command env (Fd 
               (replaceBytes "::1" "fd00::2" (replaceBytes "127.0.0.1" "10.0.2.2" hosts))
   B.writeFile (C.unpack planPath) (encodeSandboxPlan plan)
   withCString (C.unpack helper) $ \program' -> withCString (C.unpack planPath) $ \path' -> alloca $ \pidPointer -> do
-    result <- c_spawn_sandbox program' path' logFd pidPointer
+    result <- c_spawn_sandbox program' path' logFd (maybe (-1) fromIntegral hostKvm) pidPointer
     if result < 0 then throwIO (storeError "cannot spawn sandbox helper") else do
       pid <- fromIntegral <$> peek pidPointer
       pure (pid, waitForSandbox pid, Just root, map outputPath (Map.elems (outputs drv)))
