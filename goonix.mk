@@ -50,6 +50,7 @@ SCM_TESTS +=					\
   tests/ca-files.scm				\
   tests/ca-full.scm				\
   tests/ca-opaque.scm				\
+  tests/ca-record-signature.scm			\
   tests/ca-policy.scm				\
   tests/ca-existing-item.scm			\
   tests/ca-fixed-output.scm			\

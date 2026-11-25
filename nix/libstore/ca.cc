@@ -1081,3 +1081,91 @@ Path writeResolvedDerivation(LocalStore & store, const Path & originalPath,
 }
 
 }
+
+namespace nix {
+
+/* goonix: base64 for record signatures.  Small, self-contained and strict:
+   decoding rejects anything that is not base64, so an older record holding raw
+   signature bytes can never be misread as a valid one by accident. */
+static const char goonixB64Alphabet[] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+string goonixBase64Encode(const string & raw)
+{
+    string out;
+    out.reserve(((raw.size() + 2) / 3) * 4);
+    size_t i = 0;
+    while (i + 2 < raw.size()) {
+        uint32_t n = ((unsigned char) raw[i] << 16)
+                   | ((unsigned char) raw[i + 1] << 8)
+                   | (unsigned char) raw[i + 2];
+        out.push_back(goonixB64Alphabet[(n >> 18) & 63]);
+        out.push_back(goonixB64Alphabet[(n >> 12) & 63]);
+        out.push_back(goonixB64Alphabet[(n >> 6) & 63]);
+        out.push_back(goonixB64Alphabet[n & 63]);
+        i += 3;
+    }
+    size_t rest = raw.size() - i;
+    if (rest == 1) {
+        uint32_t n = (unsigned char) raw[i] << 16;
+        out.push_back(goonixB64Alphabet[(n >> 18) & 63]);
+        out.push_back(goonixB64Alphabet[(n >> 12) & 63]);
+        out.push_back('=');
+        out.push_back('=');
+    } else if (rest == 2) {
+        uint32_t n = ((unsigned char) raw[i] << 16)
+                   | ((unsigned char) raw[i + 1] << 8);
+        out.push_back(goonixB64Alphabet[(n >> 18) & 63]);
+        out.push_back(goonixB64Alphabet[(n >> 12) & 63]);
+        out.push_back(goonixB64Alphabet[(n >> 6) & 63]);
+        out.push_back('=');
+    }
+    return out;
+}
+
+static int goonixB64Value(char c)
+{
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
+}
+
+string goonixBase64Decode(const string & encoded)
+{
+    if (encoded.empty() || encoded.size() % 4 != 0)
+        throw Error("goonix: record signature is not valid base64 (length)");
+    string out;
+    out.reserve((encoded.size() / 4) * 3);
+    for (size_t i = 0; i < encoded.size(); i += 4) {
+        int values[4];
+        int padding = 0;
+        for (int j = 0; j < 4; ++j) {
+            char c = encoded[i + j];
+            if (c == '=') {
+                /* '=' is only allowed as the last one or two characters. */
+                if (i + 4 != encoded.size() || j < 2)
+                    throw Error("goonix: record signature is not valid base64 (padding)");
+                values[j] = 0;
+                ++padding;
+            } else {
+                if (padding)
+                    throw Error("goonix: record signature is not valid base64 (data after padding)");
+                values[j] = goonixB64Value(c);
+                if (values[j] < 0)
+                    throw Error("goonix: record signature is not valid base64 (alphabet)");
+            }
+        }
+        uint32_t n = (values[0] << 18) | (values[1] << 12)
+                   | (values[2] << 6) | values[3];
+        out.push_back((n >> 16) & 0xff);
+        if (padding < 2) out.push_back((n >> 8) & 0xff);
+        if (padding < 1) out.push_back(n & 0xff);
+    }
+    return out;
+}
+
+}
+

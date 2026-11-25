@@ -1266,13 +1266,21 @@ string LocalStore::signBuildRecord(const string & payload)
 {
     Path secretKey = settings.nixConfDir + "/signing-key.sec";
     checkSecrecy(secretKey);
-    return signHash(secretKey, hashString(htSHA256, payload));
+    /* goonix: carry the signature as base64.  The advanced S-expression the
+       agent returns holds raw high bytes whenever the digest looks printable,
+       so its byte form depends on the digest's luck; base64 makes it
+       deterministic and always valid UTF-8.  Decoding is the mirror at
+       verifyGoonixRecordSignature. */
+    return goonixBase64Encode(signHash(secretKey, hashString(htSHA256, payload)));
 }
 
 // goonix: forward only the store-authenticated digest to the record module.
 string verifyGoonixRecordSignature(LocalStore &, const string & signature)
 {
-    return verifySignature(signature);
+    /* The stored field is base64; decode before verifying.  A field that is
+       not valid base64 is refused by goonixBase64Decode with a clear message,
+       never passed through as though it were already a raw signature. */
+    return verifySignature(goonixBase64Decode(signature));
 }
 
 void LocalStore::exportPath(const Path & path, bool sign,
