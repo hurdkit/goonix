@@ -58,7 +58,7 @@ import System.Posix.Files (fileOwner, fileGroup, stdFileMode)
 import System.Posix.Process (getProcessID, ProcessStatus (Exited, Terminated, Stopped))
 import System.Posix.Signals (sigKILL, signalProcessGroup)
 import System.Posix.IO.ByteString (createPipe, fdToHandle, closeFd, openFd, fdRead, fdWrite, OpenMode (ReadOnly, WriteOnly), defaultFileFlags, OpenFileFlags (trunc, creat))
-import System.Posix.User (getEffectiveGroupID, getEffectiveUserID)
+import System.Posix.User (getEffectiveGroupID, getEffectiveUserID, getGroups)
 import System.FilePath (takeDirectory)
 import System.Directory (findExecutable)
 import System.IO.Error (ioeGetErrorString, isDoesNotExistError)
@@ -972,6 +972,9 @@ runBuilderWithUser buildUser rootFd store settings trace mode originalPath drvPa
 foreign import ccall unsafe "goonix_spawn_sandbox"
   c_spawn_sandbox :: CString -> CString -> CInt -> Ptr CInt -> IO CInt
 
+foreign import ccall safe "goonix_map_kvm_gid"
+  c_map_kvm_gid :: CInt -> CGid -> CGid -> CGid -> CGid -> IO CInt
+
 foreign import ccall unsafe "goonix_spawn_builtin"
   c_spawn_builtin :: CString -> Ptr CString -> Ptr CString -> CString -> CInt -> CInt
                   -> CUid -> CGid -> Ptr CGid -> CInt -> Ptr CInt -> IO CInt
@@ -1119,7 +1122,30 @@ spawnSandboxedBuilder buildUser settings store work drvPath drv command env (Fd 
     result <- c_spawn_sandbox program' path' logFd pidPointer
     if result < 0 then throwIO (storeError "cannot spawn sandbox helper") else do
       pid <- fromIntegral <$> peek pidPointer
+      -- C++ initializeUserNamespace maps the daemon's supplementary kvm GID
+      -- to 40000 with newgidmap.  If that is unavailable, retain the normal
+      -- denied-setgroups single-GID fallback (build.cc:1666-1709).
+      kvm <- mapSupplementaryKvm hostIdentities pid hostGid insideGid
+      B.writeFile (C.unpack planPath) (encodeSandboxPlan plan
+        { planGroups = (if kvm then (40000 :) else id) (maybe [] buildUserGroups buildUser) })
       pure (pid, waitForSandbox pid, Just root, map outputPath (Map.elems (outputs drv)))
+  where
+    mapSupplementaryKvm hostIdentities pid hostGid insideGid = do
+      if hostIdentities then pure False else do
+        groups <- getGroups
+        groupsText <- C.lines <$> B.readFile "/etc/group"
+        let groupIds = map (fromIntegral :: System.Posix.Types.CGid -> Word32) groups
+            kvm = [number | line <- groupsText, "kvm":_:gid:_ <- [C.split ':' line]
+                       , Just number <- [readGid gid], number `elem` groupIds]
+        case kvm of
+          [] -> pure False
+          host:_ -> do
+            mapped <- c_map_kvm_gid (fromIntegral pid) (fromIntegral hostGid)
+              (fromIntegral insideGid) (fromIntegral host) 40000
+            pure (mapped == 0)
+    readGid value = case reads (C.unpack value) of
+      [(number, "")] -> Just (number :: Word32)
+      _ -> Nothing
 
 copyEtcFile :: RawFilePath -> RawFilePath -> IO ()
 copyEtcFile root path =

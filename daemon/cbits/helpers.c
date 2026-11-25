@@ -79,6 +79,53 @@ int goonix_kill_user(uid_t uid, char *diag, size_t diag_len)
    its process as no longer signalable between this call and waitpid.  WNOWAIT
    keeps the zombie and its pid allocated during that transition, so the
    deadline thread cannot signal a pid that has already been reaped. */
+/* C++ initializeUserNamespace's extraGIDs path (build.cc:1666-1709).  This
+   runs in the daemon, before the sandbox enters its PID namespace.
+   newgidmap authorises the supplementary group through /etc/subgid.  Its
+   absence or a refusal falls back to the ordinary single-gid map. */
+int goonix_map_kvm_gid(pid_t target, gid_t daemon_gid, gid_t primary_guest,
+                       gid_t host_gid, gid_t guest_gid)
+{
+  struct group *kvm = getgrnam("kvm");
+  if (!kvm || kvm->gr_gid != host_gid) return 1;
+  gid_t groups[64];
+  int count = getgroups(64, groups);
+  if (count < 0) return 1;
+  if (count == 64) {
+    int more = getgroups(0, NULL);
+    if (more < 0) return 1;
+    gid_t *all = calloc((size_t)more, sizeof(gid_t));
+    if (!all) return 1;
+    int total = getgroups(more, all);
+    for (int i = 0; i < total; i++) if (all[i] == host_gid) {
+      free(all);
+      goto found;
+    }
+    free(all);
+    return 1;
+  }
+  int member = 0;
+  for (int i = 0; i < count; i++) if (groups[i] == host_gid) member = 1;
+  if (!member) return 1;
+found:
+  char pid[32], daemon[32], primary[32], guest[32], host[32];
+  snprintf(pid, sizeof(pid), "%d", (int)target);
+  snprintf(daemon, sizeof(daemon), "%u", (unsigned)daemon_gid);
+  snprintf(primary, sizeof(primary), "%u", (unsigned)primary_guest);
+  snprintf(guest, sizeof(guest), "%u", (unsigned)guest_gid);
+  snprintf(host, sizeof(host), "%u", (unsigned)host_gid);
+  char *const argv[] = {(char *)"newgidmap", pid, primary, daemon,
+    (char *)"1", guest, host, (char *)"1", NULL};
+  pid_t child;
+  int result = posix_spawn(&child, "newgidmap", NULL, NULL, argv, environ);
+  if (result != 0) return 1;
+  int status;
+  while (waitpid(child, &status, 0) < 0) {
+    if (errno != EINTR) return 1;
+  }
+  return WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : 1;
+}
+
 int goonix_waitid_nowait(pid_t pid)
 {
   siginfo_t info;
