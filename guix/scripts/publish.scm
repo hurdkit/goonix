@@ -781,11 +781,19 @@ has the given HASH of type ALGO."
   (let ((derivation (string-append (%store-prefix) "/" name)))
     (if (and (string-suffix? ".drv" name)
              (valid-path? store derivation))
-        (values '((content-type . (text/plain (charset . "UTF-8"))))
-                (call-with-output-string
-                  (lambda (port)
-                    (write (build-graph-expression store derivation) port)
-                    (newline port))))
+        (catch #t
+          (lambda ()
+            (values '((content-type . (text/plain (charset . "UTF-8"))))
+                    (call-with-output-string
+                      (lambda (port)
+                        (write (build-graph-expression store derivation) port)
+                        (newline port)))))
+          (lambda (key . arguments)
+            (format (current-error-port)
+                    "guix publish: refusing invalid goonix record: ~a ~a~%"
+                    key arguments)
+            (values (build-response #:code 422)
+                    "Invalid goonix build record.\n")))
         (not-found request))))
 
 (define (render-goonix-files store request name) ;goonix: file-level list

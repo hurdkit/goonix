@@ -51,7 +51,8 @@
 libgcrypt's advanced format can hold raw high bytes, so the signature is first
 converted to UTF-8 as bytes and then base64-encoded, which is deterministic and
 safe to write into a text protocol."
-  (base64-encode (string->utf8 signature)))
+  ;; guix authenticate deliberately uses ISO-8859-1 for signature bytes.
+  (base64-encode (string->bytevector signature (make-transcoder (latin-1-codec)))))
 
 (define (decode-signature field)
   "Return the canonical S-expression string carried in FIELD.
@@ -65,7 +66,8 @@ bytes must never decode by accident and produce a subtly different signature."
            "goonix: record signature is empty"))
   (catch #t
     (lambda ()
-      (utf8->string (base64-decode field)))
+      (bytevector->string (base64-decode field)
+                          (make-transcoder (latin-1-codec))))
     (lambda (key . args)
       (throw 'goonix-invalid-signature-encoding
              (format #f "goonix: record signature is not valid base64; ~

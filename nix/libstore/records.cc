@@ -1,5 +1,6 @@
 // goonix: build-record storage, selection policy and conflict tracking.
 #include "records.hh"
+#include "ca.hh"
 #include "serialise.hh"
 #include "util.hh"
 #include <sqlite3.h>
@@ -110,8 +111,16 @@ void BuildRecords::add(const BuildRecord & record)
 
 static BuildRecord readRecord(SQLiteStmt::Use & use)
 {
+    auto signature = use.getStr(6);
+    if (signature.starts_with("("))
+        /* A pre-base64 record holds the signer's raw advanced S-expression.
+           Encode those exact bytes, including any raw high bytes. */
+        signature = goonixBase64Encode(signature);
+    else
+        /* Refuse garbage at the read boundary rather than serving it. */
+        goonixBase64Decode(signature);
     return {use.getStr(0), use.getStr(1), use.getStr(2),
-        use.getStr(3), use.getStr(4), use.getInt(5) != 0, use.getStr(6)};
+        use.getStr(3), use.getStr(4), use.getInt(5) != 0, signature};
 }
 
 static const char * recordColumns =
