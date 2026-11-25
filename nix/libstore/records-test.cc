@@ -2,7 +2,10 @@
 #include "build-goonix-response.hh"
 #include "records.hh"
 #include "ca.hh"
+#include "ca-auth.hh"
 #include "local-store.hh"
+#include "sqlite.hh"
+#include <sqlite3.h>
 #include "globals.hh"
 #include "util.hh"
 #include <cstdlib>
@@ -12,6 +15,42 @@
 #include <sys/wait.h>
 
 using namespace nix;
+
+
+static void configureTestStore(const Path & root, const Path & guix);
+
+static int writeHighByteSignature(int argc, char ** argv)
+{
+    if (argc != 5 || string(argv[1]) != "--sign-high-byte")
+        return 2;
+    configureTestStore(argv[2], argv[3]);
+    createDirs(settings.nixConfDir);
+    chmod(settings.nixConfDir.c_str(), 0700);
+    const string source = getEnv("GUIX_CONFIGURATION_DIRECTORY", settings.nixConfDir);
+    writeFile(settings.nixConfDir + "/signing-key.sec", readFile(source + "/signing-key.sec"));
+    writeFile(settings.nixConfDir + "/signing-key.pub", readFile(source + "/signing-key.pub"));
+    chmod((settings.nixConfDir + "/signing-key.sec").c_str(), 0400);
+    LocalStore store(false);
+    for (unsigned int i = 0; i != 4096; ++i) {
+        string payload = std::format("goonix signature byte test {}", i);
+        auto encoded = store.signBuildRecord(payload);
+        auto raw = goonixBase64Decode(encoded);
+        if (std::any_of(raw.begin(), raw.end(), [](unsigned char c) { return c > 127; })) {
+            string hex;
+            for (unsigned char c : raw) {
+                const char digits[] = "0123456789abcdef";
+                hex.push_back(digits[c >> 4]);
+                hex.push_back(digits[c & 15]);
+            }
+            writeFile(argv[4], encoded + "\n" + hex + "\n" +
+                printHash(hashString(htSHA256, payload)));
+            std::cout << "goonix real high-byte signature: PASS\n";
+            return 0;
+        }
+    }
+    std::cerr << "goonix real high-byte signature: no such signature in 4096 attempts\n";
+    return 1;
+}
 
 static int checkGraphResponses()
 {
@@ -93,6 +132,8 @@ static int checkUnauthorizedImport(int argc, char ** argv)
 
 int main(int argc, char ** argv)
 {
+    if (argc == 5 && string(argv[1]) == "--sign-high-byte")
+        return writeHighByteSignature(argc, argv);
     if (argc == 2 && string(argv[1]) == "--check-graph-responses")
         return checkGraphResponses();
     if (argc == 8 && string(argv[3]) == "--check-unauthorized-import")

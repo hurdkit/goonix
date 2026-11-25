@@ -8,6 +8,7 @@ if ! unshare --user --map-root-user --mount true 2>/dev/null; then
   exit 77
 fi
 root=$(mktemp -d "${GOONIX_SIGNATURE_TMPDIR:-${TMPDIR:-/tmp}}/goonix-signature-publish-XXXXXX")
+echo "SIGNATURE_FIXTURE=$root"
 store=$root/store
 port=${GOONIX_SIGNATURE_PORT:-6798}
 url=http://127.0.0.1:$port
@@ -25,6 +26,15 @@ export GUIX_DAEMON_SOCKET=$root/socket GUIX_LOG_DIRECTORY=$root/log
   --substitute-urls= >"$root/server.log" 2>&1 & daemon=$!
 trap 'kill "$daemon" 2>/dev/null || true; wait 2>/dev/null || true' EXIT
 for i in $(seq 1 100); do test -S "$root/socket" && break; sleep .1; done
+# Obtain a real C++-signed high-byte signature, then decode and verify it in
+# Scheme.  Run this in the same prepared environment as the daemon, so gcrypt
+# and guix authenticate are both available.
+printf '#!/bin/sh\nexec %s guix "$@"\n' "$PWD/pre-inst-env" > "$root/guix-helper"
+chmod +x "$root/guix-helper"
+GUIX_CONFIGURATION_DIRECTORY=$root/etc ./pre-inst-env ./nix/records-test \
+  --sign-high-byte "$root/signing" "$root/guix-helper" "$root/cpp-signature"
+export GOONIX_CPP_SIGNATURE=$root/cpp-signature
+./pre-inst-env guile --no-auto-compile tests/ca-record-signature-cpp-client.scm
 ./pre-inst-env guile --no-auto-compile tests/ca-record-signature-publish-fixture.scm
 sqlite3 "$root/db/db.sqlite" '.timeout 10000' 'PRAGMA wal_checkpoint(FULL);'
 ./pre-inst-env guix publish --listen=127.0.0.1 --port="$port" -C0 \
