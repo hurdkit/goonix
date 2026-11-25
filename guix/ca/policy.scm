@@ -93,22 +93,16 @@
   "Return the kind to request for PACKAGE's own derivation."
   (cond ((and (opaque-package? package)
               (memq (%package-addressing-policy) '(content full adopted)))
-         ;; goonix: the opaque table forces resolved-addressing under the
-         ;; content/full policies, and under 'adopted too.  Under mixed/input
-         ;; the upstream graph is kept byte-identical (an input-addressed
-         ;; dependent may not take a resolved dependency), so only the
-         ;; explicit opaque property — upstream's own marking — applies there.
-         ;;
-         ;; An opaque package must be marked BEFORE it is built: a self
-         ;; reference that a rewrite cannot reverse is discovered by the
-         ;; scanner only after the item exists, and refusing it then costs the
-         ;; whole build.  Dependents of such an item are promoted out of input
-         ;; addressing (see bag-opaque-input?), because
-         ;; checkInputAddressedPolicy refuses an input-addressed derivation
-         ;; that depends on a goonix-addressed item.
-         'resolved)
+         ;; Option 2: under 'adopted an opaque item remains input-addressed
+         ;; and is not adopted.  Its dependents can retain input addressing.
+         ;; Content/full still use the resolved-addressed source path.
+         (if (eq? (%package-addressing-policy) 'adopted)
+             'input
+             'resolved))
         ((eq? 'opaque (assq-ref (package-properties package) 'self-references))
-         'resolved)
+         (if (eq? (%package-addressing-policy) 'adopted)
+             'input
+             'resolved))
         ((memq (%package-addressing-policy) '(content full)) 'content)
         ((eq? (%package-addressing-policy) 'mixed)
          (if ((%upstream-package?) package) 'input 'content))
@@ -116,7 +110,7 @@
          ;; Upstream's unmodified packages are lowered input-addressed and
          ;; then adopted (their binary rewritten to a content-addressed item,
          ;; see lower-bag-with-addressing); everything else is built
-         ;; content-addressed.  Opaque packages stay resolved (above).
+         ;; content-addressed.  Opaque packages stay input and unadopted.
          (if ((%upstream-package?) package) 'input 'content))
         (else 'input)))
 
@@ -131,74 +125,30 @@ policy is 'adopted', PACKAGE is upstream's, and it is not marked opaque."
   "Return the current mode and marker for the package derivation cache."
   (list (%package-addressing-policy) (%upstream-package?)))
 
-(define (bag-opaque-input? bag)
-  "Whether BAG directly depends on a package the opaque table (or the opaque
-property) marks.  Under 'adopted such a dependency is now RESOLVED-addressed,
-and nix/libstore/ca.cc:148 checkInputAddressedPolicy refuses an input-addressed
-derivation that depends on a resolved one, so the dependent must be promoted
-out of input addressing too."
-  (any (match-lambda
-         ((label (? package? package) . rest)
-          (opaque-package? package))
-         (_ #f))
-       (append (bag-build-inputs bag)
-               (bag-host-inputs bag)
-               (bag-target-inputs bag))))
-
 (define (lower-bag-with-addressing lower bag . arguments)
   "Apply the package's own addressing around its bag build, after inputs.
-Under the 'adopted policy an upstream package's input-addressed derivation is
-adopted (its binary rewritten to a content-addressed item); a flagged item or
-glibc is re-lowered content-addressed from source instead."
+Under the 'adopted policy an ordinary upstream package's input-addressed
+derivation is adopted; an opaque package stays input-addressed and unadopted.
+No direct-opaque or glibc-specific dependent promotion is applied."
   (let ((context (and (pair? arguments) (car arguments))))
     (if (package? context)
-        ;; goonix: glibc is never adopted (guix/ca/adopt.scm's
-        ;; glibc-derivation?), so under 'adopted lower it CONTENT-ADDRESSED
-        ;; from the start instead of lowering it input-addressed and adopting
-        ;; afterwards.
-        ;;
-        ;; The IA-then-adopt route cannot work for it: registering the
-        ;; input-addressed derivation is itself refused, because
-        ;; checkInputAddressedPolicy runs at REGISTRATION
-        ;; (nix/libstore/local-store.cc:537, ca.cc:285), not only at build
-        ;; time, and glibc's inputs have already been adopted
-        ;; (content-addressed).  Measured on CA-6's gate at glibc-2.41 over
-        ;; gawk-boot0, and pinned by tests/ca-policy.scm's re-lower group: the
-        ;; throw happens inside (package-derivation store glibc-like), before
-        ;; any build.
-        ;;
-        ;; The mark is on glibc's OWN derivation only (%package-addressing).
-        ;; The POLICY stays 'adopted for everything lowered inside this
-        ;; extent, so the builder's guile, module-import and any package a
-        ;; gexp of glibc's build pulls in are still ADOPTED - cheap grafts over
-        ;; the input-addressed items the other packages use - rather than
-        ;; re-lowered from source.  Measured both ways: with 'content for the
-        ;; whole extent, a glibc-named package using (default-guile) got a
-        ;; FROM-SOURCE guile-3.0 (graft=0, its own guile-3.0.9.tar input, a
-        ;; 198-derivation closure); with the policy left 'adopted the builder
-        ;; guile is a graft (graft=1) over the same input-addressed item its
-        ;; peers use.  gnu-build-system and trivial-build-system both lower
-        ;; the builder's guile inside bag lowering, and glibc passes no
-        ;; #:guile, so it is in that case.
-        (let* ((glibc? (and (eq? (%package-addressing-policy) 'adopted)
-                            (glibc-name? (bag-name bag))))
-               ;; goonix: a dependent of an opaque item cannot stay
-               ;; input-addressed under 'adopted, because that item is
-               ;; resolved and checkInputAddressedPolicy refuses the pairing
-               ;; at REGISTRATION.  Promote it to content, the same answer the
-               ;; 'mixed policy already gives for an upstream dependent on an
-               ;; opaque input.  The rest of the adopted graph keeps its
-               ;; addressing; only the affected subgraph changes.
-               (opaque-input? (and (eq? (%package-addressing-policy) 'adopted)
-                                   (bag-opaque-input? bag))))
-          (state-parameterize ((%package-addressing
-                                (cond (glibc? 'content)
-                                      (opaque-input? 'content)
-                                      (else (package-addressing context))))
+        (let ((addressing (package-addressing context))
+              (opaque-input?
+               (and (eq? (%package-addressing-policy) 'adopted)
+                    (opaque-package? context)))
+              (adopt? (adopt-package? context)))
+          (state-parameterize ((%package-addressing addressing)
                                (%package-derivation-name (bag-name bag)))
-            (let ((drv (apply lower bag arguments)))
-              (if (and (not glibc?) (not opaque-input?)
-                       (adopt-package? context))
+            (let ((drv
+                   (if opaque-input?
+                       ;; Keep the complete upstream derivation, not just its
+                       ;; top-level marker: nested gexps and packages must be
+                       ;; input-addressed too, so the original output path and
+                       ;; its substitutes remain usable.
+                       (state-parameterize ((%package-addressing-policy 'input))
+                         (apply lower bag arguments))
+                       (apply lower bag arguments))))
+              (if adopt?
                   (adopt-lowered-derivation lower bag arguments drv)
                   drv))))
         (apply lower bag arguments))))
@@ -207,8 +157,8 @@ glibc is re-lowered content-addressed from source instead."
   "Adopt DRV, the monadic input-addressed derivation of an upstream package
 under the 'adopted policy.  DRV is built with input-addressed inputs (the
 upstream graph); adoption then rewrites its references to adopted items.  If
-the scanner flags the item or it is glibc, re-lower it content-addressed from
-source instead."
+the scanner flags the item, re-lower it content-addressed from source instead.
+An opaque item is excluded by adopt-package? and does not enter this path."
   (with-monad %store-monad
     (>>= (state-parameterize ((%package-addressing-policy 'input))
            drv)
@@ -227,9 +177,8 @@ source instead."
                    ;; with (package-addressing context), which under the 'input
                    ;; policy returns 'input.  Setting only %package-addressing
                    ;; therefore had no effect on a flagged item's re-lowering.
-                   ;; (glibc no longer comes through here at all: it is lowered
-                   ;; content-addressed from the start, see
-                   ;; lower-bag-with-addressing.)
+                   ;; Table/property opaque items do not enter this path;
+                   ;; adopt-package? excludes them before this fallback.
                    (values (run-with-store store
                              (state-parameterize ((%package-addressing-policy
                                                    'content)

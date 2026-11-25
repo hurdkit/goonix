@@ -257,5 +257,33 @@
           ;; an unbounded chain.  LIMIT is far above what this closure needs.
           (<= max-depth limit))))))
 
+(test-group "an adopted dependent retains an unadopted opaque input"
+  ;; The name exercises the real glibc-name? non-adoption rule without a
+  ;; bootstrap-heavy glibc build.  This is an actual store fixture: both
+  ;; input-addressed outputs are registered, then only the dependent is
+  ;; adopted.  Its rewritten content and references must retain that opaque
+  ;; input-addressed item instead of inventing a promoted dependency.
+  (let* ((opaque-like (ia-plain (fresh-name "glibc-option2") "opaque-input"))
+         (_ (build-derivations store (list opaque-like)))
+         (opaque-path (realised opaque-like))
+         (dependent (ia-plain (fresh-name "adopt-opaque-dependent") opaque-path))
+         (_ (build-derivations store (list dependent)))
+         (adopted (adopt-derivation store dependent #:guile guile-drv)))
+    (test-assert "the opaque-like derivation remains input-addressed and unadopted"
+      (and (not (assoc-ref (derivation-builder-environment-vars opaque-like)
+                           "goonixAddressing"))
+           (eq? opaque-like
+                (adopt-derivation store opaque-like #:guile guile-drv))))
+    (test-equal "the dependent is adopted content-addressed"
+      "content" (assoc-ref (derivation-builder-environment-vars adopted)
+                           "goonixAddressing"))
+    (build-derivations store (list adopted))
+    (let ((path (realised adopted)))
+      (test-equal "the adopted output still names the unadopted input"
+        opaque-path (read-all path))
+      (test-assert "the adopted output is registered and references that input"
+        (and (valid-path? store path)
+             (member opaque-path (references store path)))))))
+
 (close-connection store)
 (test-end "ca-adopt")
