@@ -14,13 +14,15 @@ module Goonix.Build.Engine
   , BuildTrace (..)
   ) where
 
+import Goonix.Build.CaDecision
+
 import Control.Concurrent (forkIO, threadDelay, killThread)
 import Control.Concurrent.MVar (newEmptyMVar, newMVar, putMVar, takeMVar, withMVar)
 import Control.Concurrent.STM (STM, atomically, newEmptyTMVarIO, orElse, putTMVar, readTMVar, registerDelay, takeTMVar)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef, atomicWriteIORef, atomicModifyIORef')
 import Data.Time.Clock.POSIX (POSIXTime)
 import Control.Exception (IOException, SomeException, bracket, bracketOnError, catch, finally, fromException, mask, onException, throwIO, try)
-import Control.Concurrent.MVar (MVar, newEmptyMVar, newMVar, putMVar, takeMVar, withMVar)
+import Control.Concurrent.MVar (MVar)
 import Control.Monad ((>=>), foldM, forM, forM_, replicateM_, unless, void, when)
 import Data.Bits ((.|.))
 import Data.Time.Clock.POSIX (getPOSIXTime)
@@ -84,7 +86,7 @@ import System.Posix.Env.ByteString (getEnv)
 import Goonix.Store.Ca (goonixAddressed, resolvedDerivation, addressingOf, Addressing (..), tokenPath, selfToken)
 import Goonix.Store.DeepScan (checkDeepOutput)
 import Goonix.Store.CaBuild (resolveDerivation, checkInputAddressedPolicy, contentOutputOrder, finaliseContentOutput, Finalised (..), removeGoonixEnvironment, materialiseGoonixFiles, checkResolvedDerivation)
-import Goonix.Store.CaStore (realisedOutputPath, selectGoonixOutputs, writeResolvedDerivation, recordGoonixOutput, recordBuild, resolvedHashOf, initCaRecords)
+import Goonix.Store.CaStore (chosenOutputForCurrentGraph, realisedOutputPath, selectGoonixOutputs, writeResolvedDerivation, recordGoonixOutput, recordBuild, resolvedHashOf, initCaRecords)
 import Goonix.Store.Records (chosenOutput, chooseOutput, allChoices)
 
 data BuildMode = Normal | Repair | Check deriving (Eq, Show)
@@ -138,7 +140,7 @@ buildThingsInternal config rootFd store settings trace hook things mode cancel =
           , jobRun = \_ -> do
               let actualPath = B.take (B.length path - B.length "\0graph") path
               case config of
-                Just serverConfig -> runGraphLookup settings (configGuixProgram serverConfig)
+                Just serverConfig -> runGraphLookup rootFd store settings (configGuixProgram serverConfig)
                   actualPath (C.words (setting "substitute-urls" "" settings)) (traceOutput trace)
                 Nothing -> pure ()
               pure Done }
@@ -146,19 +148,89 @@ buildThingsInternal config rootFd store settings trace hook things mode cancel =
           { jobId = path, jobWanted = wanted, jobKind = DownloadJob
           , jobRun = \_ -> do
               let actualPath = B.take (B.length path - B.length "\0download") path
-              case config of
-                Just serverConfig -> void (trySubstitute serverConfig rootFd store settings trace actualPath)
-                Nothing -> pure ()
-              atomicModifyIORef' attemptedDownloads (\seen -> (Set.insert actualPath seen, ()))
-              pure Done }
+              -- SubstitutionGoal::tryNext adds a goal for every missing
+              -- reference before it starts the substituter.  The scheduler
+              -- must model that dependency, rather than repeatedly retrying a
+              -- download whose closure is not present.
+              infos <- case config of
+                Just serverConfig -> substitutableInfos serverConfig settings (traceOutput trace) [actualPath]
+                Nothing -> pure []
+              case infos of
+                ((_, _, references, _, _):_) -> do
+                  present <- mapM (isValidPath store) references
+                  let missing = [reference | (reference, ok) <- zip references present, not ok, reference /= actualPath]
+                  if not (null missing)
+                    then pure (Need [(downloadJobId reference, Set.empty, DownloadJob) | reference <- missing])
+                    else do
+                      case config of
+                        Just serverConfig -> void (trySubstitute serverConfig rootFd store settings trace actualPath)
+                        Nothing -> pure ()
+                      atomicModifyIORef' attemptedDownloads (\seen -> (Set.insert actualPath seen, ()))
+                      pure Done
+                [] -> do
+                  atomicModifyIORef' attemptedDownloads (\seen -> (Set.insert actualPath seen, ()))
+                  pure Done }
         BuildJob -> do
           phase <- newIORef False
+          graphRequested <- newIORef False
+          inputsRealised <- newIORef False
           pure JobSpec
             { jobId = path, jobWanted = wanted, jobKind = BuildJob
             , jobRun = \requested -> do
                 discovered <- readIORef phase
                 if discovered
                   then do
+                    bytes <- B.readFile (C.unpack path)
+                    drv <- either (throwIO . storeError) pure (parseDerivation bytes)
+                    if goonixAddressed (Map.lookup "goonixAddressing" (environment drv))
+                      then do
+                        decision <- prepareCaGoalDecision path drv requested graphRequested inputsRealised
+                        case decisionAction decision of
+                          CaGraph -> do
+                            writeIORef graphRequested True
+                            -- C++ attaches the graph as an auxiliary waitee;
+                            -- the input goal still runs while it is pending.
+                            pure (Need ([(input, selected, BuildJob)
+                              | (input, selected) <- Map.toList (inputDrvs drv)]
+                              ++ [(path <> "\0graph", Set.empty, GraphJob)]))
+                          CaSubstituteOutputs -> pure (Need [(downloadJobId (C.pack output), Set.empty, DownloadJob)
+                            | output <- Map.elems (decisionOutputs decision), not (null output)])
+                          CaDone -> pure Done
+                          CaBuild -> do
+                            -- C++ resolveGoonixBuild stores the resolved
+                            -- derivation before prepareResolvedBuild applies
+                            -- normal choices or in-memory check tokens.  The
+                            -- original path remains the choice key; the resolved
+                            -- text path is the deriver in the permanent record.
+                            resolved <- if resolvedDerivation (Map.lookup "goonixResolved" (environment drv))
+                              then pure drv
+                              else resolveDerivation (storeDirectory store) path drv (realisedOutputPath store)
+                            resolvedPath <- writeResolvedDerivation rootFd store path resolved
+                            appendTempRoot rootFd resolvedPath
+                            prepared <- prepareResolvedBuild rootFd store jobMode path resolved
+                            buildPhaseWith requested path prepared resolvedPath
+                          CaSubstituteInputs -> do
+                            writeIORef inputsRealised True
+                            pure (Need [(input, selected, BuildJob)
+                              | (input, selected) <- Map.toList (inputDrvs drv)])
+                      else buildPhase requested
+                  else do
+                    writeIORef phase True
+                    buildDerivation attemptedDownloads (discover inputMode) graphRequested config rootFd store settings trace hook jobMode requested path }
+          where
+            buildPhaseWith requested original prepared resolvedPath = do
+                    -- HS-12: one goal per derivation across the clients of this
+                    -- daemon.  The build runs in a daemon-owned thread that owns
+                    -- its temporary roots and store handle and tolerates a gone
+                    -- client, so it outlives the client that started it while any
+                    -- other client is still interested (and is killed when the
+                    -- last leaves).  The output locks still exclude other daemons.
+                    case config >>= configSharedScheduler of
+                      Just shared | jobMode == Normal -> withGoal shared path
+                        (daemonOwnedPrepared config userPool settings trace hook jobMode requested original prepared resolvedPath)
+                      _ -> buildDerivationPrepared userPool config rootFd store settings trace hook jobMode requested original prepared resolvedPath
+                    pure Done
+            buildPhase requested = do
                     -- HS-12: one goal per derivation across the clients of this
                     -- daemon.  The build runs in a daemon-owned thread that owns
                     -- its temporary roots and store handle and tolerates a gone
@@ -177,9 +249,26 @@ buildThingsInternal config rootFd store settings trace hook things mode cancel =
                         (daemonOwnedBuild config userPool settings trace hook jobMode requested path)
                       _ -> buildDerivationNow userPool config rootFd store settings trace hook jobMode requested path
                     pure Done
-                  else do
-                    writeIORef phase True
-                    buildDerivation attemptedDownloads (discover inputMode) config rootFd store settings trace hook jobMode requested path }
+            prepareCaGoalDecision originalPath drv wanted graphRequested inputsRealised = do
+              let resolved = resolvedDerivation (Map.lookup "goonixResolved" (environment drv))
+              prepared <- if resolved then prepareResolvedBuild rootFd store jobMode originalPath drv else pure drv
+              choices <- forM (Map.toList (outputs prepared)) $ \(name, out) -> do
+                chosen <- chosenOutputForCurrentGraph store originalPath name
+                valid <- if B.null chosen then pure False else isValidPath store chosen
+                pure (C.unpack name, CaOutputChoice
+                  (C.unpack (if resolved && (B.null chosen || chosen /= outputPath out)
+                    then B.empty else chosen)) valid (not (B.null chosen)))
+              alreadyRequested <- readIORef graphRequested
+              realised <- readIORef inputsRealised
+              pure (prepareCaGoal CaDecisionInput
+                { decisionNormal = jobMode == Normal
+                , decisionResolved = resolved
+                , decisionTopGoal = Set.null wanted
+                , decisionGraphRequested = alreadyRequested
+                , decisionInputsRealised = realised
+                , decisionGraphAvailable = maybe False (const True) config
+                    && settingBool "build-use-substitutes" False settings
+                , decisionChoices = Map.fromList choices })
   specs <- forM things $ \thing -> do
     let (path, wanted) = case B.break (== 33) thing of
           (drv, selected) | not (B.null selected) ->
@@ -211,8 +300,8 @@ buildThings :: Fd -> Store -> Settings -> [ByteString] -> BuildMode -> IO ()
 buildThings rootFd store settings things mode =
   buildThingsWithTrace rootFd store settings (BuildTrace (\_ _ _ _ -> pure ()) (\_ -> pure ()) (\_ _ -> pure ()) (\_ -> pure ())) things mode
 
-buildDerivation :: IORef (Set.Set ByteString) -> (ByteString -> Set.Set ByteString -> JobKind -> IO JobSpec) -> Maybe ServerConfig -> Fd -> Store -> Settings -> BuildTrace -> Maybe HookPool -> BuildMode -> Set.Set ByteString -> ByteString -> IO (Outcome [Dependency])
-buildDerivation attemptedDownloads discover config rootFd store settings trace hook mode wanted drvPath = do
+buildDerivation :: IORef (Set.Set ByteString) -> (ByteString -> Set.Set ByteString -> JobKind -> IO JobSpec) -> IORef Bool -> Maybe ServerConfig -> Fd -> Store -> Settings -> BuildTrace -> Maybe HookPool -> BuildMode -> Set.Set ByteString -> ByteString -> IO (Outcome [Dependency])
+buildDerivation attemptedDownloads discover graphRequested config rootFd store settings trace hook mode wanted drvPath = do
   appendTempRoot rootFd drvPath
   valid <- isValidPath store drvPath
   unless valid $ case config of
@@ -248,40 +337,74 @@ buildDerivation attemptedDownloads discover config rootFd store settings trace h
     -- goonix: the CA goal path.  An unresolved derivation realises ALL its
     -- inputs first (C++ goonixRealiseInputsFirst clears wantedOutputs), then
     -- resolves to a resolved derivation and re-enters the goal machinery on it.
-    buildCaDerivation drvPath drv
-      | not (resolvedDerivation (Map.lookup "goonixResolved" (environment drv))) = do
-          -- C++ goonixHaveDerivation requests records only for a TOP CA goal
-          -- with substitutes enabled and a wanted output missing
-          -- (build-goonix.inc:26-45).  `requested' is empty for a top goal and
-          -- non-empty for a discovered input.
-          missing <- if Set.null wanted
-            then or <$> mapM (fmap not . isValidPath store . outputPath) (Map.elems (outputs drv))
-            else or <$> mapM (fmap not . isValidPath store . outputPath)
-              (Map.elems (Map.restrictKeys (outputs drv) wanted))
-          let graph = if Set.null wanted && missing && mode == Normal
-                && settingBool "build-use-substitutes" False settings && maybe False (const True) config
-                then [(drvPath <> "\0graph", Set.empty, GraphJob)]
-                else []
-          pure (Need (graph ++ [(input, Set.empty, BuildJob) | input <- Map.keys (inputDrvs drv)]))
-      | otherwise = do
-          -- A resolved derivation: select the realised outputs from the records.
-          prepared <- prepareResolvedCaBuild drvPath drv
-          let selectedOutputs = if Set.null wanted then outputs prepared else Map.restrictKeys (outputs prepared) wanted
-              requestedPaths = map outputPath (Map.elems selectedOutputs)
-          ready <- and <$> mapM (isValidPath store . outputPath) (Map.elems selectedOutputs)
-          if ready && mode == Normal
-            then pure Done
-            else buildDerivationMissing requestedPaths drvPath prepared
+    buildCaDerivation drvPath drv = do
+      decision <- prepareCaGoalDecision drvPath drv wanted graphRequested
+      case decisionAction decision of
+        CaGraph -> do
+          writeIORef graphRequested True
+          pure (Need [(drvPath <> "\0graph", Set.empty, GraphJob)])
+        CaSubstituteOutputs -> pure (Need [(downloadJobId (C.pack path), Set.empty, DownloadJob)
+          | path <- Map.elems (decisionOutputs decision), not (null path)])
+        CaSubstituteInputs
+          | Map.null (inputDrvs drv) -> do
+              resolved <- resolveDerivation (storeDirectory store) drvPath drv (realisedOutputPath store)
+              prepared <- prepareResolvedBuild rootFd store mode drvPath resolved
+              resolvedPath <- writeResolvedDerivation rootFd store drvPath resolved
+              appendTempRoot rootFd resolvedPath
+              buildDerivationPrepared Nothing config rootFd store settings trace hook mode wanted drvPath prepared resolvedPath
+              pure Done
+          | otherwise -> do
+              -- C++ outputsSubstituted adds a substitution goal for every
+              -- source before inputsRealised.  A source may be a symlink whose
+              -- target is itself a required store reference, so register the
+              -- closure before the builder reads it.
+              sources <- sourceDependencies store drv
+              pure (Need ([(input, outputsOf, BuildJob)
+                | (input, outputsOf) <- Map.toList (inputDrvs drv)]
+                ++ [(downloadJobId source, Set.empty, DownloadJob) | source <- sources]))
+        CaDone -> pure Done
+        CaBuild -> do
+          if resolvedDerivation (Map.lookup "goonixResolved" (environment drv))
+            then buildDerivationNow Nothing config rootFd store settings trace hook mode wanted drvPath
+            else do
+              resolved <- resolveDerivation (storeDirectory store) drvPath drv (realisedOutputPath store)
+              resolvedPath <- writeResolvedDerivation rootFd store drvPath resolved
+              appendTempRoot rootFd resolvedPath
+              prepared <- prepareResolvedCaBuild drvPath resolved
+              buildDerivationPrepared Nothing config rootFd store settings trace hook mode wanted drvPath prepared resolvedPath
+          pure Done
+
+    -- prepareGoonixGoal has one decision for both unresolved and resolved
+    -- derivations.  prepareResolvedBuild selects only a valid path; a record's
+    -- invalid candidate is substituted before resolution, then the next pass
+    -- finishes without rebuilding it.
+    prepareCaGoalDecision originalPath drv wanted graphRequested = do
+      let selectedOutputs = if Set.null wanted then outputs drv else Map.restrictKeys (outputs drv) wanted
+          resolved = resolvedDerivation (Map.lookup "goonixResolved" (environment drv))
+      prepared <- if resolved then prepareResolvedBuild rootFd store mode originalPath drv else pure drv
+      choices <- forM (Map.toList (outputs prepared)) $ \(name, out) -> do
+        -- Unresolved prepareGoonixGoal uses the current choice, even before it
+        -- is valid.  Resolved prepareResolvedBuild exposes only a valid choice;
+        -- an invalid one remains a token until the local build fallback.
+        path <- chosenOutputForCurrentGraph store originalPath name
+        valid <- if B.null path then pure False else isValidPath store path
+        pure (C.unpack name, CaOutputChoice
+          (C.unpack (if resolved && not valid then B.empty else path)) valid (not (B.null path)))
+      alreadyRequested <- readIORef graphRequested
+      pure (prepareCaGoal CaDecisionInput
+        { decisionNormal = mode == Normal
+        , decisionResolved = resolved
+        , decisionTopGoal = Set.null wanted
+        , decisionGraphRequested = alreadyRequested
+        , decisionInputsRealised = False
+        , decisionGraphAvailable = maybe False (const True) config
+            && settingBool "build-use-substitutes" False settings
+            && not (null (C.words (setting "substitute-urls" "" settings)))
+        , decisionChoices = Map.fromList choices })
     -- C++ prepareResolvedBuild: root the choices, select each output's realised
     -- path; a check builds at the logical token, never the selected final path.
-    prepareResolvedCaBuild originalPath resolved = do
-      choices <- allChoices (database store) originalPath
-      mapM_ (appendTempRoot rootFd . snd) choices
-      selected <- selectGoonixOutputs store originalPath resolved
-      let withEnv = syncOutputEnv selected
-      if addressingOf (Map.lookup "goonixAddressing" (environment withEnv)) == Right Content && mode /= Normal
-        then pure (tokenOutputs originalPath withEnv)
-        else pure withEnv
+    prepareResolvedCaBuild originalPath resolved =
+      prepareResolvedBuild rootFd store mode originalPath resolved
     tokenOutputs originalPath drv' =
       let outputs' = Map.mapWithKey (\output out ->
             if not (B.null (outputHash out)) then out
@@ -314,9 +437,66 @@ buildDerivation attemptedDownloads discover config rootFd store settings trace h
             Just serverConfig | mode /= Check && settingBool "build-use-substitutes" False settings ->
               and <$> mapM (trySubstitute serverConfig rootFd store settings trace) requestedPaths
             _ -> pure False
-          if mode /= Repair && mode /= Check && substituted
+          candidateValid <- if goonixAddressed (Map.lookup "goonixAddressing" (environment drv)) && mode == Normal
+            then and <$> forM (Map.toList (outputs drv)) (\(name, out) -> do
+              chosen <- chosenOutputForCurrentGraph store drvPath name
+              if not (B.null chosen) && chosen == outputPath out
+                then isValidPath store chosen
+                else pure True)
+            else pure True
+          if mode /= Repair && mode /= Check && substituted && candidateValid
             then pure Done
-            else pure (Need [(input, selected, BuildJob) | (input, selected) <- Map.toList (inputDrvs drv)])
+            else do
+              sources <- sourceDependencies store drv
+              pure (Need ([(input, selected, BuildJob) | (input, selected) <- Map.toList (inputDrvs drv)]
+                ++ [(downloadJobId source, Set.empty, DownloadJob) | source <- sources]))
+
+prepareResolvedBuild :: Fd -> Store -> BuildMode -> ByteString -> Derivation -> IO Derivation
+prepareResolvedBuild rootFd store mode originalPath resolved = do
+  choices <- allChoices (database store) originalPath
+  mapM_ (appendTempRoot rootFd . snd) choices
+  selected <- forM (Map.toList (outputs resolved)) $ \(name, out) -> do
+    chosen <- chosenOutputForCurrentGraph store originalPath name
+    pure (name, if B.null chosen then out else out { outputPath = chosen })
+  let withEnv = resolved { outputs = Map.fromList selected }
+      synced = withEnv { environment = foldl (\env (name, out) ->
+        Map.insert name (outputPath out) env) (environment withEnv) (Map.toList (outputs withEnv)) }
+  if addressingOf (Map.lookup "goonixAddressing" (environment synced)) == Right Content && mode /= Normal
+    then do
+      -- C++ changes both the in-memory output and its environment entry to
+      -- the logical token for a check.  The resolved file keeps its own form.
+      let tokenised = synced
+            { outputs = Map.mapWithKey (\output out ->
+                if not (B.null (outputHash out)) then out else out
+                  { outputPath = tokenPath (storeDirectory store) output
+                    (storePathToName (storeDirectory store) (outputPath out)) }) (outputs synced) }
+      pure tokenised
+        { environment = foldl (\env (output, out) -> Map.insert output (outputPath out) env)
+            (environment tokenised) (Map.toList (outputs tokenised)) }
+    else pure synced
+
+-- | Execute a derivation already prepared by the CA decision.  Its output
+-- paths are not recomputed here; in particular an authenticated candidate is
+-- never replaced by its token after substitution.
+buildDerivationPrepared :: Maybe UserPool -> Maybe ServerConfig -> Fd -> Store -> Settings -> BuildTrace -> Maybe HookPool -> BuildMode -> Set.Set ByteString -> ByteString -> Derivation -> ByteString -> IO ()
+buildDerivationPrepared userPool config rootFd store settings trace hook mode wanted original drv path = do
+  appendTempRoot rootFd path
+  forM_ (Set.toList (inputSrcs drv)) $ \input -> do
+    present <- isValidPath store input
+    unless present $ throwIO (storeError ("input `" ++ C.unpack input ++ "' is not valid"))
+  buildWithHook userPool rootFd store settings trace hook mode original path drv
+
+daemonOwnedPrepared :: Maybe ServerConfig -> Maybe UserPool -> Settings -> BuildTrace -> Maybe HookPool -> BuildMode -> Set.Set ByteString -> ByteString -> Derivation -> ByteString -> IO ()
+daemonOwnedPrepared config userPool settings trace hook mode wanted original drv path = case config of
+  Nothing -> pure ()
+  Just serverConfig -> do
+    pid <- getProcessID
+    let rootPath = tempRootsDir serverConfig <> "/" <> C.pack (show pid <> "-goal-" <> C.unpack (storePathToName (configStore serverConfig) original))
+        gcPath = storeGcLockPathOf (configStore serverConfig) (configStateDirectory serverConfig)
+        tolerant = tolerantTrace trace
+    withTempRootFile rootPath gcPath $ \goalRootFd ->
+      bracket (openStore (configStore serverConfig) (configDatabase serverConfig) (configStateDirectory serverConfig)) closeStore $ \goalStore ->
+        buildDerivationPrepared userPool config goalRootFd goalStore settings tolerant hook mode wanted original drv path
 
 buildDerivationNow :: Maybe UserPool -> Maybe ServerConfig -> Fd -> Store -> Settings -> BuildTrace -> Maybe HookPool -> BuildMode -> Set.Set ByteString -> ByteString -> IO ()
 buildDerivationNow userPool config rootFd store settings trace hook mode wanted drvPath = do
@@ -418,8 +598,8 @@ buildWithHook userPool rootFd store settings trace pool mode originalPath drvPat
             if ready && mode == Normal then pure () else localBuild
         | otherwise = withOutputLocks $ do
             outcome <- bracketOnError (acquireHook settings currentPool)
-              (\hook -> writeIORef (fst currentPool) Nothing >> stopHook hook) $ \hook ->
-              offer currentPool hook
+              (\hook -> writeIORef (fst currentPool) Nothing >> stopHook hook) $ \hook -> do
+                offer currentPool hook
             case outcome of
               BuildRemotely hook -> do
                 -- Acceptance transfers the hook out of the pool.  The helper
@@ -1379,6 +1559,16 @@ prepareReferenceGraphs store work drv =
               parsed <- either (throwIO . storeError) pure (parseDerivation bytes)
               expanded <- mapM (referenceClosure store . outputPath) (Map.elems (outputs parsed))
               pure (Set.toAscList (Set.fromList (result ++ concat expanded)))
+
+-- | C++ outputsSubstituted schedules every direct input source, including a
+-- source which is itself a symlink to another store item.  A valid path may
+-- still have a missing reference, so include the whole known source closure.
+sourceDependencies :: Store -> Derivation -> IO [ByteString]
+sourceDependencies store drv = do
+  let sources = Set.toList (inputSrcs drv)
+  present <- mapM (isValidPath store) sources
+  closures <- mapM (referenceClosure store) [path | (path, ok) <- zip sources present, ok]
+  pure (Set.toList (Set.fromList (sources ++ concat closures)))
 
 referenceClosure :: Store -> RawFilePath -> IO [RawFilePath]
 referenceClosure store root = go Set.empty [root]

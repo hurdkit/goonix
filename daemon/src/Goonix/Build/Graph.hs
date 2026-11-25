@@ -14,17 +14,16 @@
 -- the single waitpid then releases the still-owned pid.  An empty reply
 -- retries the next cache (build-goonix.inc:323-332).
 --
--- Scope: this module performs queries and enforces their lifecycle.  It does
--- NOT yet import authenticated graph answers.  C++ parses/imports them at
--- build-goonix.inc:311-341 and local-store-ca.cc:195-284; that remains an open
--- HS-11 item, not working functionality claimed here.
+-- Complete replies are decoded and authenticated by Goonix.Store.CaStore, as
+-- C++ does at build-goonix.inc:334 and local-store-ca.cc:195-284.  A refused
+-- reply retries the next cache; the ordinary local build remains the fallback.
 module Goonix.Build.Graph
   ( runGraphLookup
   ) where
 
 import Control.Concurrent (forkIO, threadDelay)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, newMVar, putMVar, readMVar, tryPutMVar, tryReadMVar, withMVar)
-import Control.Exception (SomeException, catch, finally)
+import Control.Exception (SomeException, catch, finally, try)
 import Control.Monad (void, when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as B
@@ -35,6 +34,8 @@ import Foreign.C.Types (CInt (..))
 import Foreign.Marshal.Alloc (alloca)
 import Foreign.Ptr (Ptr)
 import Foreign.Storable (peek)
+import Goonix.Store.CaStore (importGoonixGraph)
+import Goonix.Store.ReadOnly (Store)
 import Goonix.Store.Settings (Settings, settingInt)
 import Goonix.Store.Substitute (packSettings)
 import System.IO (Handle, hClose, hFlush)
@@ -49,7 +50,7 @@ foreign import ccall safe "goonix_waitid_nowait"
 foreign import ccall unsafe "goonix_spawn_helper"
   c_spawn_helper :: CString -> CString -> CInt -> CInt -> CInt -> CString -> Ptr CInt -> IO CInt
 
-data Answer = NoGraph | GraphAnswer deriving (Eq, Show)
+data Answer = NoGraph | GraphAnswer ByteString
 
 data GraphAgent = GraphAgent
   { graphPid :: ProcessID
@@ -61,12 +62,11 @@ data GraphAgent = GraphAgent
   , graphAnswer :: MVar Answer
   }
 
--- | Try each cache as C++ GoonixGraphGoal::retry does.  A usable answer is not
--- imported yet (see the module's explicit scope note); an empty/no-graph reply
--- moves to the next cache.  Every path is local-build success, never a failure.
-runGraphLookup :: Settings -> ByteString -> ByteString -> [ByteString]
+-- | Try each cache as C++ GoonixGraphGoal::retry does.  A no-graph or refused
+-- reply moves to the next cache.  Every path is local-build success.
+runGraphLookup :: Fd -> Store -> Settings -> ByteString -> ByteString -> [ByteString]
                -> (ByteString -> IO ()) -> IO ()
-runGraphLookup settings guixProgram drvPath caches emit = go caches
+runGraphLookup rootFd store settings guixProgram drvPath caches emit = go caches
   where
     go [] = pure ()
     go (cache:rest) = do
@@ -76,7 +76,17 @@ runGraphLookup settings guixProgram drvPath caches emit = go caches
         Just agent -> do
           answer <- (readMVar (graphAnswer agent)) `finally` stopGraphAgent agent
           case answer of
-            GraphAnswer -> pure ()
+            GraphAnswer bytes -> do
+              imported <- importGraphReply rootFd store drvPath bytes
+              case imported of
+                Right () -> emit ("goonix: graph sharing for `" <> drvPath <> "': answer imported\n")
+                Left message -> do
+                  emit ("goonix: graph cache for `" <> drvPath <> "': answer refused: "
+                    <> C.pack message <> "\n")
+                  go rest
+            -- A helper can exit or close its reply pipe without answering.
+            -- C++ retries the next configured cache instead of returning a
+            -- non-exhaustive result to the scheduler.
             NoGraph -> go rest
 
     startOne cache = do
@@ -109,7 +119,7 @@ runGraphLookup settings guixProgram drvPath caches emit = go caches
               kill = withMVar lock $ \alreadyReaped ->
                 when (not alreadyReaped) $
                   signalProcess sigKILL pid `catch` \(_ :: SomeException) -> pure ()
-          _ <- forkIO $ drainLog logRead
+          _ <- forkIO $ drainLog logRead emit
           _ <- forkIO $ drainReply replyRead answer
           _ <- forkIO $ do
             threadDelay (settingInt "build-graph-timeout" 15 settings * 1000000)
@@ -129,19 +139,16 @@ runGraphLookup settings guixProgram drvPath caches emit = go caches
             putMVar reaped ()
           pure (Just agent)
 
-    drainLog handle = do
+    drainLog handle emit = do
       let loop = do
             bytes <- fdRead handle 65536 `catch` \(_ :: SomeException) -> pure B.empty
-            if B.null bytes then pure () else loop
+            if B.null bytes then pure () else emit bytes >> loop
       loop
       closeFd handle `catch` \(_ :: SomeException) -> pure ()
 
     drainReply handle answer = do
       accumulated <- newIORef B.empty
-      let tailLoop = do
-            chunk <- fdRead handle 65536 `catch` \(_ :: SomeException) -> pure B.empty
-            if B.null chunk then pure () else tailLoop
-          loop = do
+      let loop = do
             chunk <- fdRead handle 65536 `catch` \(_ :: SomeException) -> pure B.empty
             if B.null chunk
               then do
@@ -155,15 +162,58 @@ runGraphLookup settings guixProgram drvPath caches emit = go caches
                   Nothing -> loop
                   Just result -> do
                     void (tryPutMVar answer result)
-                    -- Drain through EOF so the server's close event is logged.
-                    tailLoop
                     closeFd handle `catch` \(_ :: SomeException) -> pure ()
       loop
 
+-- | Decode C++ goonixGraphReply: records precede hints; each field is an
+-- independently hex-encoded byte string.  Hints remain advisory names until
+-- importGoonixGraph finds a locally resolved, authenticated matching record.
+importGraphReply :: Fd -> Store -> ByteString -> ByteString -> IO (Either String ())
+importGraphReply rootFd store drvPath bytes = do
+  result <- try $ case C.lines bytes of
+    marker:countText:rest | marker == "goonix-records 1" ->
+      case decimal countText of
+        Just records -> case splitAt (records * 7) rest of
+          (recordFields, hintCountText:hintFields) -> case decimal hintCountText of
+            Just hints | length hintFields == hints * 3 -> do
+              decoded <- traverse decodeHex (recordFields ++ hintFields)
+              let (encodedRecords, encodedHints) = splitAt (records * 7) decoded
+              offered <- traverse decodeRecord (chunksOf 7 encodedRecords)
+              let choices = [ (original, output, path)
+                            | [original, output, path] <- chunksOf 3 encodedHints ]
+              importGoonixGraph rootFd store drvPath offered choices
+            _ -> ioError (userError "graph reply has inconsistent field counts")
+          _ -> ioError (userError "graph reply has inconsistent field counts")
+        _ -> ioError (userError "invalid graph record count")
+    _ -> ioError (userError "invalid graph response marker")
+  pure $ case result of
+    Left (exception :: SomeException) -> Left (show exception)
+    Right () -> Right ()
+  where
+    decimal text = case C.readInteger text of
+      Just (number, "") -> Just (fromInteger number :: Int)
+      _ -> Nothing
+    decodeRecord [hash, resolved, output, path, origin, checked, signature] =
+      pure (hash, resolved, output, path, origin, checked == "1", signature)
+    decodeRecord _ = ioError (userError "graph reply has inconsistent field counts")
+    chunksOf _ [] = []
+    chunksOf count values = take count values : chunksOf count (drop count values)
+    decodeHex encoded
+      | odd (B.length encoded) = ioError (userError "odd graph field encoding")
+      | otherwise = B.pack <$> traverse decodeByte [0, 2 .. B.length encoded - 2]
+      where
+        decodeByte at = case (hexDigit (B.index encoded at), hexDigit (B.index encoded (at + 1))) of
+          (Just high, Just low) -> pure (fromIntegral (high * 16 + low))
+          _ -> ioError (userError "invalid graph field encoding")
+    hexDigit byte
+      | byte >= 48 && byte <= 57 = Just (fromIntegral byte - 48 :: Int)
+      | byte >= 97 && byte <= 102 = Just (fromIntegral byte - 87)
+      | byte >= 65 && byte <= 70 = Just (fromIntegral byte - 55)
+      | otherwise = Nothing
+
 -- | Nothing = a complete response has not arrived yet.  Just NoGraph means an
--- empty/invalid answer and Just GraphAnswer a non-empty one.  This is the
--- framing of parseGoonixGraphResponse (build-goonix-response.cc:7-39), used
--- here only for lifecycle and retry; the payload is not adopted.
+-- empty/invalid answer and Just GraphAnswer a complete non-empty one.  This is
+-- the framing of parseGoonixGraphResponse (build-goonix-response.cc:7-39).
 responseStatus :: ByteString -> Maybe Answer
 responseStatus bytes
   | B.length bytes > 128 * 1024 * 1024 = Just NoGraph
@@ -188,7 +238,7 @@ responseStatus bytes
                       let remaining = fields !! hintIndex : drop (hintIndex + 1) fields
                       in if length remaining < 1 + hints * 3 || not (B.isSuffixOf "\n" bytes)
                         then Nothing
-                        else Just (if records == 0 && hints == 0 then NoGraph else GraphAnswer)
+                        else Just (if records == 0 && hints == 0 then NoGraph else GraphAnswer bytes)
   where
     decimal text = case C.readInteger text of
       Just (number, "") -> Just (fromInteger number :: Int)
