@@ -173,6 +173,8 @@ EXTRA_DIST += \
   daemon/test/differential/offload-eof.sh daemon/test/differential/offload-eof.hs \
   daemon/test/differential/offload-flood.sh daemon/test/differential/offload-flood.hs \
   daemon/test/differential/offload-flood-helper.sh \
+  daemon/test/differential/sandbox-plan-stable.hs \
+  daemon/test/differential/sandbox-plan-stable.sh \
   daemon/test/differential/export-memory.sh daemon/test/differential/export-memory.scm \
   daemon/test/differential/nar-memory.sh daemon/test/differential/nar-memory.scm \
   daemon/test/differential/substitute-log-flood.sh daemon/test/differential/substitute-log-flood.scm \

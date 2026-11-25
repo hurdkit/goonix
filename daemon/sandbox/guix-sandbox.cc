@@ -1282,6 +1282,19 @@ const std::vector<Phase> phases = {
 
 int main(int argc, char ** argv)
 {
+    if (argc == 3 && strcmp(argv[1], "--parse-plan") == 0) {
+        try {
+            Plan plan = readAndParsePlan(argv[2]);
+            (void)plan;
+            static const char valid[] = "valid sandbox plan\n";
+            ssize_t ignored = write(STDOUT_FILENO, valid, sizeof(valid) - 1);
+            (void)ignored;
+            return 0;
+        } catch (const std::exception & error) {
+            writeFull(STDERR_FILENO, Bytes("guix-sandbox: ") + error.what() + "\n");
+            return 1;
+        }
+    }
     if (argc != 2) {
         static const char usage[] = "usage: guix-sandbox PLAN\n";
         write(STDERR_FILENO, usage, sizeof(usage) - 1);

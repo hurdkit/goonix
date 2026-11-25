@@ -62,6 +62,11 @@ run wait-stack bash "$here/wait-stack.sh" "$root"
 run offload-idle bash "$here/offload-idle.sh" "$root"
 run offload-eof bash "$here/offload-eof.sh" "$root"
 run offload-flood bash "$here/offload-flood.sh" "$root"
+if test -x "$root/guix-sandbox"; then
+  run sandbox-plan-stable bash "$here/sandbox-plan-stable.sh" "$root"
+else
+  echo "SKIP: sandbox-plan-stable (build guix-sandbox to enable its parser check)"
+fi
 if test $rc -eq 0; then
   echo "ALL REGRESSIONS PASS"
 else
