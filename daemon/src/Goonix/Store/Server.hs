@@ -59,10 +59,11 @@ import System.Posix.User (getRealUserID)
 import System.IO (hPutStrLn, stderr)
 
 serve :: ServerConfig -> IO ()
-serve config = do
-  socketPath <- getEnv "GUIX_DAEMON_SOCKET"
-  let path = maybe (configStateDirectory config <> "/daemon-socket/socket") id socketPath
-  serveSocket config path
+serve config =
+  -- C++ listening_sockets with no options uses settings.nixDaemonSocketFile,
+  -- derived from nixStateDir (guix-daemon.cc:396, globals.cc:68).  The
+  -- client's GUIX_DAEMON_SOCKET must not redirect this daemon elsewhere.
+  serveSocket config (configStateDirectory config <> "/daemon-socket/socket")
 
 serveSocket :: ServerConfig -> ByteString -> IO ()
 serveSocket config path = do
