@@ -10,7 +10,7 @@ assert :: String -> Bool -> IO ()
 assert name condition = unless condition (error ("CA decision failed: " ++ name))
 
 base :: CaDecisionInput
-base = CaDecisionInput True False True False True True
+base = CaDecisionInput True False True False True True False
   (Map.fromList [("out", CaOutputChoice "" False False)])
 
 choice :: String -> Bool -> Map.Map String CaOutputChoice
@@ -32,6 +32,9 @@ main = do
         , ("valid unresolved choice is done", base { decisionChoices = choice "chosen" True }, CaDone)
         , ("check of unresolved valid choice resolves and builds", base { decisionNormal = False, decisionChoices = choice "chosen" True }, CaBuild)
         , ("missing chosen output is substituted", base { decisionChoices = choice "chosen" False }, CaSubstituteOutputs)
+        , ("settled missing selected output falls back to local build",
+            base { decisionChoices = choice "chosen" False, decisionSubstitutionSettled = True,
+                   decisionInputsRealised = True }, CaLocalBuild)
         , ("valid resolved choice is done", base { decisionResolved = True, decisionChoices = choice "chosen" True }, CaDone)
         , ("missing resolved chosen output is substituted", base { decisionResolved = True, decisionChoices = choice "chosen" False }, CaSubstituteOutputs)
         , ("unselected resolved output builds", base { decisionResolved = True, decisionChoices = token }, CaBuild)

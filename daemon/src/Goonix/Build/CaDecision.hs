@@ -30,10 +30,11 @@ data CaDecisionInput = CaDecisionInput
   , decisionGraphRequested :: !Bool
   , decisionGraphAvailable :: !Bool
   , decisionInputsRealised :: !Bool
+  , decisionSubstitutionSettled :: !Bool
   , decisionChoices :: !(Map.Map String CaOutputChoice)
   } deriving (Eq, Show)
 
-data CaGoalAction = CaDone | CaGraph | CaSubstituteOutputs | CaSubstituteInputs | CaBuild
+data CaGoalAction = CaDone | CaGraph | CaSubstituteOutputs | CaSubstituteInputs | CaBuild | CaLocalBuild
   deriving (Eq, Show)
 
 data CaGoalDecision = CaGoalDecision
@@ -57,6 +58,10 @@ prepareCaGoal input = CaGoalDecision action (Map.map choicePath (decisionChoices
           && not (decisionGraphRequested input)
           && decisionTopGoal input && decisionGraphAvailable input
           && not (any hasChoice choices) = CaGraph
+      | decisionSubstitutionSettled input && decisionInputsRealised input
+          && any missingChoice choices && not (decisionResolved input) = CaLocalBuild
+      | decisionSubstitutionSettled input && any missingChoice choices
+          && not (decisionResolved input) = CaSubstituteInputs
       | decisionNormal input && any missingChoice choices = CaSubstituteOutputs
       | decisionNormal input && not (decisionResolved input)
           && not (decisionGraphRequested input)

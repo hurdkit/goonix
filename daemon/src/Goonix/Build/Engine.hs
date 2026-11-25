@@ -174,6 +174,7 @@ buildThingsInternal config rootFd store settings trace hook things mode cancel =
           phase <- newIORef False
           graphRequested <- newIORef False
           inputsRealised <- newIORef False
+          substitutionSettled <- newIORef False
           pure JobSpec
             { jobId = path, jobWanted = wanted, jobKind = BuildJob
             , jobRun = \requested -> do
@@ -184,7 +185,7 @@ buildThingsInternal config rootFd store settings trace hook things mode cancel =
                     drv <- either (throwIO . storeError) pure (parseDerivation bytes)
                     if goonixAddressed (Map.lookup "goonixAddressing" (environment drv))
                       then do
-                        decision <- prepareCaGoalDecision path drv requested graphRequested inputsRealised
+                        decision <- prepareCaGoalDecision substitutionSettled path drv requested graphRequested inputsRealised
                         case decisionAction decision of
                           CaGraph -> do
                             writeIORef graphRequested True
@@ -193,9 +194,22 @@ buildThingsInternal config rootFd store settings trace hook things mode cancel =
                             pure (Need ([(input, selected, BuildJob)
                               | (input, selected) <- Map.toList (inputDrvs drv)]
                               ++ [(path <> "\0graph", Set.empty, GraphJob)]))
-                          CaSubstituteOutputs -> pure (Need [(downloadJobId (C.pack output), Set.empty, DownloadJob)
-                            | output <- Map.elems (decisionOutputs decision), not (null output)])
+                          CaSubstituteOutputs -> do
+                            writeIORef substitutionSettled True
+                            pure (Need [(downloadJobId (C.pack output), Set.empty, DownloadJob)
+                              | output <- Map.elems (decisionOutputs decision), not (null output)])
                           CaDone -> pure Done
+                          CaLocalBuild -> do
+                            -- C++ resolveGoonixBuild, followed by
+                            -- goonixPrepareLocalBuild: a failed selected-output
+                            -- fetch falls back to the logical token, never to
+                            -- another substitution of the collected path.
+                            resolved <- resolveDerivation (storeDirectory store) path drv (realisedOutputPath store)
+                            resolvedPath <- writeResolvedDerivation rootFd store path resolved
+                            appendTempRoot rootFd resolvedPath
+                            selected <- selectGoonixOutputs store path resolved
+                            prepared <- prepareLocalCaBuild rootFd store jobMode path selected
+                            buildPhaseWith requested path prepared resolvedPath
                           CaBuild -> do
                             -- C++ resolveGoonixBuild stores the resolved
                             -- derivation before prepareResolvedBuild applies
@@ -215,8 +229,11 @@ buildThingsInternal config rootFd store settings trace hook things mode cancel =
                             prepared <- prepareResolvedBuild rootFd store jobMode path selected
                             buildPhaseWith requested path prepared resolvedPath
                           CaSubstituteInputs -> do
+                            -- C++ goonixRealiseInputsFirst clears wantedOutputs
+                            -- before adding input waitees.  Do not restart a
+                            -- completed input for a collected selected output.
                             writeIORef inputsRealised True
-                            pure (Need [(input, selected, BuildJob)
+                            pure (Need [(input, Set.empty, BuildJob)
                               | (input, selected) <- Map.toList (inputDrvs drv)])
                       else buildPhase requested
                   else do
@@ -254,7 +271,7 @@ buildThingsInternal config rootFd store settings trace hook things mode cancel =
                         (daemonOwnedBuild config userPool settings trace hook jobMode requested path)
                       _ -> buildDerivationNow userPool config rootFd store settings trace hook jobMode requested path
                     pure Done
-            prepareCaGoalDecision originalPath drv wanted graphRequested inputsRealised = do
+            prepareCaGoalDecision substitutionSettled originalPath drv wanted graphRequested inputsRealised = do
               let resolved = resolvedDerivation (Map.lookup "goonixResolved" (environment drv))
               prepared <- if resolved then prepareResolvedBuild rootFd store jobMode originalPath drv else pure drv
               choices <- forM (Map.toList (outputs prepared)) $ \(name, out) -> do
@@ -265,12 +282,14 @@ buildThingsInternal config rootFd store settings trace hook things mode cancel =
                     then B.empty else chosen)) valid (not (B.null chosen)))
               alreadyRequested <- readIORef graphRequested
               realised <- readIORef inputsRealised
+              settled <- readIORef substitutionSettled
               pure (prepareCaGoal CaDecisionInput
                 { decisionNormal = jobMode == Normal
                 , decisionResolved = resolved
                 , decisionTopGoal = Set.null wanted
                 , decisionGraphRequested = alreadyRequested
                 , decisionInputsRealised = realised
+                , decisionSubstitutionSettled = settled
                 , decisionGraphAvailable = maybe False (const True) config
                     && settingBool "build-use-substitutes" False settings
                 , decisionChoices = Map.fromList choices })
@@ -402,6 +421,7 @@ buildDerivation attemptedDownloads discover graphRequested config rootFd store s
         , decisionTopGoal = Set.null wanted
         , decisionGraphRequested = alreadyRequested
         , decisionInputsRealised = False
+        , decisionSubstitutionSettled = False
         , decisionGraphAvailable = maybe False (const True) config
             && settingBool "build-use-substitutes" False settings
             && not (null (C.words (setting "substitute-urls" "" settings)))
@@ -455,6 +475,21 @@ buildDerivation attemptedDownloads discover graphRequested config rootFd store s
               sources <- sourceDependencies store drv
               pure (Need ([(input, selected, BuildJob) | (input, selected) <- Map.toList (inputDrvs drv)]
                 ++ [(downloadJobId source, Set.empty, DownloadJob) | source <- sources]))
+
+prepareLocalCaBuild :: Fd -> Store -> BuildMode -> ByteString -> Derivation -> IO Derivation
+prepareLocalCaBuild rootFd store mode originalPath resolved = do
+  prepared <- prepareResolvedBuild rootFd store mode originalPath resolved
+  if mode /= Normal
+    then pure prepared
+    else do
+      let tokenised = prepared
+            { outputs = Map.mapWithKey (\output out ->
+                if not (B.null (outputHash out)) then out else out
+                  { outputPath = tokenPath (storeDirectory store) output
+                    (storePathToName (storeDirectory store) (outputPath out)) }) (outputs prepared) }
+      pure tokenised
+        { environment = foldl (\env (output, out) -> Map.insert output (outputPath out) env)
+            (environment tokenised) (Map.toList (outputs tokenised)) }
 
 prepareResolvedBuild :: Fd -> Store -> BuildMode -> ByteString -> Derivation -> IO Derivation
 prepareResolvedBuild rootFd store mode originalPath resolved = do
