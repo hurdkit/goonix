@@ -15,10 +15,17 @@
 #         pass more.  Never default to nproc.
 #   IMPL  the checkout to build.  Default: this script's own tree.
 #
-# It is idempotent: bootstrap only when configure is absent, configure only when
-# config.status is absent, then make (which is a no-op when everything is
-# current).  It ends by asserting the compiled-module precondition, so a job
-# that calls only this script still cannot proceed on a stale tree.
+# It is idempotent: bootstrap only when configure is absent, configure when
+# config.status is absent or still selects the legacy shared root, then make
+# (which is a no-op when everything is current).  It ends by asserting the
+# compiled-module precondition, so a job that calls only this script still
+# cannot proceed on a stale tree.
+#
+# GOONIX_TEST_ROOT selects the complete test root: store, database and keys.
+# Otherwise derive four hex digits from the absolute worktree path.  The root
+# has the same length as the historical /tmp/gxv-test, so derivation paths do
+# not change length.  A .owner file prevents a different worktree from using it.
+# No test root is wiped here; the counted runner wipes its own store and state.
 set -euo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 JOBS=${1:-${GOONIX_GATE_JOBS:-6}}
@@ -26,17 +33,53 @@ IMPL=${2:-$(cd "$HERE/.." && pwd -P)}
 case "$JOBS" in ''|*[!0-9]*) echo "prepare-tree: JOBS must be a number, got '$JOBS'" >&2; exit 2;; esac
 [ "$JOBS" -ge 1 ] || JOBS=1
 cd "$IMPL"
+IMPL=$(pwd -P)
 echo "PREPARE_TREE=$IMPL"
 echo "PREPARE_JOBS=$JOBS"
+
+if [ -n "${GOONIX_TEST_ROOT:-}" ]; then
+  TEST_ROOT=$GOONIX_TEST_ROOT
+else
+  TEST_ROOT=/tmp/gxv-$(printf '%s' "$IMPL" | sha256sum | cut -c1-4)
+fi
+case "$TEST_ROOT" in /*) ;; *)
+  echo "prepare-tree: test root must be an absolute path: $TEST_ROOT" >&2
+  exit 2
+esac
+if [ "$TEST_ROOT" = /tmp/gxv-test ]; then
+  echo 'prepare-tree: refusing the legacy shared test root /tmp/gxv-test' >&2
+  exit 2
+fi
+if [ -z "${GOONIX_TEST_ROOT:-}" ]; then
+  case "$TEST_ROOT" in /tmp/gxv-????) ;; *)
+    echo "prepare-tree: derived test root has the wrong form: $TEST_ROOT" >&2
+    exit 2
+  esac
+fi
+# Check ownership before bootstrap, configure or make can touch the root.
+if [ -f "$TEST_ROOT/.owner" ] &&
+   [ "$(cat "$TEST_ROOT/.owner")" != "$IMPL" ]; then
+  echo "prepare-tree: $TEST_ROOT belongs to another worktree: $(cat "$TEST_ROOT/.owner")" >&2
+  exit 1
+fi
+mkdir -p "$TEST_ROOT"
+printf '%s\n' "$IMPL" > "$TEST_ROOT/.owner"
+echo "PREPARE_TEST_ROOT=$TEST_ROOT"
 
 build() {
   if [ ! -x ./configure ]; then
     echo '=== bootstrap ==='
     ./bootstrap
   fi
-  if [ ! -f ./config.status ]; then
-    echo '=== configure ==='
-    ./configure --localstatedir=/var --sysconfdir=/etc ac_cv_guix_test_root=/tmp/gxv-test
+  if [ ! -f ./config.status ] ||
+     grep -Fqx 'S["GUIX_TEST_ROOT"]="/tmp/gxv-test"' ./config.status; then
+    if [ -f ./config.status ]; then
+      echo '=== reconfigure: legacy shared test root ==='
+    else
+      echo '=== configure ==='
+    fi
+    ./configure --localstatedir=/var --sysconfdir=/etc \
+      ac_cv_guix_test_root="$TEST_ROOT"
   fi
   # The generated header the daemon sources include; make it first so a -j
   # build cannot race it (measured on z2: local-store.cc failed with

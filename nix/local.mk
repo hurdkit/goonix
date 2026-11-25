@@ -73,6 +73,8 @@ libstore_a_SOURCES =				\
 libstore_a_SOURCES +=				\
   %D%/libstore/records.cc			\
   %D%/libstore/ca.cc				\
+  %D%/libstore/ca-record-signature.cc		\
+  %D%/libstore/ca-record-signature.hh		\
   %D%/libstore/local-store-ca.cc			\
   %D%/libstore/build-ca.cc			\
   %D%/libstore/build-ca.hh			\

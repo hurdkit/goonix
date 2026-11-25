@@ -46,6 +46,9 @@ unset GUILE_LOAD_COMPILED_PATH
 
 if [ -x "@abs_top_builddir@/guix-daemon" ]
 then
+    # goonix: one test root per build tree, even when a caller forgets 92.
+    "@abs_top_srcdir@/build-aux/goonix-test-root-guard.sh" "@GUIX_TEST_ROOT@" "@abs_top_builddir@" || exit 1
+
     NIX_STORE_DIR="@GUIX_TEST_ROOT@/store"
 
     # Do that because store.scm calls `canonicalize-path' on it.

@@ -4,6 +4,7 @@
              (guix ca)
              (guix ca policy)
              (guix ca scan)
+             (gnu packages base)
              (guix sets)
              (guix derivations)
              (guix gexp)
@@ -362,8 +363,9 @@
             (string-suffix? "/TOP" (call-with-input-file out get-string-all)))))
       (test-equal "an inherited package is content-addressed from source"
         "content" (addressing (package-derivation store inherited)))
-      (test-equal "an opaque package stays resolved"
-        "resolved" (addressing (package-derivation store opaque))))))
+      (test-equal "an opaque package stays input-addressed and unadopted"
+        '(input #f)
+        (list (package-addressing opaque) (adopt-package? opaque))))))
 
 (test-group "adopting a reference through one output realises the whole deriver"
   ;; A multi-output package referenced through ONE output (gcc:lib, glib:bin,
@@ -659,166 +661,23 @@ NarSize: 1234\nNarHash: sha256:~a\nReferences: \nSystem: ~a\nDeriver: ~a\n"
                             #:env-vars '(("goonixProbe" . "yes"))))))
      "goonixProbe")))
 
-(test-group "a package re-lowered from source under adopted is content-addressed"
-  ;; CA-6 gate run 9 stopped at glibc-2.41.drv:
-  ;;   input-addressed derivation depends on content/resolved-addressed
-  ;;   `...-gawk-boot0-5.3.0.drv'; mark the dependent as content-addressed too
-  ;;
-  ;; adopt.scm never adopts glibc (glibc-derivation? is a name-prefix test):
-  ;; adopt-derivation returns the derivation unchanged and
-  ;; adopt-lowered-derivation re-lowers it "content-addressed from source".
-  ;; That re-lowering runs inside the OUTER (state-parameterize
-  ;; ((%package-addressing-policy 'input)) ...), and it sets only
-  ;; %package-addressing to 'content.  lower-bag-with-addressing then OVERWRITES
-  ;; %package-addressing with (package-addressing context), which under the
-  ;; 'input policy returns 'input.  So the re-lowered glibc came out
-  ;; input-addressed over adopted (content-addressed) inputs, and the daemon
-  ;; rightly refused it -- the same class as module-import-compiled earlier.
-  ;;
-  ;; A package named glibc-* takes exactly that path.  Two earlier attempts are
-  ;; recorded so they are not repeated:
-  ;;  v1 plain trivial inputs: PASSED 68/68.  The re-lowered bag's inputs are
-  ;;     lowered inside the same 'input extent, so they stay input-addressed
-  ;;     and nothing is inconsistent.
-  ;;  v2 an already-adopted input, built eagerly: reproduced the gate's EXACT
-  ;;     refusal, but it was thrown by (build-derivations ... leaf) OUTSIDE any
-  ;;     catch, so the group aborted with zero assertions run.
-  ;; So the whole fixture runs inside one catch, and the refusal is reported as
-  ;; a failed assertion rather than killing the suite.
-  (define outcome
-    (catch #t
-      (lambda ()
-        (let* ((leaf (trivial "ca-policy-relower-leaf"
-                              #~(call-with-output-file #$output
-                                  (lambda (p) (display "LEAF" p)))))
-               (adopted-leaf
-                (parameterize ((%package-addressing-policy 'adopted)
-                               (%upstream-package?
-                                (upstream-package-set
-                                 (list->setq (list leaf %bootstrap-guile)))))
-                  (let ((d (package-derivation store leaf)))
-                    (build-derivations store (list d))
-                    d)))
-               ;; glibc-like: its input is the ADOPTED content-addressed item.
-               (glibc-like (trivial "glibc-ca-policy-relower"
-                                    #~(call-with-output-file #$output
-                                        (lambda (p)
-                                          (format p "~a/GLIBC" #$adopted-leaf))))))
-          (parameterize ((%package-addressing-policy 'adopted)
-                         (%upstream-package?
-                          (upstream-package-set
-                           (list->setq (list leaf glibc-like %bootstrap-guile)))))
-            (let ((drv (package-derivation store glibc-like)))
-              (build-derivations store (list drv))
-              (list (addressing adopted-leaf) (addressing drv))))))
-      (lambda (key . args)
-        ;; Name the refusal, so a failure cannot be mistaken for a fixture
-        ;; problem: the daemon's message is the point of this test.
-        (format #t "re-lower refused: ~a ~a~%" key args)
-        (list 'refused key))))
-  (test-assert "a glibc-like package over an adopted input lowers and builds"
-    (not (and (pair? outcome) (eq? 'refused (car outcome)))))
-  (test-equal "the adopted input is content-addressed"
-    "content" (and (pair? outcome) (car outcome)))
-  (test-equal "the re-lowered package is content-addressed, not input"
-    "content" (and (pair? outcome) (cadr outcome))))
-
-(test-group "glibc's content mark does not widen to what its build lowers"
-  ;; The mark is on glibc's OWN derivation.  The POLICY must stay 'adopted
-  ;; inside its bag lowering, so everything lowered there is ADOPTED - a
-  ;; graft over the input-addressed item its peers use - not re-lowered
-  ;; content-addressed FROM SOURCE.
-  ;;
-  ;; Measured cost of widening it: with the policy 'content for the whole
-  ;; extent, a glibc-named package using (default-guile) got a FROM-SOURCE
-  ;; guile-3.0 (its own guile-3.0.9.tar input, a 198-derivation closure)
-  ;; instead of a graft.
-  ;;
-  ;; The property asserted here is the one that actually separates the two
-  ;; scopes: glibc's derivation closure must contain NO fresh from-source
-  ;; content-addressed lowering of an upstream package.  A graft is fine
-  ;; (it reuses a built item); a non-graft content-addressed derivation of an
-  ;; upstream package is the from-source re-lowering.
-  ;;
-  ;; An earlier version of this test compared the builder guile after
-  ;; normalising a graft to the item it rewrites.  That did NOT distinguish
-  ;; the scopes - widening the override still passed 72/0 - because the wide
-  ;; scope hands glibc the plain input-addressed guile and the narrow one a
-  ;; graft over that same guile, so both normalise to one path.  Recorded so
-  ;; the weaker assertion is not reintroduced.
-  (define (graft? d)
-    ;; A graft imports (guix ca build graft) in its builder script; the
-    ;; "__file:..." environment entry holds that script's TEXT inline
-    ;; (measured), not a path to it.
-    (any (lambda (entry)
-           (and (string-prefix? "__file:" (car entry))
-                (string? (cdr entry))
-                (string-contains (cdr entry) "(guix ca build graft)")))
-         (derivation-builder-environment-vars d)))
-  (define (closure drv)
-    (let ((table (make-hash-table)))
-      (let visit ((d drv))
-        (unless (hash-ref table (derivation-file-name d))
-          (hash-set! table (derivation-file-name d) d)
-          (for-each (lambda (i) (visit (derivation-input-derivation i)))
-                    (derivation-inputs d))))
-      (hash-map->list (lambda (k v) v) table)))
-  (let* ((leaf (trivial "ca-policy-scope-leaf"
-                        #~(call-with-output-file #$output
-                            (lambda (p) (display "L" p)))))
-         (glibc-like (trivial "glibc-ca-policy-scope"
-                              #~(call-with-output-file #$output
-                                  (lambda (p) (format p "~a/G" #$leaf)))
-                              `(("leaf" ,leaf)))))
-    (parameterize ((%package-addressing-policy 'adopted)
-                   (%upstream-package?
-                    (upstream-package-set
-                     (list->setq (list leaf glibc-like %bootstrap-guile)))))
-      (let* ((g (package-derivation store glibc-like))
-             ;; Upstream PACKAGES re-lowered from source inside the extent:
-             ;; content-addressed, NOT a graft, and not glibc itself.
-             ;; module-import / module-import-compiled are not packages: they
-             ;; are the compiled build modules, content-addressed by design
-             ;; and shared with every other package (measured: the same
-             ;; 8jwj8r0h… derivation in both closures), so they are excluded.
-             (from-source
-              (filter (lambda (d)
-                        (let ((name (derivation-name d)))
-                          (and (equal? "content" (addressing d))
-                               (not (graft? d))
-                               (not (glibc-name? name))
-                               (not (string-prefix? "module-import" name)))))
-                      (closure g))))
-        (test-equal "glibc's own derivation is content-addressed"
-          "content" (addressing g))
-        (test-equal "nothing upstream is re-lowered from source inside glibc"
-          '() (map (lambda (d) (basename (derivation-file-name d)))
-                   from-source))))))
+(test-group "the adopted policy retains opaque input addressing"
+  (parameterize ((%package-addressing-policy 'adopted))
+    (test-equal "a tabled package is not adopted"
+      #f (adopt-package? glibc))
+    (test-equal "a property-marked non-glibc package is not adopted"
+      #f
+      (adopt-package?
+       (package (inherit hello)
+         (properties '((self-references . opaque))))))
+    (test-equal "an ordinary package still follows input then adopt"
+      '(input #t)
+      (list (package-addressing hello) (adopt-package? hello)))))
 
 (test-group "an input-addressed request over adopted inputs is corrected"
-  ;; CA-6 gate, narrow glibc scope (699dc449953): the daemon refused
-  ;;   input-addressed derivation depends on content/resolved-addressed
-  ;;   `…-gawk-boot0-5.3.0.drv'; mark the dependent as content-addressed too
-  ;; while writing file-5.46.drv.
-  ;;
-  ;; Measured with a backtrace probe inside `derivation` (before the write,
-  ;; since the refusal happens inside add-data-to-store): the caller is an
-  ;; ordinary NESTED PACKAGE lowering - package->derivation -> bag->derivation
-  ;; -> expand-input -> package->derivation, three levels, all in
-  ;; guix/packages.scm - not a gexp compiler, lower-object or a graft.  At the
-  ;; leaking lowering the parameters were
-  ;;   POLICY=adopted MARK=input NAMEPARAM=#f addressing=input
-  ;; i.e. a gexp whose requested kind stayed 'input while its inputs had
-  ;; already been lowered content-addressed.
-  ;;
-  ;; gexp-addressing re-decided the kind from the ACTUAL inputs only under
-  ;; 'mixed; under 'adopted it returned the request unchanged.  The wide glibc
-  ;; scope hid this because the policy inside glibc's extent was 'content, so
-  ;; those gexps were content-addressed by the policy clause anyway.
-  ;;
-  ;; So 'adopted needs the same input-based correction 'mixed has.  An explicit
-  ;; #:addressing #f ("no override", used by grafts over input-addressed
-  ;; derivations) must still be honoured - that is asserted here too.
+  ;; An ordinary upstream gexp's input is adopted before the gexp is lowered.
+  ;; The gexp must follow that actual content-addressed input, while an
+  ;; explicit #:addressing #f (no override, as used by grafts) remains intact.
   (let* ((leaf (trivial "ca-policy-stale-input-leaf"
                         #~(call-with-output-file #$output
                             (lambda (p) (display "LEAF" p))))))

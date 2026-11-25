@@ -19,8 +19,12 @@
   #:use-module (guix ca scan)
   #:use-module (guix ca adopt)
   #:use-module (guix packages)
+  #:use-module (guix build-system)
   #:use-module (guix derivations)
+  #:use-module (ice-9 match)
+  #:use-module (srfi srfi-1)
   #:use-module (gnu packages base)
+  #:use-module (gnu packages bootstrap)
   #:use-module (gnu packages virtualization)
   #:use-module (gnu packages file)
   #:use-module (ice-9 binary-ports)
@@ -81,21 +85,10 @@
     (test-equal "a property-marked package lowers resolved"
       "resolved" (addressing (lower marked)))))
 
-(test-group "the boot path's packages are resolved under 'adopted too"
-  ;; A package the opaque table names must be marked resolved before it is
-  ;; built under EVERY policy that builds content-addressed items, including
-  ;; 'adopted.  A self reference the rewriter cannot reverse is found by the
-  ;; scanner only after the item exists, so an unmarked opaque package fails at
-  ;; finalisation instead of being built at its final path in the first place.
-  ;;
-  ;; The table applies under content/full/adopted; under mixed/input the
-  ;; upstream graph stays byte-identical and only the explicit opaque property
-  ;; marks a package.  Dependents of a tabled item are promoted out of input
-  ;; addressing, because an input-addressed derivation may not depend on a
-  ;; goonix-addressed one.
-  ;;
-  ;; The 'content assertions are here too so the two policies cannot drift
-  ;; apart again: a tabled package is resolved under both.
+(test-group "the opaque table applies under 'content without promotion under 'adopted"
+  ;; Under 'adopted a tabled package keeps its input address and is not
+  ;; adopted.  Its upstream dependents stay input-addressed before their own
+  ;; adoption.  Under 'content the table still selects resolved addressing.
   (define (addressing-under policy package)
     (parameterize ((%package-addressing-policy policy))
       (package-addressing package)))
@@ -106,9 +99,9 @@
          (format #f "~a is in the opaque table (sanity)" (package-name package))
        (opaque-package? package))
      (test-equal
-         (format #f "~a lowers resolved under 'adopted (the boot path)"
+         (format #f "~a stays input under 'adopted (option 2)"
                  (package-name package))
-       'resolved
+       'input
        (addressing-under 'adopted package))
      (test-equal
          (format #f "~a still lowers resolved under 'content (no drift)"
@@ -131,6 +124,117 @@
   (test-equal "an upstream unmarked package still lowers content under 'content"
     'content
     (addressing-under 'content hello)))
+
+(test-group "module compilation is cached per addressing policy"
+  (let* ((guile (parameterize ((%package-addressing-policy 'input)
+                               (%graft? #f))
+                  (package-derivation store %bootstrap-guile)))
+         (full (parameterize ((%package-addressing-policy 'full)
+                              (%graft? #f))
+                 (run-with-store store
+                   (gexp->derivation "ca-policy-module-cache"
+                                     #~(mkdir #$output)
+                                     #:guile-for-build guile
+                                     #:modules '((guix build utils))))))
+         (input (parameterize ((%package-addressing-policy 'input)
+                               (%graft? #f))
+                  (run-with-store store
+                    (gexp->derivation "ca-policy-module-cache"
+                                      #~(mkdir #$output)
+                                      #:guile-for-build guile
+                                      #:modules '((guix build utils)))))))
+    (test-equal "the full module builder is content-addressed"
+      "content" (addressing full))
+    (test-equal "the input module builder is input-addressed"
+      #f (addressing input))
+    (test-equal "the two policies have distinct module derivations"
+      #f (equal? (derivation-file-name full) (derivation-file-name input)))))
+
+(test-group "opaque adopted lowering is byte-identical to input lowering"
+  ;; No output is built here.  Grafts are disabled for both lowerings, so
+  ;; neither one needs the references of a realised grafted output.
+  (for-each
+   (lambda (package)
+     (let ((input (parameterize ((%package-addressing-policy 'input)
+                                 (%graft? #f))
+                    (package-derivation store package)))
+           (adopted (parameterize ((%package-addressing-policy 'adopted)
+                                   (%graft? #f))
+                      (package-derivation store package))))
+       (test-equal
+           (format #f "~a keeps its upstream .drv under 'adopted"
+                   (package-name package))
+         (derivation-file-name input)
+         (derivation-file-name adopted))))
+   (list glibc file qemu-minimal))
+  (let* ((marked (package (inherit hello)
+                   (properties '((self-references . opaque)))))
+         (input (parameterize ((%package-addressing-policy 'input)
+                               (%graft? #f))
+                  ;; An opaque property selects resolved addressing under
+                  ;; 'input too.  Compare against the otherwise identical
+                  ;; upstream package, not against that resolved derivation.
+                  (package-derivation store hello)))
+         (adopted (parameterize ((%package-addressing-policy 'adopted)
+                                 (%graft? #f))
+                    (package-derivation store marked))))
+    (test-equal "a property-marked package keeps its upstream .drv under 'adopted"
+      (derivation-file-name input)
+      (derivation-file-name adopted))))
+
+(test-group "option 2 keeps opaque items input-addressed and unadopted"
+  (define (under-adopted package)
+    (parameterize ((%package-addressing-policy 'adopted))
+      (list (package-addressing package) (adopt-package? package))))
+  (test-equal "hello keeps its input then adopt route"
+    '(input #t) (under-adopted hello))
+  (for-each
+   (lambda (package)
+     (test-equal
+         (format #f "~a stays input-addressed and unadopted under 'adopted"
+                 (package-name package))
+       '(input #f)
+       (under-adopted package)))
+   (list glibc file qemu-minimal))
+  (let ((marked (package (inherit hello)
+                  (properties '((self-references . opaque))))))
+    (test-equal "a property-marked non-glibc package is also unadopted"
+      '(input #f) (under-adopted marked))))
+
+(test-group "the adopted hello package closure respects opaque inputs"
+  ;; This is a package-graph invariant, not a count of changed objects and
+  ;; not a build.  Production package-addressing decides every edge.
+  (define (under-adopted package)
+    (parameterize ((%package-addressing-policy 'adopted))
+      (package-addressing package)))
+  (define records
+    (map (lambda (package)
+           (let ((bag (package->bag package)))
+             (cons package
+                   (parameterize ((%current-system (bag-system bag))
+                                  (%current-target-system (bag-target bag)))
+                     (filter-map
+                      (match-lambda ((label (? package? p) . _) p) (_ #f))
+                      (append (bag-build-inputs bag) (bag-host-inputs bag)
+                              (bag-target-inputs bag)))))))
+         (package-closure (list hello))))
+  (define (inputs package) (or (assq-ref records package) '()))
+  (test-assert "no input-addressed package has a non-input package input"
+    (every (lambda (record)
+             (let ((package (car record)))
+               (or (not (eq? 'input (under-adopted package)))
+                   (every (lambda (input)
+                            (eq? 'input (under-adopted input)))
+                          (inputs package)))))
+           records))
+  (test-assert "every opaque package in hello's closure stays input and unadopted"
+    (every (lambda (record)
+             (let ((package (car record)))
+               (or (not (opaque-package? package))
+                   (parameterize ((%package-addressing-policy 'adopted))
+                     (and (eq? 'input (package-addressing package))
+                          (not (adopt-package? package)))))))
+           records)))
 
 (test-group "a scan flags exactly the covered fixtures, not the rewritable ones"
   ;; "Every opaque package is marked" becomes a check: the scanner flags

@@ -23,10 +23,7 @@
 
 (define-module (test-publish)
   #:use-module (guix scripts publish)
-  #:autoload (guix ca records)
-             (build-graph-records build-records->expression
-                                  expression->build-records
-                                  expression->graph-choices) ;goonix: record transport
+  #:use-module (guix tests) ;goonix: record assertions live in ca-publish-records.scm
   #:use-module (guix tests)
   #:use-module (guix config)
   #:use-module ((guix utils) #:select (call-with-temporary-directory))
@@ -71,23 +68,7 @@
 
 (define %item (add-text-to-store %store "item" "bar" (list %reference)))
 
-(define %ca-derivation ;goonix: CA publish fixture
-  (let* ((guile-drv (package-derivation %store (@ (gnu packages bootstrap)
-                                                 %bootstrap-guile)))
-         (guile (string-append (derivation->output-path guile-drv)
-                               "/bin/guile")))
-    (derivation %store "publish-ca" guile
-                '("--no-auto-compile" "-c"
-                  "(call-with-output-file (getenv \"out\") (lambda (p) (display \"published\" p)))")
-                #:inputs (list (derivation-input guile-drv))
-                #:addressing 'content)))
-
-(build-derivations %store (list %ca-derivation))
-(define %ca-output
-  (realised-output-path %store %ca-derivation "out"))
-(define %ca-record
-  (build-graph-records %store (derivation-file-name %ca-derivation)))
-
+;; goonix: the CA fixture and record HTTP tests are in ca-publish-records.scm.
 (define (http-get-body uri)
   (call-with-values (lambda () (http-get uri))
     (lambda (response body) body)))
@@ -214,22 +195,7 @@ FileSize: ~a\n"
     (publish-uri
      (string-append "/" (store-path-hash-part %item) ".narinfo")))))
 
-(define %ca-record-expression
-  (call-with-input-string
-      (http-get-body
-       (publish-uri (string-append "/goonix/records/"
-                                   (basename
-                                    (derivation-file-name %ca-derivation)))))
-    read))
-
-(test-equal "/goonix/records/DERIVATION serves the signed graph" ;goonix: HTTP records
-  %ca-record
-  (expression->build-records %ca-record-expression))
-
-(test-assert "/goonix/records/DERIVATION serves unsigned choice hints"
-  (equal? (list (list (derivation-file-name %ca-derivation) "out"
-                      (realised-output-path %store %ca-derivation "out")))
-          (expression->graph-choices %ca-record-expression)))
+;; goonix: record graph responses are tested in ca-publish-records.scm.
 
 (test-equal "/*.narinfo pipeline"
   (make-list 500 200)
@@ -844,34 +810,7 @@ FileSize: ~a~%"
          (list (http-get (publish-uri path))
                (http-post (publish-uri path))))))
 
-;; A malformed record has its own refusal.  An unrelated renderer failure is
-;; not a record error and must escape rather than becoming a quiet 422.
-(let ((store (open-connection-for-tests)))
-  (let* ((drv (derivation store "publish-narrow-catch" "/bin/sh" '()
-                          #:addressing 'input))
-         (name (basename (derivation-file-name drv)))
-         (request (build-request
-                   (string->uri
-                    (string-append "http://localhost/goonix/records/" name))))
-         (render (@@ (guix scripts publish) render-goonix-records)))
-    (test-assert "publish does not swallow an unrelated graph exception"
-      (catch 'unrelated-test-error
-        (lambda ()
-          (mock ((guix ca records) build-graph-expression
-                 (lambda (store derivation)
-                   (throw 'unrelated-test-error "boom")))
-            (render store request name))
-          #f)
-        (lambda (key . args) #t)))
-    (test-assert "publish returns 422 for the invalid-record refusal"
-      (call-with-values
-          (lambda ()
-            (mock ((guix ca records) build-graph-expression
-                   (lambda (store derivation)
-                     (throw 'goonix-invalid-signature-encoding "bad record")))
-              (render store request name)))
-        (lambda (response body)
-          (and (response? response) (= 422 (response-code response))))))))
+;; goonix: record refusal and publisher-survival tests are in ca-publish-records.scm.
 
 (test-end "publish")
 

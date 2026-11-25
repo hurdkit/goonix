@@ -1117,7 +1117,9 @@ second element is the derivation to compile them."
                                              (return #f))))
              (return (cons modules compiled)))
            modules
-           system extensions guile deprecation-warnings module-path))
+           system extensions guile deprecation-warnings module-path
+           ((module-ref (resolve-module '(guix ca policy))
+                        'package-addressing-key)))) ;goonix: policy-sensitive module cache
 
 (define (sexp->string sexp)
   "Like 'object->string', but deterministic and slightly faster."
