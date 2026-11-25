@@ -74,6 +74,7 @@ SH_TESTS +=					\
   tests/guix-ca-async.sh			\
   tests/ca-async-lifecycle.sh			\
   tests/guix-ca-record-signature-publish.sh	\
+  tests/ca-graph-authentication.sh		\
   tests/guix-ca-two-store.sh			\
   tests/guix-ca-files.sh			\
   tests/guix-ca-second-machine.sh		\
@@ -94,6 +95,8 @@ EXTRA_DIST +=					\
   tests/ca-record-signature-publish-fixture.scm	\
   tests/ca-record-signature-publish-client.scm	\
   tests/ca-record-signature-cpp-client.scm	\
+  tests/ca-tampered-cache.scm			\
+  tests/ca-tampered-fixture.scm			\
   tests/ca-two-store-fixture.scm			\
   tests/ca-files-fixture.scm			\
   tests/ca-files-client.scm			\
