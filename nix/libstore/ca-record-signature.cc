@@ -6,6 +6,13 @@
 
 namespace nix {
 
+string canonicalGoonixRecordSignature(const string & signature)
+{
+    /* Only the signer's raw advanced S-expression gets the legacy conversion.
+       Other fields retain the existing strict base64 validation. */
+    return signature.starts_with("(") ? goonixBase64Encode(signature) : signature;
+}
+
 string signGoonixRecordPayload(LocalStore & store, const string & payload,
     SignGoonixRecord sign)
 {

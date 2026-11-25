@@ -1,5 +1,6 @@
 // goonix: build-record storage, selection policy and conflict tracking.
 #include "records.hh"
+#include "ca-record-signature.hh"
 #include "ca.hh"
 #include "serialise.hh"
 #include "util.hh"
@@ -53,6 +54,46 @@ create table if not exists GoonixConflicts (
 create index if not exists GoonixConflictLookup
     on GoonixConflicts(resolvedHash, output);
 )sql");
+
+    /* Choose one representation at the storage boundary.  A legacy raw
+       advanced S-expression and its base64 form are the same signature, not
+       two facts.  Do this at open so old raw/encoded twins also converge;
+       repeating it is a no-op once every row is canonical. */
+    auto txn = transaction();
+    SQLiteStmt rows;
+    rows.create(db, "select id, signature from GoonixBuildRecords "
+        "where substr(signature, 1, 1) = '(' order by id;");
+    std::vector<std::pair<int64_t, string>> legacy;
+    {
+        auto use = rows.use();
+        while (use.next()) {
+            auto bytes = (const char *) sqlite3_column_blob(rows, 1);
+            int size = sqlite3_column_bytes(rows, 1);
+            if (!bytes) throw Error("null legacy goonix record signature");
+            legacy.emplace_back(use.getInt(0), string(bytes, size));
+        }
+    }
+    for (auto & [id, raw] : legacy) {
+        string signature = canonicalGoonixRecordSignature(raw);
+        SQLiteStmt insert;
+        insert.create(db, "insert or ignore into GoonixBuildRecords "
+            "(resolvedHash, resolvedDerivation, output, path, origin, "
+            "relocationChecked, signature) select resolvedHash, resolvedDerivation, "
+            "output, path, origin, relocationChecked, ?2 from GoonixBuildRecords "
+            "where id = ?1;");
+        auto write = insert.use();
+        write(id);
+        if (sqlite3_bind_text(insert, 2, signature.data(), signature.size(),
+                SQLITE_TRANSIENT) != SQLITE_OK)
+            throwSQLiteError(db, "binding canonical record signature");
+        write.exec();
+        /* Either the canonical row was inserted or its twin already existed.
+           The old raw row is redundant in both cases. */
+        SQLiteStmt remove;
+        remove.create(db, "delete from GoonixBuildRecords where id = ?;");
+        remove.use()(id).exec();
+    }
+    txn.commit();
 }
 
 string canonicalBuildRecordPayload(const BuildRecord & record)
@@ -100,13 +141,31 @@ void BuildRecords::add(const BuildRecord & record)
         record.origin.empty() || record.signature.empty())
         throw Error("invalid or unsigned goonix build record");
     noteConflict(db, record);
+    const string signature = canonicalGoonixRecordSignature(record.signature);
+    /* The row may be a legacy raw fact discovered after this store opened.
+       Its stored bytes are not valid UTF-8, so compare decoded raw bytes as
+       blobs rather than coercing them through a C string. */
+    SQLiteStmt existing;
+    existing.create(db, "select 1 from GoonixBuildRecords "
+        "where resolvedHash = ?1 and resolvedDerivation = ?2 and output = ?3 "
+        "and path = ?4 and origin = ?5 and relocationChecked = ?6 "
+        "and (signature = ?7 or (substr(signature, 1, 1) = '(' "
+        "and cast(signature as blob) = cast(?8 as blob))) limit 1;");
+    auto found = existing.use();
+    const string rawSignature = goonixBase64Decode(signature);
+    found(record.resolvedHash)(record.resolvedDerivation)(record.output)
+        (record.path)(record.origin)(record.relocationChecked ? 1 : 0)(signature);
+    if (sqlite3_bind_blob(existing, 8, rawSignature.data(),
+            rawSignature.size(), SQLITE_TRANSIENT) != SQLITE_OK)
+        throwSQLiteError(db, "binding raw record signature for deduplication");
+    if (found.next()) return;
     SQLiteStmt stmt;
     stmt.create(db, "insert or ignore into GoonixBuildRecords "
         "(resolvedHash, resolvedDerivation, output, path, origin, "
         "relocationChecked, signature) values (?, ?, ?, ?, ?, ?, ?);");
     stmt.use()(record.resolvedHash)(record.resolvedDerivation)
         (record.output)(record.path)(record.origin)
-        (record.relocationChecked ? 1 : 0)(record.signature).exec();
+        (record.relocationChecked ? 1 : 0)(signature).exec();
 }
 
 static BuildRecord readRecord(SQLiteStmt::Use & use)
@@ -114,8 +173,8 @@ static BuildRecord readRecord(SQLiteStmt::Use & use)
     auto signature = use.getStr(6);
     if (signature.starts_with("("))
         /* A pre-base64 record holds the signer's raw advanced S-expression.
-           Encode those exact bytes, including any raw high bytes. */
-        signature = goonixBase64Encode(signature);
+           Preserve the read-side conversion for databases opened read-only. */
+        signature = canonicalGoonixRecordSignature(signature);
     else {
         try {
             goonixBase64Decode(signature);
