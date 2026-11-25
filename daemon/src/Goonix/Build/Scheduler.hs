@@ -42,7 +42,7 @@ data State = State
   , jobOrder :: ![JobId]
   } deriving (Eq, Show)
 
-data Event = Tick | Completed JobId | FailedEvent JobId | NeedsDependencies JobId [JobId]
+data Event = Tick | Completed JobId | FailedEvent JobId | NeedsDependencies JobId [JobId] | WaitForDependencies JobId [JobId]
   deriving (Eq, Show)
 
 data Action = Start JobId | Finish JobId | Fail JobId | ReportFailure JobId
@@ -73,11 +73,13 @@ addDependencyJobsWithKinds names state = foldM add state names
   where add current (name, kind) = addJob name kind [] current
 
 step :: Event -> State -> (State, [Action])
-step event state = schedule $ case event of
-  Completed name -> update name Succeeded state
-  FailedEvent name -> update name Failed state
-  NeedsDependencies name required -> waitFor name required state
-  Tick -> state
+step event state = case event of
+  WaitForDependencies name required -> (waitFor name required state, [])
+  _ -> schedule $ case event of
+    Completed name -> update name Succeeded state
+    FailedEvent name -> update name Failed state
+    NeedsDependencies name required -> waitFor name required state
+    Tick -> state
   where
     update name result current = case Map.lookup name (jobs current) of
       Just job | status job == Running -> current { jobs = Map.insert name job { status = result } (jobs current) }

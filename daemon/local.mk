@@ -108,6 +108,9 @@ EXTRA_DIST += \
   daemon/src/Goonix/Store/Nar.hs daemon/src/Goonix/Store/References.hs \
   daemon/src/Goonix/Store/Ca.hs \
   daemon/src/Goonix/Store/DeepScan.hs \
+  daemon/src/Goonix/Build/CaDecision.hs daemon/src/Goonix/Build/Runtime.hs \
+  daemon/src/Goonix/Build/Graph.hs daemon/src/Goonix/Build/Scheduler.hs \
+  daemon/test/scheduler/Main.hs daemon/test/ca-decision/Main.hs \
   daemon/test/ca-vectors/Main.hs \
   daemon/test/ca-leftover/Main.hs daemon/test/ca-leftover.sh \
   daemon/test/rewrite-mode/Main.hs daemon/test/rewrite-mode.sh \

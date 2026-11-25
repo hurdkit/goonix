@@ -40,6 +40,7 @@ library
         Goonix.Store.CaStore
         Goonix.Store.DeepScan
         Goonix.Store.Records
+        Goonix.Build.CaDecision
         Goonix.Build.Engine
         Goonix.Build.Graph
         Goonix.Build.Offload
@@ -108,6 +109,16 @@ test-suite scheduler-properties
     build-depends:
         base,
         bytestring,
+        containers,
+        guix-daemon-hs
+
+test-suite ca-decision-properties
+    import: warnings
+    type: exitcode-stdio-1.0
+    hs-source-dirs: test/ca-decision
+    main-is: Main.hs
+    build-depends:
+        base,
         containers,
         guix-daemon-hs
 
