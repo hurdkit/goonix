@@ -5,7 +5,7 @@
 #include "pathlocks.hh"
 #include "worker-protocol.hh"
 #include "derivations.hh"
-#include "ca-auth.hh" // goonix: narrow signature-verification bridge
+#include "ca-record-signature.hh" // goonix: record signature encoding
 #include "records.hh" // goonix: resolved build records
 #include "ca.hh"
 
@@ -1261,33 +1261,23 @@ static std::string verifySignature(const string &signature)
     return readAuthenticateReply(agent->fromAgent.readSide);
 }
 
-// goonix: sign the canonical record, not a client-supplied path mapping.
+// goonix: retain the local permission check behind the record-signature boundary.
+void checkGoonixRecordKeySecrecy(const Path & path) { checkSecrecy(path); }
+
+// goonix: sign the canonical record through the existing authentication agent.
 string LocalStore::signBuildRecord(const string & payload)
 {
-    Path secretKey = settings.nixConfDir + "/signing-key.sec";
-    checkSecrecy(secretKey);
-    /* goonix: carry the signature as base64.  The advanced S-expression the
-       agent returns holds raw high bytes whenever the digest looks printable,
-       so its byte form depends on the digest's luck; base64 makes it
-       deterministic and always valid UTF-8.  Decoding is the mirror at
-       verifyGoonixRecordSignature. */
-    return goonixBase64Encode(signHash(secretKey, hashString(htSHA256, payload)));
+    return signGoonixRecordPayload(*this, payload,
+        [](LocalStore &, const Path & key, const Hash & hash) {
+            return signHash(key, hash);
+        });
 }
 
-// goonix: forward only the store-authenticated digest to the record module.
-string verifyGoonixRecordSignature(LocalStore &, const string & signature)
+// goonix: delegate base64 decoding and verification without changing the agent.
+string verifyGoonixRecordSignature(LocalStore & store, const string & signature)
 {
-    /* The stored field is base64; decode before verifying.  A field that is
-       not valid base64 is refused by goonixBase64Decode with a clear message,
-       never passed through as though it were already a raw signature. */
-    string decoded;
-    try {
-        decoded = goonixBase64Decode(signature);
-    } catch (Error & error) {
-        throw InvalidRecordSignature(error.msg());
-    }
-    /* Authentication failures remain AuthenticationError, not bad encoding. */
-    return verifySignature(decoded);
+    return verifyGoonixRecordSignature(store, signature,
+        [](LocalStore &, const string & raw) { return verifySignature(raw); });
 }
 
 void LocalStore::exportPath(const Path & path, bool sign,
