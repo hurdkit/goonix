@@ -307,7 +307,7 @@ public:
     GoalPtr makeDerivationGoal(const Path & drvPath, const StringSet & wantedOutputs, BuildMode buildMode = bmNormal);
     GoalPtr makeSubstitutionGoal(const Path & storePath, bool repair = false);
     bool isTopGoal(const GoalPtr & goal) const { return topGoals.count(goal); } // goonix: roots only request graphs
-    GoalPtr makeGoonixGraphGoal(const Path & path); // goonix: graph factory
+    GoalPtr makeGoonixGraphGoal(const Path & path); GoalPtr existingDerivationGoal(const Path & path); // goonix: graph factory and existing-goal lookup
 
     /* Remove a dead goal. */
     void removeGoal(GoalPtr goal);
