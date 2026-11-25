@@ -37,10 +37,13 @@ endif HAVE_LIBARCHIVE
 
 # The sandbox helper is built in the source tree with the daemon, so Guix's
 # existing GUIX_SANDBOX override and tests can select this exact binary.
-guix-sandbox: $(top_srcdir)/daemon/sandbox/guix-sandbox.cc
-	$(AM_V_CXX)$(CXX) $(CPPFLAGS) $(AM_CXXFLAGS) $(CXXFLAGS) -std=c++17 \
-	  -O2 -Wall -Wextra -Wpedantic $(LDFLAGS) $(LDLIBS) -o $@.tmp $<; \
-	  mv $@.tmp $@
+guix-sandbox: $(top_srcdir)/daemon/sandbox/guix-sandbox.cc $(top_srcdir)/daemon/cbits/helpers.c
+	$(AM_V_GEN)$(CC) $(CPPFLAGS) $(CFLAGS) -O2 -c \
+	  $(top_srcdir)/daemon/cbits/helpers.c -o $@-helpers.o && \
+	$(CXX) $(CPPFLAGS) $(AM_CXXFLAGS) $(CXXFLAGS) -std=c++17 \
+	  -O2 -Wall -Wextra -Wpedantic $(LDFLAGS) $(LDLIBS) -o $@.tmp \
+	  $(top_srcdir)/daemon/sandbox/guix-sandbox.cc $@-helpers.o && \
+	mv $@.tmp $@
 # Keep the direct build independent of Cabal's package database and of Hackage.
 DAEMON_GHC_FLAGS = -O2 -Wall -Wcompat -Widentities -Wredundant-constraints \
   -threaded -rtsopts -with-rtsopts=-N \

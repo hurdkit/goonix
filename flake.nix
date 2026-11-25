@@ -82,7 +82,9 @@
                     ${./nix/goonix-ca-scan.cc} ${./nix/libutil/util.cc} \
                     ${./nix/libutil/affinity.cc} \
                     -lz -larchive -o $out/libexec/goonix-ca-scan
-                  g++ -O2 -std=c++17 ${./daemon/sandbox/guix-sandbox.cc} -o $out/bin/guix-sandbox
+                  gcc -O2 -c ${./daemon/cbits/helpers.c} -o sandbox-helpers.o
+                  g++ -O2 -std=c++17 ${./daemon/sandbox/guix-sandbox.cc} \
+                    sandbox-helpers.o -o $out/bin/guix-sandbox
                 '';
                 preConfigure = ''
                   mkdir -p src/Goonix

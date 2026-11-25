@@ -79,10 +79,9 @@ int goonix_kill_user(uid_t uid, char *diag, size_t diag_len)
    its process as no longer signalable between this call and waitpid.  WNOWAIT
    keeps the zombie and its pid allocated during that transition, so the
    deadline thread cannot signal a pid that has already been reaped. */
-/* C++ initializeUserNamespace's extraGIDs path (build.cc:1666-1709).  This
-   runs in the daemon, before the sandbox enters its PID namespace.
-   newgidmap authorises the supplementary group through /etc/subgid.  Its
-   absence or a refusal falls back to the ordinary single-gid map. */
+/* C++ initializeUserNamespace's extraGIDs path (build.cc:1666-1709).
+   guix-sandbox's parent map-writer calls this before its setgroups/gid_map
+   writes, so the optional group is authorized without an early deny. */
 int goonix_map_kvm_gid(pid_t target, gid_t daemon_gid, gid_t primary_guest,
                        gid_t host_gid, gid_t guest_gid)
 {
@@ -117,7 +116,7 @@ found:
   char *const argv[] = {(char *)"newgidmap", pid, primary, daemon,
     (char *)"1", guest, host, (char *)"1", NULL};
   pid_t child;
-  int result = posix_spawn(&child, "newgidmap", NULL, NULL, argv, environ);
+  int result = posix_spawnp(&child, "newgidmap", NULL, NULL, argv, environ);
   if (result != 0) return 1;
   int status;
   while (waitpid(child, &status, 0) < 0) {

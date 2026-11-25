@@ -943,6 +943,15 @@ static Bytes idMapToIdentityMap(const Bytes & map)
 
 /* Retain spawn.cc's external map-writer handshake.  No daemon code runs
    after fork; the child only executes the C++ map-writing routine. */
+extern "C" int goonix_map_kvm_gid(pid_t target, gid_t daemon_gid,
+    gid_t primary_guest, gid_t host_gid, gid_t guest_gid);
+
+static bool pathExists(const Bytes & path)
+{
+    struct stat status;
+    return stat(path.c_str(), &status) == 0;
+}
+
 void unshareAndInitUserns(Plan & plan, const Bytes & context)
 {
     const pid_t target = getpid();
@@ -972,6 +981,14 @@ void unshareAndInitUserns(Plan & plan, const Bytes & context)
             } catch (const std::exception & error) {
                 throw Error(Bytes("uid_map `") + uidMap + "': " + error.what());
             }
+            gid_t hostKvm = gid_t(-1);
+            const bool mappedKvm = plan.has(sandboxFlag) && !plan.mapAllIds &&
+                !plan.allowSetgroups && pathExists("/dev/kvm") &&
+                goonix_map_kvm_gid(target, plan.gidMapOutside,
+                    plan.gidMapInside, hostKvm, 40000) == 0;
+            /* Report success before denying supplementary groups.  The child
+               uses this only to retain the mapped guest group in its plan. */
+            writeFull(fromChild.writeSide.get(), mappedKvm ? "kvm\n" : "one\n");
             try {
                 writeFile("/proc/" + pid + "/setgroups", plan.allowSetgroups ? "allow\n" : "deny\n");
             } catch (const std::exception & error) {
@@ -1000,6 +1017,11 @@ void unshareAndInitUserns(Plan & plan, const Bytes & context)
     try {
         if (unshare(CLONE_NEWUSER) == -1) sysError("unshare(CLONE_NEWUSER)");
         writeFull(toChild.writeSide.get(), "ready\n");
+        char mapping[4];
+        readFull(fromChild.readSide.get(),
+            reinterpret_cast<unsigned char *>(mapping), sizeof(mapping));
+        if (memcmp(mapping, "kvm\n", 4) == 0)
+            plan.supplementaryGroups.push_back(40000);
         waitForMessage(fromChild.readSide.get(), "go\n");
         toChild.writeSide.reset();
         fromChild.readSide.reset();
