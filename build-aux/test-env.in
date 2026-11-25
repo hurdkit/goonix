@@ -128,15 +128,14 @@ running 'guix-daemon $extra_options'" >&2
     GOONIX_DAEMON_TMPDIR="@GUIX_TEST_ROOT@/daemon-tmp-$$"
     mkdir -m 0700 "$GOONIX_DAEMON_TMPDIR"
 
-    # Launch the daemon without chroot support because is may be
-    # unavailable, for instance if we're not running as root.
-    TMPDIR="$GOONIX_DAEMON_TMPDIR"				\
-    "@abs_top_builddir@/pre-inst-env"				\
-	"@abs_top_builddir@/guix-daemon"			\
-        $extra_options						\
-        ${GUIX_TEST_DAEMON_OPTIONS:-}                         \
-        --allow-aslr                                            \
-	--substitute-urls="$GUIX_BINARY_SUBSTITUTE_URL" &
+    # goonix: launch with the caller's options and the test daemon's TMPDIR.
+    TMPDIR="$GOONIX_DAEMON_TMPDIR" \
+    "@abs_top_builddir@/pre-inst-env" \
+    "@abs_top_builddir@/guix-daemon" \
+    $extra_options \
+    ${GUIX_TEST_DAEMON_OPTIONS:-} \
+    --allow-aslr \
+    --substitute-urls="$GUIX_BINARY_SUBSTITUTE_URL" &
 
     daemon_pid=$!
 
