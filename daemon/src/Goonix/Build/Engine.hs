@@ -207,7 +207,12 @@ buildThingsInternal config rootFd store settings trace hook things mode cancel =
                               else resolveDerivation (storeDirectory store) path drv (realisedOutputPath store)
                             resolvedPath <- writeResolvedDerivation rootFd store path resolved
                             appendTempRoot rootFd resolvedPath
-                            prepared <- prepareResolvedBuild rootFd store jobMode path resolved
+                            -- C++ resolveGoonixBuild calls selectGoonixOutputs
+                            -- before prepareResolvedBuild.  Without this, R has
+                            -- valid facts but no adopted choice and the resumed
+                            -- unresolved goal rebuilds an already realised input.
+                            selected <- selectGoonixOutputs store path resolved
+                            prepared <- prepareResolvedBuild rootFd store jobMode path selected
                             buildPhaseWith requested path prepared resolvedPath
                           CaSubstituteInputs -> do
                             writeIORef inputsRealised True
