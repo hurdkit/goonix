@@ -39,3 +39,4 @@ tests/channels.scm 9 1
 tests/import/egg.scm 6 0
 tests/import/opam.scm 4 0
 tests/publish.scm 7 0
+build-aux/test-env.in 3 0
