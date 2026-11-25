@@ -81,6 +81,57 @@
     (test-equal "a property-marked package lowers resolved"
       "resolved" (addressing (lower marked)))))
 
+(test-group "the boot path's packages are resolved under 'adopted too"
+  ;; A package the opaque table names must be marked resolved before it is
+  ;; built under EVERY policy that builds content-addressed items, including
+  ;; 'adopted.  A self reference the rewriter cannot reverse is found by the
+  ;; scanner only after the item exists, so an unmarked opaque package fails at
+  ;; finalisation instead of being built at its final path in the first place.
+  ;;
+  ;; The table applies under content/full/adopted; under mixed/input the
+  ;; upstream graph stays byte-identical and only the explicit opaque property
+  ;; marks a package.  Dependents of a tabled item are promoted out of input
+  ;; addressing, because an input-addressed derivation may not depend on a
+  ;; goonix-addressed one.
+  ;;
+  ;; The 'content assertions are here too so the two policies cannot drift
+  ;; apart again: a tabled package is resolved under both.
+  (define (addressing-under policy package)
+    (parameterize ((%package-addressing-policy policy))
+      (package-addressing package)))
+
+  (for-each
+   (lambda (package)
+     (test-assert
+         (format #f "~a is in the opaque table (sanity)" (package-name package))
+       (opaque-package? package))
+     (test-equal
+         (format #f "~a lowers resolved under 'adopted (the boot path)"
+                 (package-name package))
+       'resolved
+       (addressing-under 'adopted package))
+     (test-equal
+         (format #f "~a still lowers resolved under 'content (no drift)"
+                 (package-name package))
+       'resolved
+       (addressing-under 'content package)))
+   (list glibc qemu-minimal file))
+
+  (test-equal "glibc-utf8-locales, which depends on glibc, is not itself opaque"
+    #f
+    (opaque-package? glibc-utf8-locales))
+
+  (test-equal "a package the table does not name stays input under 'adopted"
+    ;; The fix must not turn the whole adopted graph resolved: only tabled
+    ;; (or property-marked) packages change.  hello is upstream's and unmarked,
+    ;; so it keeps upstream's input addressing and byte-identity.
+    'input
+    (addressing-under 'adopted hello))
+
+  (test-equal "an upstream unmarked package still lowers content under 'content"
+    'content
+    (addressing-under 'content hello)))
+
 (test-group "a scan flags exactly the covered fixtures, not the rewritable ones"
   ;; "Every opaque package is marked" becomes a check: the scanner flags
   ;; precisely the fixtures the table or the property covers (a self-reference

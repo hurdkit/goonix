@@ -77,3 +77,20 @@ Path finaliseContentOutput(class LocalStore & store, const Path & tokenPath,
     const Path & actualTokenPath = "", bool * created = nullptr);
 
 }
+
+namespace nix {
+
+/* goonix: a record signature travels as base64, never as the raw advanced
+   S-expression.  libgcrypt writes a digest as a quoted string holding RAW HIGH
+   BYTES whenever it looks printable and as #hex# otherwise, so the byte form
+   of a signature depends on the digest's luck; passing those bytes on as a
+   protocol string makes a strict UTF-8 reader throw on some records and not
+   others.  Base64 makes the byte form deterministic, exactly as narinfo
+   signatures are already carried. */
+MakeError(InvalidRecordSignature, Error)
+
+string goonixBase64Encode(const string & raw);
+string goonixBase64Decode(const string & encoded);
+
+}
+

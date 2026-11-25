@@ -76,6 +76,41 @@ goonix_gate_require_compiled() {
   return 0
 }
 
+# goonix_gate_require_lane SCRIPT-NAME
+#
+# Refuse to start a gate unless the caller is in a lane.  This is mechanical
+# because recording the rule did NOT stop it being broken: on 2026-11-24 a
+# "quick check" of a script's clean path started a real daemon OUTSIDE
+# heavy-turn.sh three separate times, the last one reaching START and taking
+# ca8-laptop's store from 305 to 525 substituted items.  A clean-path invocation
+# IS a gate run, and every gate run goes through heavy-turn.sh inside a
+# memory-capped systemd scope.
+#
+# Two legitimate contexts, either is enough:
+#   (a) a LAPTOP lane job: heavy-turn.sh exports HEAVY_TURN_SLOT (since 07:17),
+#       and it names an existing lock directory.  A value pointing at a missing
+#       directory is a forgery or a stale env and is REFUSED, so exporting a
+#       bare name does not buy a free pass.
+#   (b) a ZERGLING2 job: /proc/self/cgroup contains "z2run-".  heavy-turn's env
+#       is not forwarded into the remote unit, so the cgroup is the evidence.
+#       This is what lets a z2-submitted counted run start at all.
+#
+# Place the call at the very TOP of the runner, before prepare and before any
+# daemon, so a mistake costs milliseconds rather than a 39-minute prepare build.
+goonix_gate_require_lane() {
+  local who=${1:-this runner}
+  if [ -n "${HEAVY_TURN_SLOT:-}" ] && [ -d "${HEAVY_TURN_SLOT}" ]; then
+    return 0
+  fi
+  if grep -q 'z2run-' /proc/self/cgroup 2>/dev/null; then
+    return 0
+  fi
+  echo "REFUSE: $who starts a daemon/build and must run in a lane." >&2
+  echo "  Use HEAVY_LANE=build bash heavy-turn.sh NAME PURPOSE -- $who ..." >&2
+  echo "  (HEAVY_TURN_SLOT='${HEAVY_TURN_SLOT:-unset}' is not an existing directory, and /proc/self/cgroup has no z2run- unit)" >&2
+  exit 1
+}
+
 # goonix_gate_exit VERDICT
 #
 # Print the verdict and exit with it, so the caller's unit fails when the gate
@@ -84,4 +119,38 @@ goonix_gate_exit() {
   local verdict=${1:-1}
   echo "GATE_EXIT=$verdict"
   exit "$verdict"
+}
+
+# goonix_stage_running STAGE
+#
+# Print the pid of a process that is ACTUALLY EXECUTING
+# `bash .../ca8-core-run.sh STAGE ...`, and return 0; return 1 when there is none.
+#
+# Do NOT use `pgrep -f 'ca8-core-run\.sh stage1'` for this.  Measured on the
+# laptop: it matches my own z2 submission tickets, because z2run.sh takes the
+# remote command as ARGUMENTS, so the runner string sits in the argv of the
+# heavy-turn ticket, its launcher and the z2run wrapper.  A queued z2 ticket is
+# not a local stage1.  With the pgrep form, goonix-ca8/stage2-gate-after-stage1.sh
+# REFUSED on 2026-11-24 07:11:28 with no stage1 running at all - the three matches
+# were the counted3 ticket, its launcher and its z2run wrapper.  The same trap was
+# first fixed in continuation-then-stage2.sh (744ca029b21); this is the shared
+# form, so a third caller does not reintroduce it.
+#
+# argv[0] must be a bash, argv[1] must end in ca8-core-run.sh, argv[2] must be
+# exactly the requested stage.  A string buried in another command's arguments
+# cannot satisfy that.
+goonix_stage_running() {
+  local want=${1:?stage name required}
+  local p argv0 argv1 argv2
+  for p in /proc/[0-9]*; do
+    [ -r "$p/cmdline" ] || continue
+    { read -r -d '' argv0; read -r -d '' argv1; read -r -d '' argv2; } \
+      < "$p/cmdline" 2>/dev/null || continue
+    case "$argv0" in */bash|bash) ;; *) continue ;; esac
+    case "$argv1" in */ca8-core-run.sh|ca8-core-run.sh) ;; *) continue ;; esac
+    [ "$argv2" = "$want" ] || continue
+    printf '%s\n' "${p#/proc/}"
+    return 0
+  done
+  return 1
 }

@@ -50,6 +50,7 @@ SCM_TESTS +=					\
   tests/ca-files.scm				\
   tests/ca-full.scm				\
   tests/ca-opaque.scm				\
+  tests/ca-record-signature.scm			\
   tests/ca-policy.scm				\
   tests/ca-existing-item.scm			\
   tests/ca-fixed-output.scm			\
@@ -72,6 +73,7 @@ SH_TESTS +=					\
   build-aux/check-goonix-hooks.sh		\
   tests/guix-ca-async.sh			\
   tests/ca-async-lifecycle.sh			\
+  tests/guix-ca-record-signature-publish.sh	\
   tests/guix-ca-two-store.sh			\
   tests/guix-ca-files.sh			\
   tests/guix-ca-second-machine.sh		\
@@ -89,6 +91,9 @@ EXTRA_DIST +=					\
   build-aux/goonix-upstream-base		\
   tests/ca-vectors.json				\
   tests/ca-async-fixture.scm			\
+  tests/ca-record-signature-publish-fixture.scm	\
+  tests/ca-record-signature-publish-client.scm	\
+  tests/ca-record-signature-cpp-client.scm	\
   tests/ca-two-store-fixture.scm			\
   tests/ca-files-fixture.scm			\
   tests/ca-files-client.scm			\

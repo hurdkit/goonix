@@ -92,12 +92,20 @@
 (define (package-addressing package)
   "Return the kind to request for PACKAGE's own derivation."
   (cond ((and (opaque-package? package)
-              (memq (%package-addressing-policy) '(content full)))
+              (memq (%package-addressing-policy) '(content full adopted)))
          ;; goonix: the opaque table forces resolved-addressing under the
-         ;; content/full policies.  Under mixed/adopted/input the upstream
-         ;; graph is kept byte-identical (an input-addressed dependent may not
-         ;; take a resolved dependency), so only the explicit opaque property
-         ;; — upstream's own marking — applies there.
+         ;; content/full policies, and under 'adopted too.  Under mixed/input
+         ;; the upstream graph is kept byte-identical (an input-addressed
+         ;; dependent may not take a resolved dependency), so only the
+         ;; explicit opaque property — upstream's own marking — applies there.
+         ;;
+         ;; An opaque package must be marked BEFORE it is built: a self
+         ;; reference that a rewrite cannot reverse is discovered by the
+         ;; scanner only after the item exists, and refusing it then costs the
+         ;; whole build.  Dependents of such an item are promoted out of input
+         ;; addressing (see bag-opaque-input?), because
+         ;; checkInputAddressedPolicy refuses an input-addressed derivation
+         ;; that depends on a goonix-addressed item.
          'resolved)
         ((eq? 'opaque (assq-ref (package-properties package) 'self-references))
          'resolved)
@@ -122,6 +130,20 @@ policy is 'adopted', PACKAGE is upstream's, and it is not marked opaque."
 (define (package-addressing-key)
   "Return the current mode and marker for the package derivation cache."
   (list (%package-addressing-policy) (%upstream-package?)))
+
+(define (bag-opaque-input? bag)
+  "Whether BAG directly depends on a package the opaque table (or the opaque
+property) marks.  Under 'adopted such a dependency is now RESOLVED-addressed,
+and nix/libstore/ca.cc:148 checkInputAddressedPolicy refuses an input-addressed
+derivation that depends on a resolved one, so the dependent must be promoted
+out of input addressing too."
+  (any (match-lambda
+         ((label (? package? package) . rest)
+          (opaque-package? package))
+         (_ #f))
+       (append (bag-build-inputs bag)
+               (bag-host-inputs bag)
+               (bag-target-inputs bag))))
 
 (define (lower-bag-with-addressing lower bag . arguments)
   "Apply the package's own addressing around its bag build, after inputs.
@@ -158,13 +180,25 @@ glibc is re-lowered content-addressed from source instead."
         ;; peers use.  gnu-build-system and trivial-build-system both lower
         ;; the builder's guile inside bag lowering, and glibc passes no
         ;; #:guile, so it is in that case.
-        (let ((glibc? (and (eq? (%package-addressing-policy) 'adopted)
-                           (glibc-name? (bag-name bag)))))
+        (let* ((glibc? (and (eq? (%package-addressing-policy) 'adopted)
+                            (glibc-name? (bag-name bag))))
+               ;; goonix: a dependent of an opaque item cannot stay
+               ;; input-addressed under 'adopted, because that item is
+               ;; resolved and checkInputAddressedPolicy refuses the pairing
+               ;; at REGISTRATION.  Promote it to content, the same answer the
+               ;; 'mixed policy already gives for an upstream dependent on an
+               ;; opaque input.  The rest of the adopted graph keeps its
+               ;; addressing; only the affected subgraph changes.
+               (opaque-input? (and (eq? (%package-addressing-policy) 'adopted)
+                                   (bag-opaque-input? bag))))
           (state-parameterize ((%package-addressing
-                                (if glibc? 'content (package-addressing context)))
+                                (cond (glibc? 'content)
+                                      (opaque-input? 'content)
+                                      (else (package-addressing context))))
                                (%package-derivation-name (bag-name bag)))
             (let ((drv (apply lower bag arguments)))
-              (if (and (not glibc?) (adopt-package? context))
+              (if (and (not glibc?) (not opaque-input?)
+                       (adopt-package? context))
                   (adopt-lowered-derivation lower bag arguments drv)
                   drv))))
         (apply lower bag arguments))))

@@ -844,6 +844,35 @@ FileSize: ~a~%"
          (list (http-get (publish-uri path))
                (http-post (publish-uri path))))))
 
+;; A malformed record has its own refusal.  An unrelated renderer failure is
+;; not a record error and must escape rather than becoming a quiet 422.
+(let ((store (open-connection-for-tests)))
+  (let* ((drv (derivation store "publish-narrow-catch" "/bin/sh" '()
+                          #:addressing 'input))
+         (name (basename (derivation-file-name drv)))
+         (request (build-request
+                   (string->uri
+                    (string-append "http://localhost/goonix/records/" name))))
+         (render (@@ (guix scripts publish) render-goonix-records)))
+    (test-assert "publish does not swallow an unrelated graph exception"
+      (catch 'unrelated-test-error
+        (lambda ()
+          (mock ((guix ca records) build-graph-expression
+                 (lambda (store derivation)
+                   (throw 'unrelated-test-error "boom")))
+            (render store request name))
+          #f)
+        (lambda (key . args) #t)))
+    (test-assert "publish returns 422 for the invalid-record refusal"
+      (call-with-values
+          (lambda ()
+            (mock ((guix ca records) build-graph-expression
+                   (lambda (store derivation)
+                     (throw 'goonix-invalid-signature-encoding "bad record")))
+              (render store request name)))
+        (lambda (response body)
+          (and (response? response) (= 422 (response-code response))))))))
+
 (test-end "publish")
 
 ;;; Local Variables:

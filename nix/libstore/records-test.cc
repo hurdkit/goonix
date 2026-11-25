@@ -2,7 +2,10 @@
 #include "build-goonix-response.hh"
 #include "records.hh"
 #include "ca.hh"
+#include "ca-auth.hh"
 #include "local-store.hh"
+#include "sqlite.hh"
+#include <sqlite3.h>
 #include "globals.hh"
 #include "util.hh"
 #include <cstdlib>
@@ -12,6 +15,42 @@
 #include <sys/wait.h>
 
 using namespace nix;
+
+
+static void configureTestStore(const Path & root, const Path & guix);
+
+static int writeHighByteSignature(int argc, char ** argv)
+{
+    if (argc != 5 || string(argv[1]) != "--sign-high-byte")
+        return 2;
+    configureTestStore(argv[2], argv[3]);
+    createDirs(settings.nixConfDir);
+    chmod(settings.nixConfDir.c_str(), 0700);
+    const string source = getEnv("GUIX_CONFIGURATION_DIRECTORY", settings.nixConfDir);
+    writeFile(settings.nixConfDir + "/signing-key.sec", readFile(source + "/signing-key.sec"));
+    writeFile(settings.nixConfDir + "/signing-key.pub", readFile(source + "/signing-key.pub"));
+    chmod((settings.nixConfDir + "/signing-key.sec").c_str(), 0400);
+    LocalStore store(false);
+    for (unsigned int i = 0; i != 4096; ++i) {
+        string payload = std::format("goonix signature byte test {}", i);
+        auto encoded = store.signBuildRecord(payload);
+        auto raw = goonixBase64Decode(encoded);
+        if (std::any_of(raw.begin(), raw.end(), [](unsigned char c) { return c > 127; })) {
+            string hex;
+            for (unsigned char c : raw) {
+                const char digits[] = "0123456789abcdef";
+                hex.push_back(digits[c >> 4]);
+                hex.push_back(digits[c & 15]);
+            }
+            writeFile(argv[4], encoded + "\n" + hex + "\n" +
+                printHash(hashString(htSHA256, payload)));
+            std::cout << "goonix real high-byte signature: PASS\n";
+            return 0;
+        }
+    }
+    std::cerr << "goonix real high-byte signature: no such signature in 4096 attempts\n";
+    return 1;
+}
 
 static int checkGraphResponses()
 {
@@ -93,6 +132,8 @@ static int checkUnauthorizedImport(int argc, char ** argv)
 
 int main(int argc, char ** argv)
 {
+    if (argc == 5 && string(argv[1]) == "--sign-high-byte")
+        return writeHighByteSignature(argc, argv);
     if (argc == 2 && string(argv[1]) == "--check-graph-responses")
         return checkGraphResponses();
     if (argc == 8 && string(argv[3]) == "--check-unauthorized-import")
@@ -171,6 +212,38 @@ int main(int argc, char ** argv)
         return 1;
     }
     std::cout << "goonix signing helper with forced stderr: PASS\n";
+
+    /* One bad row must not hide its valid sibling.  The bad row has a
+       distinct path, so this is a mixed aggregate, not a failed direct read. */
+    {
+        sqlite3 * fixture;
+        if (sqlite3_open((settings.nixDBPath + "/db.sqlite").c_str(), &fixture) != SQLITE_OK)
+            throw Error("could not open mixed-record fixture database");
+        const Path bad = store.addTextToStore("bad-record-output", "bad", PathSet());
+        auto sql = std::format(
+            "insert into GoonixBuildRecords "
+            "(resolvedHash, resolvedDerivation, output, path, origin, "
+            "relocationChecked, signature) values "
+            "('{}', '{}', 'out', '{}', 'corrupt-test', 0, 'not base64');",
+            hash, drv, bad);
+        int result = sqlite3_exec(fixture, sql.c_str(), nullptr, nullptr, nullptr);
+        sqlite3_close(fixture);
+        if (result != SQLITE_OK) throw Error("could not insert mixed-record fixture");
+        auto byHash = store.queryGoonixBuildRecords(hash, "out");
+        auto byPath = store.queryGoonixRecordsByPath(drv);
+        auto byResolved = store.queryGoonixRecordsByResolved(drv);
+        if (byHash.size() != 1 || byPath.size() != 1 || byResolved.size() != 1 ||
+            byHash.at(0).signature != records.at(0).signature) {
+            std::cerr << "goonix mixed valid and garbage records: FAIL\n";
+            return 1;
+        }
+        try {
+            verifyGoonixRecordSignature(store, "not base64");
+            std::cerr << "goonix direct invalid signature verification: FAIL\n";
+            return 1;
+        } catch (const InvalidRecordSignature &) { }
+        std::cout << "goonix mixed valid and garbage records: PASS\n";
+    }
 
     auto replayed = records.at(0);
     replayed.path = store.addTextToStore("replayed-output", "replayed", PathSet());

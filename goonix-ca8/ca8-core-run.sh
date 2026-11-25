@@ -19,6 +19,14 @@ set -euo pipefail
 IMPL=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 cd "$IMPL"
 
+# Lane guard, FIRST - before the dev-shell re-exec, before prepare, before any
+# daemon.  A "quick check" of this script's clean path IS a gate run and must not
+# happen outside heavy-turn.sh.  Three times on 2026-11-24 a check did exactly
+# that; the last took ca8-laptop's store from 305 to 525 items.  Make it
+# mechanical instead of a note in STATUS.
+source "$IMPL/goonix-ca6/gate-lib.sh"
+goonix_gate_require_lane "goonix-ca8/ca8-core-run.sh"
+
 if [ -z "${IN_NIX_SHELL:-}" ]; then
   # goonix: the shell MUST come from this worktree's own flake.  The main
   # checkout /home/wrath/goonix (branch goonix, the pinned base) has no
@@ -29,6 +37,25 @@ fi
 
 stage=${1:?stage name}
 script=${2:?scheme file}
+
+# The scratch path MUST be absolute, and this is checked HERE - at the top,
+# before the prepare build, before any daemon, in seconds rather than after 39
+# minutes of compiling.  Every scratch-derived path below is interpolated into
+# the namespace script verbatim and the daemon validates them: given a relative
+# scratch it exits with
+#   error: not an absolute path: `.scratch/<name>/log'
+# so it never listens, the 10 s socket wait gives up, and guile reports
+#   &store-connection-error file: ".scratch/<name>/socket" errno: 2
+# which reads like a daemon crash rather than a bad argument.  Measured on
+# z2-ca8-stage1-counted2: STAGE=stage1 EXIT=1, 0 store items, 0 build events,
+# stage1.out empty, and that one line in daemon-stage1.log.  Refuse instead of
+# silently resolving: the caller meant a specific tree, and guessing which one
+# (this worktree? its cwd?) could wipe or write the wrong store.
+case "${GOONIX_CA8_SCRATCH:-$IMPL/.scratch/ca8-core}" in
+  /*) ;;
+  *) echo "REFUSE: GOONIX_CA8_SCRATCH must be an absolute path, not '${GOONIX_CA8_SCRATCH}' (the daemon rejects relative paths)" >&2
+     exit 1 ;;
+esac
 
 # goonix: a gate must run on a COMPILED tree.  This runner starts guile with
 # --no-auto-compile, so an unbuilt tree is interpreted - a different load path
@@ -61,6 +88,28 @@ if ! unshare --user --map-root-user --mount true 2>/dev/null; then
 fi
 
 scratch=${GOONIX_CA8_SCRATCH:-$IMPL/.scratch/ca8-core}
+# Absolute-path guard already ran at the top of this script, before prepare.
+
+# GOONIX_CA8_FRESH=1 makes this the COUNTED run: the gate's claim is that the
+# seeds and the ladder build content-addressed FROM A WIPED STORE, so a run
+# that finds items already present proves only the tail (DECISIONS 57).
+# Same wipe as goonix-ca6/run.sh:34-48, whose recipe is proven: store items are
+# mode 555, so a plain `rm -rf' cannot unlink their children and fails with
+# "Permission denied" even though we own them (measured, CA-6 counted run 15).
+# Make the tree writable first.  This touches only our own scratch tree.
+#
+# No seed restore step, unlike CA-6: stage1's PASS 1 realises every fixed-output
+# derivation of the chain itself, with substitutes on, so the wipe IS the
+# reseed.  etc/ (the signing keys and the ACL) is deliberately NOT wiped: it is
+# harness configuration, not store state, and the daemon needs it to start.
+if [ "${GOONIX_CA8_FRESH:-0}" = 1 ]; then
+  echo "FRESH: wiping $scratch/store, $scratch/var and $scratch/log (counted run)"
+  chmod -R u+w "$scratch/store" "$scratch/var" "$scratch/log" 2>/dev/null || true
+  rm -rf "$scratch/store" "$scratch/var" "$scratch/log"
+  mkdir -p "$scratch/store" "$scratch/var" "$scratch/log"
+  echo "FRESH: store items after wipe: $(ls "$scratch/store" | wc -l)"
+fi
+
 mkdir -p "$scratch/store" "$scratch/var" "$scratch/etc" "$scratch/log"
 chmod 700 "$scratch/etc"
 
