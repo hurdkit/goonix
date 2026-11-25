@@ -45,7 +45,7 @@ import Goonix.Store.Writing
 import qualified Goonix.Store.Collector as Collector
 import Goonix.Store.Path (validateStoreName)
 import Goonix.Store.Ca (assertNotReserved)
-import Goonix.Store.CaStore (initCaRecords, realisedOutputPath, queryGoonixBuildGraph, goonixRecordFields)
+import Goonix.Store.CaStore (initCaRecords, realisedOutputPath, queryGoonixBuildGraphWithLog, goonixRecordFields)
 import Goonix.Store.Derivation (parseDerivation)
 import Goonix.Store.Records (queryRecords)
 import System.Posix.Env.ByteString (getEnv)
@@ -415,7 +415,7 @@ dispatch config store client settingsRef rootFd rootPath clientVersion operation
     writeSocket client (encodeStrings (goonixRecordFields records False))
   84 -> do
     drvPath <- readStorePathStrict store client
-    (records, hints) <- queryGoonixBuildGraph store drvPath
+    (records, hints) <- queryGoonixBuildGraphWithLog store (stderrEmit client) drvPath
     writeFrame client stderrLast
     writeSocket client (encodeStrings (goonixRecordFields records True) <> encodeStrings hints)
   _ -> throwIO (StoreError (C.pack ("invalid operation " ++ show operation)) 1)
@@ -464,7 +464,12 @@ buildTrace settings client = BuildTrace
 -- print-build-trace: C++ forwards substituter diagnostics unconditionally
 -- (getLineFromSubstituter).
 stderrEmit :: Socket -> ByteString -> IO ()
-stderrEmit client bytes = writeSocket client (encodeInt stderrNext <> encodeString bytes)
+stderrEmit client bytes = writeSocket client (encodeInt stderrNext <> encodeString line)
+  where
+    -- Guix flushes STDERR_NEXT only when it contains a newline, as C++'s
+    -- writeToStderr always does.  Do not leave a diagnostic buffered until
+    -- after its HTTP response has been handled.
+    line = if B.null bytes || B.last bytes == 10 then bytes else bytes <> "\n"
 
 repairStorePath :: ServerConfig -> Fd -> Store -> Settings -> (ByteString -> IO ()) -> ByteString -> IO Bool
 repairStorePath config rootFd store settings emit path = do

@@ -107,7 +107,8 @@ EXTRA_DIST += \
   daemon/src/Goonix/Store/Path.hs daemon/src/Goonix/Store/Derivation.hs \
   daemon/src/Goonix/Store/Nar.hs daemon/src/Goonix/Store/References.hs \
   daemon/src/Goonix/Store/Ca.hs \
-  daemon/src/Goonix/Store/DeepScan.hs \
+  daemon/src/Goonix/Store/DeepScan.hs daemon/src/Goonix/Store/RecordSignature.hs \
+  daemon/test/record-signature/Main.hs \
   daemon/src/Goonix/Build/CaDecision.hs daemon/src/Goonix/Build/Runtime.hs \
   daemon/src/Goonix/Build/Graph.hs daemon/src/Goonix/Build/Scheduler.hs \
   daemon/test/scheduler/Main.hs daemon/test/ca-decision/Main.hs \

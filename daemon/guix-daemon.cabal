@@ -40,6 +40,7 @@ library
         Goonix.Store.CaStore
         Goonix.Store.DeepScan
         Goonix.Store.Records
+        Goonix.Store.RecordSignature
         Goonix.Build.CaDecision
         Goonix.Build.Engine
         Goonix.Build.Graph
@@ -120,6 +121,17 @@ test-suite ca-decision-properties
     build-depends:
         base,
         containers,
+        guix-daemon-hs
+
+test-suite record-signature-properties
+    import: warnings
+    type: exitcode-stdio-1.0
+    hs-source-dirs: test/record-signature
+    main-is: Main.hs
+    build-depends:
+        base,
+        bytestring,
+        directory,
         guix-daemon-hs
 
 test-suite format-properties

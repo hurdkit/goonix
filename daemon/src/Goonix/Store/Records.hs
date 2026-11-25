@@ -15,6 +15,7 @@ module Goonix.Store.Records
   , queryRecords
   , queryRecordsByPath
   , queryRecordsByResolved
+  , queryRecordsWithLog
   , derivationsForPath
   , originalsForPath
   , chosenPaths
@@ -26,12 +27,16 @@ module Goonix.Store.Records
   , dropChoice
   ) where
 
+import Control.Exception (throwIO, try)
+import Control.Monad (foldM)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as C
 import Data.Int (Int64)
 import Goonix.Store.Ca (put64, putBytes)
 import Goonix.Store.Database
+import Goonix.Store.RecordSignature
+import System.IO (hPutStrLn, stderr)
 
 data BuildRecord = BuildRecord
   { recordResolvedHash :: !ByteString
@@ -140,34 +145,59 @@ addRecord db record = do
          Integer (if recordRelocationChecked record then 1 else 0),
          Bytes (recordSignature record)]
 
-readRecord :: [Value] -> BuildRecord
+readRecord :: [Value] -> IO BuildRecord
 readRecord [Bytes resolvedHash, Bytes resolvedDerivation, Bytes output,
-            Bytes path, Bytes origin, Integer checked, Bytes signature] =
-  BuildRecord resolvedHash resolvedDerivation output path origin (checked /= 0) signature
-readRecord row = error ("unexpected record row: " ++ show row)
+            Bytes path, Bytes origin, Integer checked, Bytes signature] = do
+  loaded <- loadRecordSignature signature
+  pure (BuildRecord resolvedHash resolvedDerivation output path origin (checked /= 0) loaded)
+readRecord row = ioError (userError ("unexpected record row: " ++ show row))
 
 recordColumns :: ByteString
 recordColumns = "resolvedHash, resolvedDerivation, output, path,\
   \ origin, relocationChecked, signature"
 
+-- | A pre-base64 stored S-expression is normalized at load.  Garbage in one
+-- row does not poison an aggregate: retain valid siblings and name the bad
+-- row in the warning.  Direct graph verification never calls this fallback.
+queryRecordsWithLog :: (ByteString -> IO ()) -> Database -> ByteString -> [Value] -> IO [BuildRecord]
+queryRecordsWithLog logWarning db sql arguments = do
+  rows <- queryValues db sql arguments
+  foldM collect [] rows
+  where
+    collect records row = do
+      loaded <- try (readRecord row)
+      case loaded of
+        Right record -> pure (records ++ [record])
+        Left (InvalidRecordSignature reason) -> do
+          logWarning ("goonix: ignoring invalid record signature for `" <> field 1
+            <> "', output `" <> field 2 <> "', path `" <> field 3 <> "': " <> C.pack reason)
+          pure records
+      where
+        field index = case drop index row of
+          Bytes bytes : _ -> bytes
+          _ -> B.empty
+
+queryRecordsLogged :: Database -> ByteString -> [Value] -> IO [BuildRecord]
+queryRecordsLogged = queryRecordsWithLog (hPutStrLn stderr . C.unpack)
+
 -- | C++ query: an empty output selects every output of the resolved hash.
 queryRecords :: Database -> ByteString -> ByteString -> IO [BuildRecord]
 queryRecords db resolvedHash output =
-  map readRecord <$> queryValues db
+  queryRecordsLogged db
     ("select " <> recordColumns <> " from GoonixBuildRecords\
     \ where resolvedHash = ? and (? = '' or output = ?) order by id;")
     [Bytes resolvedHash, Bytes output, Bytes output]
 
 queryRecordsByPath :: Database -> ByteString -> IO [BuildRecord]
 queryRecordsByPath db path =
-  map readRecord <$> queryValues db
+  queryRecordsLogged db
     ("select " <> recordColumns <> " from GoonixBuildRecords\
     \ where path = ? order by id;")
     [Bytes path]
 
 queryRecordsByResolved :: Database -> ByteString -> IO [BuildRecord]
 queryRecordsByResolved db resolved =
-  map readRecord <$> queryValues db
+  queryRecordsLogged db
     ("select " <> recordColumns <> " from GoonixBuildRecords\
     \ where resolvedDerivation = ? order by id;")
     [Bytes resolved]

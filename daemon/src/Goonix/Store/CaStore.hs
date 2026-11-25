@@ -15,6 +15,7 @@ module Goonix.Store.CaStore
   , recordBuild
   , recordGoonixOutput
   , queryGoonixBuildGraph
+  , queryGoonixBuildGraphWithLog
   , goonixRecordFields
   , importGoonixGraph
   , resolvedHashOf
@@ -37,9 +38,11 @@ import Goonix.Store.Base32 (encodeBase16)
 import Goonix.Store.Hash (sha256)
 import Goonix.Store.Path (storePathToName, makeTextPath)
 import Goonix.Store.ReadOnly
+import Goonix.Store.RecordSignature
 import Goonix.Store.Records
 import Goonix.Store.Writing (addTextToStore)
 import System.Posix.Types (Fd)
+import System.IO (hPutStrLn, stderr)
 
 -- | Create the records tables if absent (C++ initialiseGoonixRecords).
 initCaRecords :: Store -> IO ()
@@ -180,7 +183,7 @@ recordBuild store resolvedPath output path origin relocationChecked = do
   let hash = resolvedHashOf resolved
       record = BuildRecord hash resolvedPath output path origin relocationChecked B.empty
       payload = canonicalBuildRecordPayload record
-  signature <- signHash (sha256 payload)
+  signature <- encodeRecordSignature <$> signHash (sha256 payload)
   addRecord (database store) record { recordSignature = signature }
 
 -- | C++ recordGoonixOutput: the fact plus the choice.
@@ -267,7 +270,8 @@ importGoonixGraph rootFd store unresolved offered hints = do
     -- signing public keys/ACL.  It returns the SHA-256 digest the signer
     -- actually signed; only that digest is compared to the canonical record.
     authenticateGraphRecord store' record resolvedBytes = do
-      verified <- try (verifySignature (recordSignature record))
+      rawSignature <- decodeRecordSignature (recordSignature record)
+      verified <- try (verifySignature rawSignature)
       verifiedHash <- case verified of
         Left (exception :: SomeException) ->
           throwIO (StoreError (C.pack ("goonix build record authentication failed: " ++ show exception)) 1)
@@ -306,7 +310,10 @@ goonixRecordFields records includeHash = concatMap fields records
 -- already made; facts plus record-backed routing hints.  Names, not input
 -- availability, determine R; no query repairs a choice.
 queryGoonixBuildGraph :: Store -> ByteString -> IO ([BuildRecord], [ByteString])
-queryGoonixBuildGraph store unresolved = do
+queryGoonixBuildGraph store = queryGoonixBuildGraphWithLog store (hPutStrLn stderr . C.unpack)
+
+queryGoonixBuildGraphWithLog :: Store -> (ByteString -> IO ()) -> ByteString -> IO ([BuildRecord], [ByteString])
+queryGoonixBuildGraphWithLog store logWarning unresolved = do
   (_, records, hints) <- visit (Set.empty, [], []) unresolved =<< readDerivation unresolved
   pure (records, hints)
   where
@@ -341,7 +348,9 @@ queryGoonixBuildGraph store unresolved = do
                     if B.null chosen
                       then pure acc
                       else do
-                        outputRecords <- queryRecords (database store) hash output
+                        outputRecords <- queryRecordsWithLog logWarning (database store)
+                          ("select resolvedHash, resolvedDerivation, output, path, origin, relocationChecked, signature from GoonixBuildRecords where resolvedHash = ? and output = ? order by id;")
+                          [Bytes hash, Bytes output]
                         let hint = if any (\r -> recordOutput r == output && recordPath r == chosen) outputRecords
                               then hs ++ [originalPath, output, chosen]
                               else hs
