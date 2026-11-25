@@ -830,16 +830,8 @@ void mountIntoSandbox(const Plan & plan, const Bytes & source,
 void setupNamespaces(Plan & plan)
 {
     if (!plan.extended) return;
-    if (!plan.has(hostIdentitiesFlag)) {
-        if (unshare(CLONE_NEWUSER) == -1) sysError("unshare(CLONE_NEWUSER)");
-        const Bytes uidMap = std::to_string(plan.uidMapInside) + " " +
-            std::to_string(plan.uidMapOutside) + " 1\n";
-        const Bytes gidMap = std::to_string(plan.gidMapInside) + " " +
-            std::to_string(plan.gidMapOutside) + " 1\n";
-        writeFile("/proc/self/uid_map", uidMap);
-        writeFile("/proc/self/setgroups", "deny");
-        writeFile("/proc/self/gid_map", gidMap);
-    }
+    if (!plan.has(hostIdentitiesFlag))
+        unshareAndInitUserns(plan, "extended sandbox");
     const int flags = CLONE_NEWNS | CLONE_NEWNET | CLONE_NEWPID |
         CLONE_NEWIPC | CLONE_NEWUTS;
     if (unshare(flags) == -1) sysError("creating sandbox namespaces");
@@ -941,6 +933,9 @@ static Bytes idMapToIdentityMap(const Bytes & map)
     return out;
 }
 
+void setupNamespaces(Plan & plan);
+void unshareAndInitUserns(Plan & plan, const Bytes & context);
+
 /* Retain spawn.cc's external map-writer handshake.  No daemon code runs
    after fork; the child only executes the C++ map-writing routine. */
 extern "C" int goonix_map_kvm_gid(pid_t target, gid_t daemon_gid,
@@ -1000,15 +995,20 @@ void unshareAndInitUserns(Plan & plan, const Bytes & context)
             /* Report success before denying supplementary groups.  The child
                uses this only to retain the mapped guest group in its plan. */
             writeFull(fromChild.writeSide.get(), mappedKvm ? "kvm\n" : "one\n");
-            try {
-                writeFile("/proc/" + pid + "/setgroups", plan.allowSetgroups ? "allow\n" : "deny\n");
-            } catch (const std::exception & error) {
-                throw Error(Bytes("setgroups: ") + error.what());
-            }
-            try {
-                writeFile("/proc/" + pid + "/gid_map", gidMap);
-            } catch (const std::exception & error) {
-                throw Error(Bytes("gid_map `") + gidMap + "': " + error.what());
+            /* A successful newgidmap has already installed both ranges.
+               C++ initializeUserNamespace returns here: setgroups and
+               gid_map cannot be written again in this namespace. */
+            if (!mappedKvm) {
+                try {
+                    writeFile("/proc/" + pid + "/setgroups", plan.allowSetgroups ? "allow\n" : "deny\n");
+                } catch (const std::exception & error) {
+                    throw Error(Bytes("setgroups: ") + error.what());
+                }
+                try {
+                    writeFile("/proc/" + pid + "/gid_map", gidMap);
+                } catch (const std::exception & error) {
+                    throw Error(Bytes("gid_map `") + gidMap + "': " + error.what());
+                }
             }
             writeFull(fromChild.writeSide.get(), "go\n");
         } catch (const std::exception & error) {
