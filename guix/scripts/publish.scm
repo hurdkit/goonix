@@ -781,7 +781,7 @@ has the given HASH of type ALGO."
   (let ((derivation (string-append (%store-prefix) "/" name)))
     (if (and (string-suffix? ".drv" name)
              (valid-path? store derivation))
-        (catch #t
+        (catch 'goonix-invalid-signature-encoding
           (lambda ()
             (values '((content-type . (text/plain (charset . "UTF-8"))))
                     (call-with-output-string
