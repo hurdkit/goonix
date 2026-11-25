@@ -84,6 +84,12 @@ make_tree "$work/one"
 make_tree "$work/two"
 one=$(root_of "$work/one")
 two=$(root_of "$work/two")
+for root in "$one" "$two"; do
+  if [ -e "$root" ]; then
+    echo "root collision, rerun: $root already exists" >&2
+    exit 1
+  fi
+done
 roots+=("$one" "$two")
 test "$one" != "$two"
 test "${#one}" -eq 13
