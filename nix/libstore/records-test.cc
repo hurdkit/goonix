@@ -213,6 +213,38 @@ int main(int argc, char ** argv)
     }
     std::cout << "goonix signing helper with forced stderr: PASS\n";
 
+    /* One bad row must not hide its valid sibling.  The bad row has a
+       distinct path, so this is a mixed aggregate, not a failed direct read. */
+    {
+        sqlite3 * fixture;
+        if (sqlite3_open((settings.nixDBPath + "/db.sqlite").c_str(), &fixture) != SQLITE_OK)
+            throw Error("could not open mixed-record fixture database");
+        const Path bad = store.addTextToStore("bad-record-output", "bad", PathSet());
+        auto sql = std::format(
+            "insert into GoonixBuildRecords "
+            "(resolvedHash, resolvedDerivation, output, path, origin, "
+            "relocationChecked, signature) values "
+            "('{}', '{}', 'out', '{}', 'corrupt-test', 0, 'not base64');",
+            hash, drv, bad);
+        int result = sqlite3_exec(fixture, sql.c_str(), nullptr, nullptr, nullptr);
+        sqlite3_close(fixture);
+        if (result != SQLITE_OK) throw Error("could not insert mixed-record fixture");
+        auto byHash = store.queryGoonixBuildRecords(hash, "out");
+        auto byPath = store.queryGoonixRecordsByPath(drv);
+        auto byResolved = store.queryGoonixRecordsByResolved(drv);
+        if (byHash.size() != 1 || byPath.size() != 1 || byResolved.size() != 1 ||
+            byHash.at(0).signature != records.at(0).signature) {
+            std::cerr << "goonix mixed valid and garbage records: FAIL\n";
+            return 1;
+        }
+        try {
+            verifyGoonixRecordSignature(store, "not base64");
+            std::cerr << "goonix direct invalid signature verification: FAIL\n";
+            return 1;
+        } catch (const InvalidRecordSignature &) { }
+        std::cout << "goonix mixed valid and garbage records: PASS\n";
+    }
+
     auto replayed = records.at(0);
     replayed.path = store.addTextToStore("replayed-output", "replayed", PathSet());
     try {

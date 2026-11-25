@@ -87,6 +87,8 @@ namespace nix {
    protocol string makes a strict UTF-8 reader throw on some records and not
    others.  Base64 makes the byte form deterministic, exactly as narinfo
    signatures are already carried. */
+MakeError(InvalidRecordSignature, Error)
+
 string goonixBase64Encode(const string & raw);
 string goonixBase64Decode(const string & encoded);
 

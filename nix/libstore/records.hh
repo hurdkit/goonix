@@ -2,6 +2,7 @@
 #pragma once
 
 #include "types.hh"
+#include "ca.hh"
 #include "sqlite.hh"
 #include <map>
 #include <vector>

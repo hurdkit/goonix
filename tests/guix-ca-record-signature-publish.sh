@@ -72,11 +72,15 @@ export GOONIX_EXPECTED_HEX=287369676e6174757265200a2028640a202028706b637331290a2
 ! grep -q 'input locale conversion error' "$root/publish.log"
 test "$(curl -sS -o /dev/null -w '%{http_code}' "$url/nix-cache-info")" = 200
 
-# Any other non-base64 field is refused, without taking down the publisher.
+# An aggregate graph skips a garbage row and warns; it does not poison the
+# valid-record query path or stop the publisher.  Direct verification of that
+# field is tested by nix/records-test and still refuses it.
 sqlite3 "$root/db/db.sqlite" '.timeout 10000' \
  "UPDATE GoonixBuildRecords SET signature = 'not base64 or a signature'
   WHERE path = '$(sed -n 's/.*(output "\([^"]*\)").*/\1/p' "$root/fixture.scm")';"
 code=$(request)
-test "$code" -ge 400
+test "$code" = 200
+grep -q '(goonix-records 1 (choices ()))' "$root/response"
+grep -q 'ignoring invalid record signature for `' "$root/publish.log"
 ! grep -q 'input locale conversion error' "$root/publish.log"
 test "$(curl -sS -o /dev/null -w '%{http_code}' "$url/nix-cache-info")" = 200

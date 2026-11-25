@@ -1280,7 +1280,14 @@ string verifyGoonixRecordSignature(LocalStore &, const string & signature)
     /* The stored field is base64; decode before verifying.  A field that is
        not valid base64 is refused by goonixBase64Decode with a clear message,
        never passed through as though it were already a raw signature. */
-    return verifySignature(goonixBase64Decode(signature));
+    string decoded;
+    try {
+        decoded = goonixBase64Decode(signature);
+    } catch (Error & error) {
+        throw InvalidRecordSignature(error.msg());
+    }
+    /* Authentication failures remain AuthenticationError, not bad encoding. */
+    return verifySignature(decoded);
 }
 
 void LocalStore::exportPath(const Path & path, bool sign,

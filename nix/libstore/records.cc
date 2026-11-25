@@ -116,11 +116,39 @@ static BuildRecord readRecord(SQLiteStmt::Use & use)
         /* A pre-base64 record holds the signer's raw advanced S-expression.
            Encode those exact bytes, including any raw high bytes. */
         signature = goonixBase64Encode(signature);
-    else
-        /* Refuse garbage at the read boundary rather than serving it. */
-        goonixBase64Decode(signature);
+    else {
+        try {
+            goonixBase64Decode(signature);
+        } catch (Error & error) {
+            throw InvalidRecordSignature(error.msg());
+        }
+    }
     return {use.getStr(0), use.getStr(1), use.getStr(2),
         use.getStr(3), use.getStr(4), use.getInt(5) != 0, signature};
+}
+
+/* A damaged row does not hide valid siblings in an aggregate query.  Direct
+   verification still rejects the same signature.  Name the row by its
+   resolved derivation, output and path so the warning is actionable. */
+template<typename... Args>
+static std::vector<BuildRecord> readRecords(sqlite3 * db, const string & sql,
+    Args... arguments)
+{
+    SQLiteStmt stmt;
+    stmt.create(db, sql);
+    auto use = stmt.use();
+    (use(arguments), ...);
+    std::vector<BuildRecord> result;
+    while (use.next()) {
+        try {
+            result.push_back(readRecord(use));
+        } catch (InvalidRecordSignature & error) {
+            printMsg(lvlError, std::format(
+                "goonix: ignoring invalid record signature for `{}', output `{}', path `{}': {}",
+                use.getStr(1), use.getStr(2), use.getStr(3), error.msg()));
+        }
+    }
+    return result;
 }
 
 static const char * recordColumns =
@@ -130,39 +158,21 @@ static const char * recordColumns =
 std::vector<BuildRecord> BuildRecords::query(const string & resolvedHash,
     const string & output)
 {
-    SQLiteStmt stmt;
-    stmt.create(db, std::format("select {} from GoonixBuildRecords "
+    return readRecords(db, std::format("select {} from GoonixBuildRecords "
         "where resolvedHash = ? and (? = '' or output = ?) order by id;",
-        recordColumns));
-    auto use = stmt.use();
-    use(resolvedHash)(output)(output);
-    std::vector<BuildRecord> result;
-    while (use.next()) result.push_back(readRecord(use));
-    return result;
+        recordColumns), resolvedHash, output, output);
 }
 
 std::vector<BuildRecord> BuildRecords::queryByPath(const Path & path)
 {
-    SQLiteStmt stmt;
-    stmt.create(db, std::format("select {} from GoonixBuildRecords "
-        "where path = ? order by id;", recordColumns));
-    auto use = stmt.use();
-    use(path);
-    std::vector<BuildRecord> result;
-    while (use.next()) result.push_back(readRecord(use));
-    return result;
+    return readRecords(db, std::format("select {} from GoonixBuildRecords "
+        "where path = ? order by id;", recordColumns), path);
 }
 
 std::vector<BuildRecord> BuildRecords::queryByResolvedDerivation(const Path & resolved)
 {
-    SQLiteStmt stmt;
-    stmt.create(db, std::format("select {} from GoonixBuildRecords "
-        "where resolvedDerivation = ? order by id;", recordColumns));
-    auto use = stmt.use();
-    use(resolved);
-    std::vector<BuildRecord> result;
-    while (use.next()) result.push_back(readRecord(use));
-    return result;
+    return readRecords(db, std::format("select {} from GoonixBuildRecords "
+        "where resolvedDerivation = ? order by id;", recordColumns), resolved);
 }
 
 PathSet BuildRecords::derivationsForPath(const Path & path)
