@@ -20,6 +20,7 @@
   #:use-module (guix daemon-sessions)
   #:use-module (guix scripts processes)
   #:use-module (guix store)
+  #:use-module ((guix remote-procedures) #:select (%protocol-version))
   #:use-module (guix serialization)
   #:use-module (guix derivations)
   #:use-module (guix packages)
@@ -130,10 +131,10 @@
 (define %stderr-last #x616c7473)
 
 (define (asked-of-daemon version answer)
-  "Run a daemon that announces protocol VERSION and answers 'query-sessions'
-with ANSWER, a list of strings, and ask it with 'query-daemon-report'.  Return
-two values: the operations it was asked for, and what 'query-daemon-report'
-returned."
+  "Run a daemon that sends VERSION as its version in the greeting and answers
+'query-sessions' with ANSWER, a list of strings, and ask it with
+'query-daemon-report'.  Return two values: the operations it was asked for,
+and what 'query-daemon-report' returned."
   (call-with-temporary-directory
    (lambda (directory)
      (let ((file   (string-append directory "/socket"))
@@ -176,22 +177,27 @@ returned."
          (close-port server)
          (values asked report))))))
 
-;; The protocol version from which a daemon has the question, and the one
-;; before it, written out: these are what daemons that exist announce.
-(define %version-with-sessions #x167)
-(define %version-without-sessions #x166)
+;; What a goonix daemon sets above its protocol version in the greeting, and
+;; the versions that goonix daemons announced before they gave that signal,
+;; written out: these are what daemons that exist send.  The question goes
+;; with the signal, not with a version: upstream may give any of these
+;; numbers a meaning of its own.
+(define %signal #x67010000)
+(define %versions-before-the-signal '(#x165 #x166 #x167))
 
-(test-equal "a daemon that announces a version before the question is not asked"
-  '(() #f)
-  (let-values (((asked report)
-                (asked-of-daemon %version-without-sessions
-                                 '("1" "4242" "3" "100" "0" "0"))))
-    (list asked (report->list report))))
+(test-equal "a daemon that gives no signal is not asked, whatever its version"
+  '((() #f) (() #f) (() #f) (() #f))
+  (map (lambda (version)
+         (let-values (((asked report)
+                       (asked-of-daemon version
+                                        '("1" "4242" "3" "100" "0" "0"))))
+           (list asked (report->list report))))
+       (cons %protocol-version %versions-before-the-signal)))
 
-(test-equal "a daemon that announces the version of the question is asked"
+(test-equal "a daemon that gives the signal is asked"
   '((85) (4242 (3 100 () ())))
   (let-values (((asked report)
-                (asked-of-daemon %version-with-sessions
+                (asked-of-daemon (logior %signal %protocol-version)
                                  '("1" "4242" "3" "100" "0" "0"))))
     (list asked (report->list report))))
 
@@ -415,11 +421,11 @@ Session: 4310
 (define (mine? session)
   (= (getpid) (process-id (daemon-session-client session))))
 
-(test-assert "the daemon announces the version of the question and answers it"
+(test-assert "the daemon gives the signal and answers the question"
   ;; The daemon it names is one that listens, not a session process.
   (let ((report (query-daemon-report)))
     (and (with-store store
-           (>= (store-connection-version store) %version-with-sessions))
+           (positive? (store-connection-goonix-level store)))
          (daemon-report? report)
          (let-values (((sessions listening) (daemon-sessions)))
            (->bool (memv (daemon-report-pid report)

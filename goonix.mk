@@ -18,6 +18,7 @@ MODULES +=					\
   guix/ca/files.scm				\
   guix/download-cache.scm			\
   guix/daemon-sessions.scm			\
+  guix/goonix-protocol.scm			\
   guix/ca/scan.scm				\
   guix/scripts/ca.scm				\
   guix/flakes.scm				\
@@ -61,6 +62,7 @@ SCM_TESTS +=					\
   tests/ca-sharing.scm				\
   tests/download-cache.scm			\
   tests/daemon-sessions.scm			\
+  tests/goonix-protocol.scm			\
   tests/flakes.scm				\
   tests/flake-eval.scm				\
   tests/flake-actions.scm			\

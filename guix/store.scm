@@ -28,6 +28,7 @@
   #:use-module ((guix i18n) #:select (G_))
   #:use-module (guix serialization)
   #:use-module (guix remote-procedures)
+  #:use-module (guix goonix-protocol)             ;goonix: the daemon's signal
   #:use-module (guix monads)
   #:use-module (guix records)
   #:use-module (guix base16)
@@ -86,6 +87,7 @@
             store-connection-major-version
             store-connection-minor-version
             store-connection-socket
+            store-connection-goonix-level         ;goonix: the daemon's signal
 
             ;; Deprecated forms for 'store-connection'.
             nix-server?
@@ -248,6 +250,10 @@
   (atts-cache   store-connection-add-text-to-store-cache)
   (caches       store-connection-caches
                 (default '#()))                   ;vector
+  ;; goonix: the level the daemon gave in the greeting; 0 means that it
+  ;; gave no signal and is sent upstream's operations and settings only.
+  (goonix-level store-connection-goonix-level
+                (default 0))
   (built-in-builders store-connection-built-in-builders
                      (default (delay '()))))      ;promise
 
@@ -461,7 +467,8 @@ daemon.  A default BUFFER-SIZE of 8192 is used.  Return a server object."
           (unless (>= (protocol-minor v) #x61)    ;61 was added in Jan. 2017
             (handshake-error))
 
-          (write-value integer %protocol-version port)
+          (write-value integer            ;goonix: the version below the signal
+                       (goonix-version-word %protocol-version) port)
           (write-value integer (if cpu-affinity 1 0) port)
           (when cpu-affinity
             (write-value integer cpu-affinity port))
@@ -497,6 +504,8 @@ connection.  Use with care."
                             (make-vector
                              (atomic-box-ref %store-connection-caches)
                              vlist-null)
+                            ;; goonix: the level the daemon gave in VERSION.
+                            (version-word-goonix-level version)
                             (if built-in-builders
                                 (delay built-in-builders)
                                 (delay (%built-in-builders connection)))))
@@ -639,6 +648,12 @@ encoding conversion errors."
                         #'(server arg ...))
            docstring
            (let* ((s (store-connection-socket server)))
+             ;; goonix: an operation of the fork goes to no other daemon.
+             (unless (goonix-level-knows? (store-connection-goonix-level server)
+                                          id)
+               (raise (condition (&store-protocol-error
+                                  (message (goonix-refusal 'name))
+                                  (status 1)))))
              (record-operation 'name)
              (write-value integer id s)
              (write-value type arg s)
@@ -802,8 +817,10 @@ definitions."
                #:print-build-trace print-build-trace
                #:use-substitutes? use-substitutes?
                #:settings
-               ;; goonix: opt into deep CA scans on this connection.
-               `(("goonix-deep-scan" . ,(if deep-scan? "true" "false"))
+               ;; goonix: opt into deep CA scans on this connection, with a
+               ;; daemon that has the setting.
+               `(,@(goonix-settings (store-connection-goonix-level server)
+                                    deep-scan?)
                  ;; This option is honored by 'guix substitute' et al.
                  ,@(if print-build-trace
                        `(("print-extended-build-trace"

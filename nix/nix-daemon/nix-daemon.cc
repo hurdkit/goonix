@@ -1,7 +1,6 @@
 #include "config.h"
 #include "nix-daemon.hh"
 #include "local-store.hh"
-#include "misc.hh" // goonix: derivationFromPath for realised-output queries
 #include "util.hh"
 #include "serialise.hh"
 #include "worker-protocol.hh"
@@ -306,6 +305,8 @@ struct SavingSourceAdapter : Source
     }
 };
 
+
+#include "goonix-operations.inc" // goonix: the fork's operations and its signal
 
 static void performOp(bool trusted, unsigned int clientVersion,
     Source & from, Sink & to, unsigned int op)
@@ -634,8 +635,10 @@ static void performOp(bool trusted, unsigned int clientVersion,
                     || name == "build-max-jobs" || name == "build-cores"
                     || name == "build-repeat"
                     /* goonix: an unprivileged, bounded helper makes the
-                       client's own builds stricter, never more permissive. */
-                    || name == "goonix-deep-scan"
+                       client's own builds stricter, never more permissive.
+                       Only a client that gave the signal has the setting. */
+                    || (name == "goonix-deep-scan" && goonixPeerLevel(clientVersion)
+                        >= goonixSettingsLevel)
                     || name == "multiplexed-build-output")
                     settings.set(name, value);
 		else if (name == "user-name"
@@ -778,52 +781,9 @@ static void performOp(bool trusted, unsigned int clientVersion,
 	break;
     }
 
-    case wopQueryRealisedOutput: {
-        // goonix: no choice mutation in a query and no client registration.
-        Path drv = readStorePathStrict(from);
-        string output = readString(from);
-        startWork();
-        Path path = dynamic_cast<LocalStore *>(store.get())
-            ->realisedOutputPath(drv, derivationFromPath(*store, drv), output);
-        stopWork();
-        writeString(path, to);
-        break;
-    }
-
-    case wopQueryBuildRecords: {
-        string hash = readString(from);
-        string output = readString(from);
-        startWork();
-        auto records = dynamic_cast<LocalStore *>(store.get())
-            ->queryGoonixBuildRecords(hash, output);
-        stopWork();
-        /* One list of strings, six per record: a type that the client's
-           (guix serialization) has, so that the module stays upstream's.
-           Its text is part of the derivations of most packages.  */
-        writeStrings(goonixRecordFields(records), to); // goonix: record fields
-        break;
-    }
-
-    case wopQueryBuildGraph: {
-        // goonix: read-only graph facts; clients cannot register mappings.
-        Path drv = readStorePathStrict(from);
-        startWork();
-        auto response = dynamic_cast<LocalStore *>(store.get())
-            ->queryGoonixBuildGraph(drv);
-        stopWork();
-        writeStrings(goonixRecordFields(response.first, true), to); // goonix: graph fields
-        writeStrings(response.second, to); // goonix: record-backed unsigned hints
-        break;
-    }
-
-    case wopQuerySessions: // goonix: local clients only, as the Haskell daemon
-        if (isRemoteConnection) throw Error(std::format("invalid operation {}", op));
-        startWork();
-        stopWork();
-        writeStrings(goonixSessionReport(), to);
-        break;
-
     default:
+        // goonix: an operation of the fork, for a client that gave the signal.
+        if (goonixPerformOp(clientVersion, from, to, op)) break;
         throw Error(std::format("invalid operation {}", op));
     }
 }
@@ -847,7 +807,7 @@ static void processConnection(bool trusted, uid_t userId)
     unsigned int magic = readInt(from);
     if (magic != WORKER_MAGIC_1) throw Error("protocol mismatch");
     writeInt(WORKER_MAGIC_2, to);
-    writeInt(PROTOCOL_VERSION, to);
+    writeInt(goonixVersionWord(PROTOCOL_VERSION), to); // goonix: with the signal
     to.flush();
     unsigned int clientVersion = readInt(from);
 

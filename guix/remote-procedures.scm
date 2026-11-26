@@ -46,7 +46,7 @@
 
 (define %protocol-version
   ;; Version of the currently-implemented protocol.
-  #x167)                                  ;goonix: as the daemons announce
+  #x164)
 
 ;; Values sent by the client and then the server upon handshake.
 (define %worker-magic-1 #x6e697863)               ; "nixc"
@@ -327,8 +327,9 @@ contains unsigned original-derivation, output and chosen-path triples."
 
   (define (query-sessions)
     "Return the daemon's sessions other than this one, as a list of strings;
-see 'string-list->daemon-report' in (guix daemon-sessions), which asks only
-a daemon whose version says that it knows this procedure."
+see 'string-list->daemon-report' in (guix daemon-sessions).  Like the three
+procedures above, it is sent only to a daemon that gave the signal of
+(guix goonix-protocol) in the greeting."
     id: 85
     returns: string-list))
 

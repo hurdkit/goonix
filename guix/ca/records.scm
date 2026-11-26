@@ -11,11 +11,14 @@
   #:use-module (guix base16)
   #:use-module (guix base64)
   #:use-module (guix store)
+  #:use-module ((guix remote-procedures) #:select (remote-procedure-id))
+  #:use-module ((guix goonix-protocol) #:select (goonix-level-knows?))
   #:use-module (ice-9 match)
   #:use-module (rnrs io ports)
   #:use-module (rnrs bytevectors)
   #:use-module (srfi srfi-1)
-  #:export (build-graph-records
+  #:export (daemon-knows-build-graph?
+            build-graph-records
             graph-response
             build-graph-expression
             build-records->expression
@@ -104,6 +107,13 @@ refusing to interpret it as a raw signature (~a)"
                               signature)
                         records)))
       (_ (error "daemon returned incomplete goonix graph record" fields)))))
+
+(define (daemon-knows-build-graph? store)
+  "Return true if the daemon behind STORE said in the greeting that it knows
+'query-build-graph'.  No other daemon is asked for a build graph:
+'graph-response' and the procedures made of it raise an error instead."
+  (goonix-level-knows? (store-connection-goonix-level store)
+                       (remote-procedure-id query-build-graph)))
 
 (define (graph-response store derivation)
   "Return DERIVATION's signed records and its choice-hint triples."
