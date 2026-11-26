@@ -5,13 +5,21 @@
 // translation unit of its own because the operations report their work
 // through that file's startWork and stopWork.
 
+#include "goonix-protocol.hh"
 #include "misc.hh" // derivationFromPath, for the realised-output query
 
-/* Perform OP and return true if OP is an operation of goonix.  Otherwise
-   read nothing, write nothing and return false: the caller then refuses OP
-   as upstream's daemon refuses an operation that it does not have.  */
-static bool goonixPerformOp(Source & from, Sink & to, unsigned int op)
+/* Perform OP and return true if OP is an operation of goonix and the
+   client said in the greeting, with the level in CLIENTVERSION, that it
+   knows it.  Otherwise read nothing, write nothing and return false: the
+   caller then refuses OP as upstream's daemon refuses an operation that it
+   does not have.  A client of upstream, which gives no level, is refused
+   each of these in that way.  */
+static bool goonixPerformOp(unsigned int clientVersion,
+    Source & from, Sink & to, unsigned int op)
 {
+    unsigned int level = goonixOperationLevel(op);
+    if (level == 0 || goonixPeerLevel(clientVersion) < level) return false;
+
     switch (op) {
 
     case wopQueryRealisedOutput: {

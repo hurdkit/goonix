@@ -306,7 +306,7 @@ struct SavingSourceAdapter : Source
 };
 
 
-#include "goonix-operations.inc" // goonix: the fork's operations
+#include "goonix-operations.inc" // goonix: the fork's operations and its signal
 
 static void performOp(bool trusted, unsigned int clientVersion,
     Source & from, Sink & to, unsigned int op)
@@ -635,8 +635,10 @@ static void performOp(bool trusted, unsigned int clientVersion,
                     || name == "build-max-jobs" || name == "build-cores"
                     || name == "build-repeat"
                     /* goonix: an unprivileged, bounded helper makes the
-                       client's own builds stricter, never more permissive. */
-                    || name == "goonix-deep-scan"
+                       client's own builds stricter, never more permissive.
+                       Only a client that gave the signal has the setting. */
+                    || (name == "goonix-deep-scan" && goonixPeerLevel(clientVersion)
+                        >= goonixSettingsLevel)
                     || name == "multiplexed-build-output")
                     settings.set(name, value);
 		else if (name == "user-name"
@@ -780,8 +782,8 @@ static void performOp(bool trusted, unsigned int clientVersion,
     }
 
     default:
-        // goonix: an operation of the fork.
-        if (goonixPerformOp(from, to, op)) break;
+        // goonix: an operation of the fork, for a client that gave the signal.
+        if (goonixPerformOp(clientVersion, from, to, op)) break;
         throw Error(std::format("invalid operation {}", op));
     }
 }
@@ -805,7 +807,7 @@ static void processConnection(bool trusted, uid_t userId)
     unsigned int magic = readInt(from);
     if (magic != WORKER_MAGIC_1) throw Error("protocol mismatch");
     writeInt(WORKER_MAGIC_2, to);
-    writeInt(PROTOCOL_VERSION, to);
+    writeInt(goonixVersionWord(PROTOCOL_VERSION), to); // goonix: with the signal
     to.flush();
     unsigned int clientVersion = readInt(from);
 

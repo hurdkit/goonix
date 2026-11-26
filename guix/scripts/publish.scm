@@ -52,8 +52,8 @@
   #:use-module (gcrypt pk-crypto)
   #:use-module (guix workers)
   #:use-module (guix store)
-  #:autoload (guix ca records)
-             (build-graph-expression) ;goonix: signed graph and choice renderer
+  #:autoload (guix ca records)        ;goonix: signed graph and choice renderer
+             (build-graph-expression daemon-knows-build-graph?)
   #:use-module ((guix serialization) #:select (write-file))
   #:use-module (zlib)
   #:autoload   (lzlib) (call-with-lzip-output-port
@@ -779,7 +779,8 @@ has the given HASH of type ALGO."
 (define (render-goonix-records store request name) ;goonix: signed graph renderer
   "Render the signed build-record graph for the derivation named NAME."
   (let ((derivation (string-append (%store-prefix) "/" name)))
-    (if (and (string-suffix? ".drv" name)
+    (if (and (daemon-knows-build-graph? store)
+             (string-suffix? ".drv" name)
              (valid-path? store derivation))
         (catch 'goonix-invalid-signature-encoding
           (lambda ()

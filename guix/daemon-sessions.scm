@@ -17,6 +17,8 @@
 
 (define-module (guix daemon-sessions)
   #:use-module (guix store)
+  #:use-module ((guix remote-procedures) #:select (remote-procedure-id))
+  #:use-module ((guix goonix-protocol) #:select (goonix-level-knows?))
   #:use-module ((guix serialization) #:select (nar-error?))
   #:use-module (srfi srfi-1)
   #:use-module (srfi srfi-9)
@@ -57,15 +59,16 @@
 ;;; the daemon knows its sessions, so it is asked: the 'query-sessions'
 ;;; remote procedure returns them.
 ;;;
-;;; A daemon says in the version it announces whether it knows that
-;;; procedure, and one that does not is not asked: it would answer with an
-;;; error, end the session that asked and write a line about it in its log.
-;;; The daemon that has a process per session knows the procedure too, and
-;;; reports no session: /proc shows them all.  A daemon that is not asked, a
-;;; connection that fails or ends, and an answer this module cannot read all
-;;; mean the same here: the daemon reports no sessions, and what /proc shows
-;;; is all there is.  The question is put on a connection opened for it and
-;;; closed afterwards.
+;;; The procedure is goonix's.  A daemon says in the greeting whether it
+;;; knows it, with the signal of (guix goonix-protocol), and one that does
+;;; not is not asked, whatever protocol version it announces: it would answer
+;;; with an error, end the session that asked and write a line about it in
+;;; its log.  The daemon that has a process per session knows the procedure
+;;; too, and reports no session: /proc shows them all.  A daemon that is not
+;;; asked, a connection that fails or ends, and an answer this module cannot
+;;; read all mean the same here: the daemon reports no sessions, and what
+;;; /proc shows is all there is.  The question is put on a connection opened
+;;; for it and closed afterwards.
 ;;;
 ;;; A session that a daemon reported has a number, by which the daemon tells
 ;;; its sessions apart: they all have the daemon's PID.  'guix processes'
@@ -91,10 +94,6 @@
   (children  reported-session-children))          ;list of integers, PIDs
 
 (define %report-version 1)
-
-(define %sessions-protocol-version
-  ;; The protocol version from which a daemon knows 'query-sessions'.
-  #x167)
 
 (define (string-list->daemon-report strings)
   "Return the <daemon-report> that STRINGS, the answer to 'query-sessions',
@@ -156,8 +155,8 @@ Unix-domain socket of this machine."
 
 (define* (query-daemon-report #:optional (uri (%daemon-socket-uri)))
   "Ask the daemon at URI for its sessions and return its <daemon-report>.
-Return #f if it gives none: no daemon answers at URI, the daemon announces a
-version that does not have the question and is not asked, or URI denotes
+Return #f if it gives none: no daemon answers at URI, the daemon did not say
+in the greeting that it knows the question and is not asked, or URI denotes
 another machine, whose processes are not those 'guix processes' lists.  The
 connection this opens is not among the sessions of the report."
   (define (close store)
@@ -179,8 +178,9 @@ connection this opens is not among the sessions of the report."
       (false-if-exception (close-port port))))
 
   (define (ask store)
-    ;; A daemon of an earlier version does not know the question.
-    (and (>= (store-connection-version store) %sessions-protocol-version)
+    ;; Only a daemon that gave the signal knows the question.
+    (and (goonix-level-knows? (store-connection-goonix-level store)
+                              (remote-procedure-id query-sessions))
          (catch 'system-error
            (lambda ()
              (guard (c ((or (store-error? c) (nar-error? c)) #f))
