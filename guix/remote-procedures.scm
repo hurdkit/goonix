@@ -323,7 +323,14 @@ strings per record: resolved hash, resolved derivation, output, path, origin,
 relocation flag and signature.  That is seven fields.  The second string list
 contains unsigned original-derivation, output and chosen-path triples."
     id: 84
-    returns: string-list string-list))
+    returns: string-list string-list)
+
+  (define (query-sessions)
+    "Return the daemon's sessions other than this one, as a list of strings;
+see 'string-list->daemon-report' in (guix daemon-sessions).  Known to a
+daemon that serves every client from one process."
+    id: 85
+    returns: string-list))
 
 (define-syntax remote-procedure-id
   (syntax-rules ()

@@ -17,6 +17,7 @@ MODULES +=					\
   guix/ca/opaque.scm				\
   guix/ca/files.scm				\
   guix/download-cache.scm			\
+  guix/daemon-sessions.scm			\
   guix/ca/scan.scm				\
   guix/scripts/ca.scm				\
   guix/flakes.scm				\
@@ -59,6 +60,7 @@ SCM_TESTS +=					\
   tests/ca-rewrite.scm				\
   tests/ca-sharing.scm				\
   tests/download-cache.scm			\
+  tests/daemon-sessions.scm			\
   tests/flakes.scm				\
   tests/flake-eval.scm				\
   tests/flake-actions.scm			\

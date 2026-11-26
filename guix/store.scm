@@ -176,6 +176,7 @@
             query-realised-output/direct
             query-build-records
             query-build-graph
+            query-sessions
             live-paths
             dead-paths
             collect-garbage
@@ -711,6 +712,7 @@ definitions."
   query-realised-output/direct
   query-build-records
   query-build-graph
+  query-sessions
   optimize-store
   (verify-store => verify-store/direct)
   (collect-garbage => run-gc/direct)
