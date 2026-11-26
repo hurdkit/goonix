@@ -6,7 +6,8 @@
 # files among its open files, its builders among its children.  The Haskell
 # daemon is one process for all its sessions and shows none of that, so it
 # keeps the same facts and answers operation 85 with them.  The C++ daemon
-# does not know the operation.
+# knows the operation and answers it with no session: /proc shows them all.
+# Both announce a protocol version from which a client may ask.
 #
 # One client holds three connections: one builds, with a builder that waits
 # to be let go, one is idle, one asks.  Checked for the Haskell daemon:
@@ -19,12 +20,13 @@
 #   - after the build no session holds anything, and a connection that the
 #     daemon has ended is no longer listed, from the moment its client can
 #     see that end.
-# Checked for the C++ daemon, which is what a client of either has to cope
-# with: the question is refused with "invalid operation 85" and the
-# connection that asked is ended, by a session process that says so on the
-# daemon's standard error.
+# Checked for the C++ daemon: the answer names the daemon's PID and no
+# session, and the connection that asked is still served.
 # Checked for both: the building and the idle connection are served to the
-# end, and a connection opened afterwards is served.
+# end, and a connection opened afterwards is served; (guix daemon-sessions),
+# which asks only a daemon whose version has the operation, asks this one
+# and reads its answer; the daemon's standard error has no "invalid
+# operation" line.
 #
 # Usage: sessions.sh [DAEMON] [FIXTURE]
 set -euo pipefail
@@ -48,7 +50,7 @@ exec 9<>"$fixture/tick"
 if test "$(grep -ac GoonixziStore "$daemon" || true)" -gt 0; then
   export SESSIONS_EXPECT=report
 else
-  export SESSIONS_EXPECT=refusal
+  export SESSIONS_EXPECT=none
 fi
 
 launcher= scope=
@@ -94,11 +96,16 @@ if test "$SESSIONS_EXPECT" = report; then
     || fail "no sessions were reported"
   grep -Fqx 'sessions reported after the build and after two clients left' "$fixture/client.log" \
     || fail "no sessions were reported after the build"
+fi
+grep -Fqx 'the client of this tree asked the daemon and read its answer' "$fixture/client.log" \
+  || fail "(guix daemon-sessions) got no report from the daemon"
+if grep -F 'invalid operation' "$fixture/daemon.log" >&2; then
+  fail "the daemon refused an operation"
+fi
+if test "$SESSIONS_EXPECT" = report; then
   echo "sessions reported by the daemon: PASS"
 else
-  grep -Fqx 'operation 85 refused, its connection ended' "$fixture/client.log" \
-    || fail "operation 85 was not refused"
-  grep -Fq 'invalid operation 85' "$fixture/daemon.log" \
-    || fail "the daemon's session process did not report the operation it refused"
-  echo "operation 85 refused, the other clients served: PASS"
+  grep -Fqx 'no session reported, the asking connection served' "$fixture/client.log" \
+    || fail "operation 85 was not answered with no session"
+  echo "operation 85 answered with no session, the other clients served: PASS"
 fi

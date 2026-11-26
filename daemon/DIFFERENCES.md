@@ -54,24 +54,33 @@ session, with the client's PID as its second argument, the lock files of its
 builds among its open files and its builders among its children. The sessions
 of this daemon are threads of one process and show none of that. The daemon
 keeps those facts itself and gives them to a client that asks, with operation
-85 of the worker protocol, `wopQuerySessions`, which the C++ daemon does not
-have (inventory 1.6 and 9.25). The operation takes no argument and returns
-one list of strings: the version of the layout; the daemon's PID; then, for
-each session other than the asking one, its number, the PID of its client,
-the number of its lock files followed by their names, and the number of its
-child processes followed by their PIDs. `(guix daemon-sessions)` makes of
-that the sessions `guix processes` prints, beside the ones it finds in
-`/proc`. A daemon that refuses the operation, as the C++ daemon and
-upstream's do, adds none; the C++ daemon then ends the connection that asked,
-with a line on its standard error, and its other connections are not
-affected. What `guix processes` shows differs from what it shows for the C++
-daemon:
+85 of the worker protocol, `wopQuerySessions` (inventory 1.6 and 9.25). The
+operation takes no argument and returns one list of strings: the version of
+the layout; the daemon's PID; then, for each session other than the asking
+one, its number, the PID of its client, the number of its lock files followed
+by their names, and the number of its child processes followed by their
+PIDs. `(guix daemon-sessions)` makes of that the sessions `guix processes`
+prints, beside the ones it finds in `/proc`.
+
+The C++ daemon has the operation too and answers it with the version of the
+layout, its PID and no session: `/proc` shows every one of its sessions, and
+one named in the answer as well would be listed twice. Both daemons announce
+the protocol version that has the operation, and `(guix daemon-sessions)`
+asks a daemon only if the version it announced is at least that one. A daemon
+of an earlier version, upstream's among them, is not asked: it would refuse,
+end the connection that asked and write "invalid operation 85" on its
+standard error. What `guix processes` shows for this daemon differs from what
+it shows for the C++ daemon:
 
 - `SessionPID` is the daemon's PID for every session: there is no other
-  process. The sessions are told apart by their numbers, which `guix
-  processes` does not print. In its normalized format the `Session` records
-  of one daemon therefore share the `PID` that the format declares as their
-  key.
+  process. The sessions are told apart by their numbers. `guix processes`
+  prints the number of a session that its daemon reported in a
+  `SessionNumber` field after `SessionPID`. In its normalized format, where
+  the `PID` of a `Session` record is the key that `Lock` and `ChildProcess`
+  records refer to, the key of such a session is the daemon's PID and the
+  session's number joined by a hyphen, and the descriptor of the `Session`
+  records does not declare `PID` an integer. A session of the C++ daemon,
+  read in `/proc`, has no number and is printed as upstream prints it.
 - `LockHeld` lists the lock files of the outputs the session itself builds or
   substitutes, from before it waits for a lock until it has let go of it. A
   session that waits for a build which another session started waits inside
@@ -85,16 +94,18 @@ daemon:
   another session waits for it, is on no session's record.
 - Lock files are given to a trusted client only: root and the user the daemon
   runs as. Those are the users to whom `/proc` shows the open files of the
-  C++ session processes. A remote client is refused the operation: the PIDs
-  mean nothing on its host.
+  C++ session processes. A remote client is refused the operation, by
+  either daemon: the PIDs mean nothing on its host.
 - A daemon that has been told to stop accepts no connection and can no longer
   be asked. It has written the PIDs of the clients it waits for to its
   standard error.
 
 `daemon/test/differential/sessions.sh` runs against either daemon, with a
 client that builds on one connection, keeps a second idle and asks on a
-third: for this daemon the sessions it reports, for the C++ daemon the
-refusal, and for both that the other connections are served.
+third: for this daemon the sessions it reports, for the C++ daemon its
+answer without sessions, and for both that the other connections are served,
+that `(guix daemon-sessions)` asks and reads the answer, and that nothing is
+refused.
 
 Because it is one process, the daemon also creates the store and state
 directories once at start-up (`initialiseState`) rather than per client as the

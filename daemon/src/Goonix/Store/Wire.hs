@@ -132,8 +132,9 @@ data DecodeResult a
 workerMagic1, workerMagic2, protocolVersion :: Word32
 workerMagic1 = 0x6e697863
 workerMagic2 = 0x6478696f
--- goonix: 0x166 adds the resolved-derivation graph record queries (82-84).
-protocolVersion = 0x166
+-- goonix: 0x166 adds the resolved-derivation graph record queries (82-84),
+-- 0x167 the session query (85).  A client asks for 85 only from 0x167 on.
+protocolVersion = 0x167
 
 stderrNext, stderrRead, stderrWrite, stderrLast, stderrError :: Word32
 stderrNext = 0x6f6c6d67

@@ -3,10 +3,13 @@
 ;; for its sessions with operation 85, written here byte by byte so that the
 ;; test does not depend on a client that knows the operation.
 ;;
-;; SESSIONS_EXPECT says what the daemon under test does with the question:
-;; `report' (the Haskell daemon answers) or `refusal' (the C++ daemon does not
-;; know the operation).
+;; SESSIONS_EXPECT says what the daemon under test answers: `report' (the
+;; Haskell daemon names its sessions) or `none' (the C++ daemon names no
+;; session: each of its sessions is a process that /proc shows).  At the end
+;; the client of this tree, (guix daemon-sessions), asks too: it asks only a
+;; daemon whose version has the operation, and both daemons announce it.
 (use-modules (guix store) (guix serialization) (guix derivations) (guix tests)
+             (guix daemon-sessions)
              (gnu packages bootstrap)
              (ice-9 binary-ports) (ice-9 match) (ice-9 textual-ports)
              (ice-9 threads)
@@ -60,14 +63,6 @@
       (unless (eof-object? (get-u8 port))
         (loop)))
     (close-port port)))
-
-(define (closed? store)
-  "Return true if the daemon has ended STORE's connection."
-  (guard (c ((nar-error? c) #t))
-    (catch 'system-error
-      (lambda ()
-        (eof-object? (lookahead-u8 (store-connection-socket store))))
-      (const #t))))
 
 (define (rows strings)
   "Return the sessions STRINGS, an answer without its two leading strings,
@@ -167,16 +162,15 @@ denotes: a list of (NUMBER CLIENT LOCKS CHILDREN)."
      (assert (equal? sessions (report asking))
              "a second answer on the same connection differs"))
    (say "sessions reported while a build runs"))
-  ((refusal)
-   (match (ask asking)
-     (('refused message)
-      (assert (string-contains message "invalid operation 85")
-              "the refusal says: " message))
-     (other
-      (assert #f "the daemon did not refuse operation 85: " other)))
-   (assert (closed? asking)
-           "the daemon kept the connection that asked for operation 85")
-   (say "operation 85 refused, its connection ended")))
+  ((none)
+   (assert (null? (report asking))
+           "the daemon whose sessions /proc shows reported some")
+   ;; The connection that asked is still served.
+   (assert (not (valid-path? asking out))
+           "the output is valid before its build ended")
+   (assert (null? (report asking))
+           "a second answer on the same connection differs")
+   (say "no session reported, the asking connection served")))
 
 ;; Whatever the daemon did with the question, its other clients are served.
 (assert (not (valid-path? idle out)) "the output is valid before its build ended")
@@ -214,6 +208,19 @@ denotes: a list of (NUMBER CLIENT LOCKS CHILDREN)."
          (assert #f "a connection the daemon has ended is reported: "
                  sessions)))))
   (say "sessions reported after the build and after two clients left"))
+;; The client of this tree asks a daemon only if the version that the daemon
+;; announced has the operation.  Either daemon is asked, and names itself.
+(match (query-daemon-report (getenv "GUIX_DAEMON_SOCKET"))
+  ((? daemon-report? report)
+   (assert (eqv? (daemon-report-pid report) daemon-pid)
+           "the report names daemon " (daemon-report-pid report)
+           ", not " daemon-pid)
+   (assert (eq? (null? (daemon-report-sessions report)) (eq? expect 'none))
+           "the sessions of the report: " (daemon-report-sessions report)))
+  (_
+   (assert #f "(guix daemon-sessions) got no report from a daemon of version "
+           (number->string (store-connection-version later) 16))))
+(say "the client of this tree asked the daemon and read its answer")
 (close-connection building)
 (close-connection later)
 (say "client done")

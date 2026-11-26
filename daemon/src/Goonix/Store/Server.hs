@@ -549,8 +549,9 @@ dispatch config session store client settingsRef rootFd rootPath clientVersion o
     writeFrame client stderrLast
     writeSocket client (encodeStrings (goonixRecordFields records True) <> encodeStrings hints)
   -- goonix: this daemon's sessions, for `guix processes' (DIFFERENCES.md).
-  -- The C++ daemon does not know the operation.  The PIDs mean nothing on
-  -- another host, so a remote client gets the answer the C++ daemon gives.
+  -- The C++ daemon answers the operation with no session.  The PIDs mean
+  -- nothing on another host, so a remote client is refused as for an
+  -- operation that does not exist; the C++ daemon does the same.
   85 -> do
     settings <- readIORef settingsRef
     when (remote settings) (throwIO (StoreError "invalid operation 85" 1))
