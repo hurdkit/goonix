@@ -55,13 +55,19 @@ run() { # name script...
 run cabal-modules bash "$here/cabal-modules.sh" "$root"
 run dedup-overflow bash "$here/dedup-overflow.sh" "$root/daemon/cbits/files.c"
 run delete-hardlink bash "$here/delete-hardlink.sh" "$root"
-run sqlite-contention bash "$here/sqlite-contention.sh" "$root"
-run socket-idle bash "$here/socket-idle.sh" "$root"
-run child-wait bash "$here/child-wait.sh" "$root"
-run wait-stack bash "$here/wait-stack.sh" "$root"
-run offload-idle bash "$here/offload-idle.sh" "$root"
-run offload-eof bash "$here/offload-eof.sh" "$root"
-run offload-flood bash "$here/offload-flood.sh" "$root"
+# These probes compile daemon modules that import the generated Goonix.Config.
+# A --disable-haskell-daemon tree deliberately has no rule for that module.
+if test -f "$root/daemon/src/Goonix/Config.hs"; then
+  run sqlite-contention bash "$here/sqlite-contention.sh" "$root"
+  run socket-idle bash "$here/socket-idle.sh" "$root"
+  run child-wait bash "$here/child-wait.sh" "$root"
+  run wait-stack bash "$here/wait-stack.sh" "$root"
+  run offload-idle bash "$here/offload-idle.sh" "$root"
+  run offload-eof bash "$here/offload-eof.sh" "$root"
+  run offload-flood bash "$here/offload-flood.sh" "$root"
+else
+  echo 'SKIP: Haskell compile regressions (configured without the Haskell daemon; generated Goonix.Config.hs is absent)'
+fi
 if test -x "$root/guix-sandbox"; then
   run sandbox-plan-stable bash "$here/sandbox-plan-stable.sh" "$root"
 else
