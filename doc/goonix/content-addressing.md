@@ -127,8 +127,10 @@ outside a whole occurrence, UTF-16/UTF-32 token, or reserved placeholder is
 an output rejection naming the file and byte offset.  Ordinary finalisation
 permits a self token hidden in a gzip member.  The client can request the
 CA-1 policy with `set-build-options` keyword `deep-scan?`; it sends the
-per-connection `goonix-deep-scan` setting, accepted from any client because
-it only makes that connection's builds stricter.  It applies to builds
+per-connection `goonix-deep-scan` setting to a daemon that gave the signal
+of goonix in the greeting (`(guix goonix-protocol)`), and to no other.  Such
+a daemon accepts the setting from any client that gave the same signal,
+because it only makes that connection's builds stricter.  It applies to builds
 performed on that connection; an item that is already valid is not scanned
 again.  Before finalization, the daemon runs the optional libexec `goonix-ca-scan` helper with every output token of the
 derivation.  The helper, not the daemon, streams gzip, xz, bzip2 and ZIP
