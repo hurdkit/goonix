@@ -188,6 +188,8 @@ active sessions, and the master 'guix-daemon' process."
   "Display SESSION information in recutils format on PORT."
   (format port "SessionPID: ~a~%"
           (process-id (daemon-session-process session)))
+  ;; goonix: the number of a session that its daemon reported.
+  ((@ (guix daemon-sessions) session-number->recutils) session port)
   (format port "ClientPID: ~a~%"
           (process-id (daemon-session-client session)))
   (format port "ClientCommand:~{ ~a~}~%"
@@ -231,12 +233,14 @@ active sessions, and the master 'guix-daemon' process."
   "Display SESSION PID as a recutils field on PORT."
   (format
    port "Session: ~a"
-   (process-id (daemon-session-process session))))
+   ((@ (guix daemon-sessions) session-key) session ;goonix: PID and number
+    (process-id (daemon-session-process session)))))
 
 (define (session-scalars->normalized-record session port)
   "Display SESSION scalar fields to PORT in normalized form."
   (format port "PID: ~a~%"
-          (process-id (daemon-session-process session)))
+          ((@ (guix daemon-sessions) session-key) session ;goonix: as above
+           (process-id (daemon-session-process session))))
   (format port "ClientPID: ~a~%"
           (process-id (daemon-session-client session)))
   (format port "ClientCommand:~{ ~a~}~%"
@@ -250,7 +254,9 @@ active sessions, and the master 'guix-daemon' process."
 
 (define (daemon-sessions->normalized-record port sessions)
   "Display SESSIONS recutils on PORT in normalized form"
-  (display session-rec-type port)
+  ;; goonix: a descriptor that fits the keys of the sessions a daemon reported.
+  (display ((@ (guix daemon-sessions) session-rec-type) sessions
+            session-rec-type) port)
   (newline port)
   (newline port)
   (for-each (lambda (session)

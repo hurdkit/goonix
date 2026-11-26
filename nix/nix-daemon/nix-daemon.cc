@@ -816,6 +816,13 @@ static void performOp(bool trusted, unsigned int clientVersion,
         break;
     }
 
+    case wopQuerySessions: // goonix: local clients only, as the Haskell daemon
+        if (isRemoteConnection) throw Error(std::format("invalid operation {}", op));
+        startWork();
+        stopWork();
+        writeStrings(goonixSessionReport(), to);
+        break;
+
     default:
         throw Error(std::format("invalid operation {}", op));
     }
