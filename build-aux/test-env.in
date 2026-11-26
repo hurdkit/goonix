@@ -166,6 +166,7 @@ running 'guix-daemon $extra_options'" >&2
         test -S "$proxy_socket" || exit 1
     fi
     trap 'test -z "${proxy_pid:-}" || kill "$proxy_pid"; kill "$daemon_pid"; rm -rf "$GUIX_STATE_DIRECTORY"' EXIT
+    "@abs_top_srcdir@/build-aux/goonix-wait-socket.sh" "$GUIX_STATE_DIRECTORY/daemon-socket/socket" "$daemon_pid" || exit 1 # goonix: wait until the daemon listens.
 
     # The test suite expects the 'guile-bootstrap' package to be available.
     # Normally the Guile bootstrap tarball is downloaded by a fixed-output

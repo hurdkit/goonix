@@ -74,6 +74,7 @@ SCM_TESTS +=					\
 
 SH_TESTS +=					\
   build-aux/check-goonix-hooks.sh		\
+  tests/goonix-test-env-socket.sh		\
   tests/guix-ca-async.sh			\
   tests/ca-async-lifecycle.sh			\
   tests/guix-ca-record-signature-publish.sh	\
@@ -92,6 +93,7 @@ SH_TESTS +=					\
 
 EXTRA_DIST +=					\
   build-aux/goonix-hooks.txt			\
+  build-aux/goonix-wait-socket.sh		\
   build-aux/goonix-upstream-base		\
   tests/ca-vectors.json				\
   tests/ca-async-fixture.scm			\

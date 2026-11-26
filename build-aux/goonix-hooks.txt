@@ -3,7 +3,7 @@
 .gitignore 8 0
 Makefile.am 15 0
 build-aux/pre-inst-env.in 3 0
-build-aux/test-env.in 49 8
+build-aux/test-env.in 50 8
 config-daemon.ac 25 0
 gnu/local.mk 4 0
 guix/config.scm.in 4 0

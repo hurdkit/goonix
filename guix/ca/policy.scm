@@ -78,6 +78,16 @@
   ;; inherited records receive their new definition's location.
   (make-parameter upstream-package?))
 
+(define (bootstrap-package? package)
+  "Whether PACKAGE belongs to the bootstrap/commencement boundary.
+Match its module of definition, including bootstrap.scm locations that refer
+to bindings implemented in commencement.scm.  No package name list is needed."
+  (and=> (package-location package)
+         (lambda (location)
+           (member (location-file location)
+                   '("gnu/packages/commencement.scm"
+                     "gnu/packages/bootstrap.scm")))))
+
 (define %package-addressing
   (make-parameter 'input))
 
@@ -99,6 +109,9 @@
          (if (eq? (%package-addressing-policy) 'adopted)
              'input
              'resolved))
+        ((and (bootstrap-package? package)
+              (eq? (%package-addressing-policy) 'adopted))
+         'input)
         ((eq? 'opaque (assq-ref (package-properties package) 'self-references))
          (if (eq? (%package-addressing-policy) 'adopted)
              'input
@@ -119,7 +132,8 @@
 policy is 'adopted', PACKAGE is upstream's, and it is not marked opaque."
   (and (eq? (%package-addressing-policy) 'adopted)
        ((%upstream-package?) package)
-       (not (opaque-package? package))))
+       (not (or (opaque-package? package)
+                (bootstrap-package? package)))))
 
 (define (package-addressing-key)
   "Return the current mode and marker for the package derivation cache."
@@ -135,7 +149,8 @@ No direct-opaque or glibc-specific dependent promotion is applied."
         (let ((addressing (package-addressing context))
               (opaque-input?
                (and (eq? (%package-addressing-policy) 'adopted)
-                    (opaque-package? context)))
+                    (or (opaque-package? context)
+                        (bootstrap-package? context))))
               (adopt? (adopt-package? context)))
           (state-parameterize ((%package-addressing addressing)
                                (%package-derivation-name (bag-name bag)))
@@ -157,8 +172,9 @@ No direct-opaque or glibc-specific dependent promotion is applied."
   "Adopt DRV, the monadic input-addressed derivation of an upstream package
 under the 'adopted policy.  DRV is built with input-addressed inputs (the
 upstream graph); adoption then rewrites its references to adopted items.  If
-the scanner flags the item, re-lower it content-addressed from source instead.
-An opaque item is excluded by adopt-package? and does not enter this path."
+the scanner flags the item, re-lower the item ITSELF content-addressed from
+source instead; its inputs keep the 'adopted treatment.  An opaque item is
+excluded by adopt-package? and does not enter this path."
   (with-monad %store-monad
     (>>= (state-parameterize ((%package-addressing-policy 'input))
            drv)
@@ -168,20 +184,30 @@ An opaque item is excluded by adopt-package? and does not enter this path."
                                        'adopt-derivation)
                            store d)))
                (if (eq? adopt d)
-                   ;; Flagged item: build content-addressed from source.
+                   ;; Flagged item: build it content-addressed from source.
                    ;;
-                   ;; goonix: set the POLICY, not only %package-addressing.
-                   ;; This runs inside the outer (state-parameterize
-                   ;; ((%package-addressing-policy 'input)) ...) above, and
-                   ;; lower-bag-with-addressing OVERWRITES %package-addressing
-                   ;; with (package-addressing context), which under the 'input
-                   ;; policy returns 'input.  Setting only %package-addressing
-                   ;; therefore had no effect on a flagged item's re-lowering.
+                   ;; goonix: only the item's OWN derivation is content.
+                   ;; LOWER is the plain bag lowerer, so the item does not
+                   ;; re-enter lower-bag-with-addressing: %package-addressing
+                   ;; 'content reaches its bag-named gexp, and its nested
+                   ;; gexps are content under 'adopted anyway.  Its package
+                   ;; inputs go through the hook under the 'adopted POLICY,
+                   ;; so a bootstrap or opaque input stays input-addressed and
+                   ;; unadopted and an ordinary input is adopted, as for an
+                   ;; unflagged dependent.  The policy is bound explicitly so
+                   ;; this holds whatever extent the continuation runs in.
+                   ;;
+                   ;; A 'content POLICY here re-lowered the whole bag, inputs
+                   ;; included, content-addressed from source: package-
+                   ;; addressing's bootstrap clause and lower-bag-with-
+                   ;; addressing's opaque-input? select input only under
+                   ;; 'adopted.  The CA-6 boot probe then built the
+                   ;; commencement chain from source, gash-utils-boot first.
                    ;; Table/property opaque items do not enter this path;
                    ;; adopt-package? excludes them before this fallback.
                    (values (run-with-store store
                              (state-parameterize ((%package-addressing-policy
-                                                   'content)
+                                                   'adopted)
                                                   (%package-addressing 'content))
                                (apply lower bag arguments)))
                            store)
