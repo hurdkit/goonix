@@ -174,7 +174,11 @@ active sessions, and the master 'guix-daemon' process."
                                  (process-id process))
                                 (filter lock-file? files)))))))
 
-    (values (filter-map child-process->session children)
+    ;; goonix: a daemon that serves every client from one process reports
+    ;; its sessions itself; see (guix daemon-sessions).
+    (values (append (filter-map child-process->session children)
+                    ((@ (guix daemon-sessions) reported-daemon-sessions)
+                     daemon-session lookup-process lookup-children))
             master)))
 
 (define (lock->recutils lock port)
