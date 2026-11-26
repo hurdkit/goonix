@@ -9,6 +9,7 @@ module Goonix.Store.Socket
   , listenUnix
   , listenTcp
   , acceptSocket
+  , acceptSocketUnless
   , fromFd
   , closeSocket
   , readSocket
@@ -20,9 +21,10 @@ module Goonix.Store.Socket
   , setCloseOnExec
   ) where
 
-import Control.Concurrent (ThreadId, forkIO, killThread, threadDelay, threadWaitRead, threadWaitWrite)
+import Control.Concurrent (ThreadId, forkIO, killThread, threadDelay, threadWaitRead, threadWaitReadSTM, threadWaitWrite)
 import Control.Concurrent.MVar (MVar, newMVar, withMVar)
-import Control.Exception (IOException, catch, throwIO)
+import Control.Concurrent.STM (STM, atomically, orElse)
+import Control.Exception (IOException, catch, finally, throwIO)
 import Control.Monad (forever)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as B
@@ -46,6 +48,7 @@ foreign import ccall unsafe "goonix_listen_unix" c_listen_unix :: CString -> IO 
 foreign import ccall unsafe "goonix_socket_errno" c_socket_errno :: IO CInt
 foreign import ccall safe "goonix_listen_tcp" c_listen_tcp :: CString -> CString -> IO CInt
 foreign import ccall safe "goonix_accept" c_accept :: CInt -> IO CInt
+foreign import ccall unsafe "goonix_accept_ready" c_accept_ready :: CInt -> IO CInt
 foreign import ccall unsafe "goonix_peer_uid" c_peer_uid :: CInt -> Ptr CUInt -> IO CInt
 foreign import ccall unsafe "goonix_is_tcp" c_is_tcp :: CInt -> IO CInt
 foreign import ccall unsafe "goonix_is_listening" c_is_listening :: CInt -> IO CInt
@@ -88,6 +91,33 @@ acceptSocket (Socket (Fd fd) _) = do
       -- instead of holding a capability in a raw blocking read/write.
       setFdOption (Fd client) NonBlockingRead True
       pure (Socket (Fd client) (Just lock))
+
+-- | Accept the next client, or return 'Nothing' as soon as @stop@ succeeds.
+-- 'acceptSocket' sits in a foreign call that nothing can interrupt, so a
+-- daemon that has been asked to stop could not leave it before one more
+-- client arrived.  Here the listening socket is non-blocking and the wait is
+-- the runtime's, taken together with @stop@.
+acceptSocketUnless :: STM () -> Socket -> IO (Maybe Socket)
+acceptSocketUnless stop (Socket fd@(Fd raw) _) = do
+  setFdOption fd NonBlockingRead True
+  next
+  where
+    next = do
+      client <- c_accept_ready raw
+      if client >= 0
+        then do
+          lock <- newMVar ()
+          setFdOption (Fd client) NonBlockingRead True
+          pure (Just (Socket (Fd client) (Just lock)))
+        else if client == noClientWaiting
+          then do
+            (ready, forget) <- threadWaitReadSTM fd
+            stopped <- atomically ((True <$ stop) `orElse` (False <$ ready)) `finally` forget
+            if stopped then pure Nothing else next
+          else do
+            errno <- getErrno
+            socketError ("cannot accept client: errno=" ++ show (case errno of Errno number -> number))
+    noClientWaiting = -2
 
 fromFd :: Fd -> Socket
 fromFd fd = Socket fd Nothing

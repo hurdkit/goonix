@@ -16,6 +16,39 @@ preparation. The C++ daemon instead isolates each client in its own process.
 (inventory 1.1 and 9.25).  A vanished client is handled by cancelling its
 Haskell thread rather than by the `SIGPOLL` flag (inventory 1.3).
 
+`SIGTERM`, `SIGINT` and `SIGHUP` ask the daemon to stop; they do not end it at
+once (inventory 1.1 and 1.3). The C++ daemon leaves all three at their default
+action in its listening process: the signal ends that process, nobody new is
+accepted, and each connected client keeps its own process, which runs in a
+session of its own and serves it to the end. One process cannot both end and
+keep serving. On the first of these signals this daemon closes its listening
+sockets, so that new clients are refused as they are once the C++ listening
+process is gone; serves every connected client until that client disconnects,
+whether it is building or idle; and then ends by that signal, so that whoever
+waits for it sees the status the C++ listening process gives. A signal that
+was being ignored when the daemon started stays ignored, as it does there. The
+socket file is left in place, as it is there. What differs:
+
+- The process that was signalled stays alive until its last client has
+  disconnected, and a client that never disconnects keeps it alive. The C++
+  listening process is gone at once; what stays there are the clients' own
+  processes, under other PIDs.
+- Whoever sends `SIGKILL` after a grace period ends the remaining clients'
+  operations together with the daemon. A signal for the C++ listening
+  process, or for its process group, does not reach the clients' processes.
+- While it waits, the daemon has said so once on its standard error, with the
+  number of clients it waits for. With no client connected it says nothing.
+- A further `SIGTERM`, `SIGINT` or `SIGHUP` changes nothing while it waits.
+  There is no per-client process to signal either: the C++ daemon ends one
+  client's session, with "interrupted by the user", when that session's
+  process gets one of the three; here a session ends when its client
+  disconnects.
+
+`daemon/test/differential/stop-drain.sh` runs against either daemon: a client
+with a build in flight and a second, idle connection; the signal; no new
+connection; the build's result; the daemon gone afterwards, by the signal. For
+this daemon it also checks that the process is still there while a client is.
+
 Because it is one process, the daemon also creates the store and state
 directories once at start-up (`initialiseState`) rather than per client as the
 C++ `LocalStore` constructor does on each connection (inventory 1.1). The

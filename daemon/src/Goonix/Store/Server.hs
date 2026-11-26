@@ -8,6 +8,10 @@ module Goonix.Store.Server
   , serveListener
   , openListener
   , activationSockets
+  , Lifecycle
+  , newLifecycle
+  , requestStop
+  , openConnections
   , handleConnection
   , ServerConfig (..)
   , defaultConfig
@@ -17,8 +21,9 @@ module Goonix.Store.Server
 
 import Control.Concurrent (forkFinally)
 import Control.Concurrent.MVar (MVar, newMVar, modifyMVar)
-import Control.Exception (IOException, SomeException, bracket, catch, fromException, throwIO, try)
-import Control.Monad (forever, unless, when)
+import Control.Concurrent.STM (TVar, atomically, check, modifyTVar', newTVarIO, readTVar, readTVarIO, writeTVar)
+import Control.Exception (IOException, SomeException, bracket, catch, finally, fromException, throwIO, try)
+import Control.Monad (unless, when)
 import Data.Bits ((.&.))
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as B
@@ -37,7 +42,7 @@ import Goonix.Store.Substitute (substitutablePaths, substitutableInfos, substitu
 import Goonix.Store.Archive (exportPathTo, importPathsFrom)
 import Goonix.Build.Engine (BuildMode (..), BuildTrace (..), buildThings, buildThingsWithConfig, buildThingsWithCancel, ensureStorePath)
 import Goonix.Build.Users (loadUserPool)
-import Goonix.Build.Shared (newShared)
+import Goonix.Build.Shared (goalWorkers, newShared)
 import Goonix.Store.Hash (algorithmFromName, hashDigest, Hash (..), HashAlgorithm (..))
 import Goonix.Store.Base32 (decodeBase32)
 import Goonix.Store.Wire
@@ -58,20 +63,52 @@ import System.Posix.Types (Fd (..))
 import System.Posix.User (getRealUserID)
 import System.IO (hPutStrLn, stderr)
 
-serve :: ServerConfig -> IO ()
-serve config =
+-- | What the accept loops and the connections of one daemon process share so
+-- that the daemon can stop in an orderly way.
+--
+-- The C++ daemon gives each client a process of its own, in a session of its
+-- own.  A SIGTERM for its listening process ends that process alone: the
+-- clients that are connected keep their session processes and are served to
+-- the end.  Here every client is a thread of the process that listens, so the
+-- process is asked to stop instead: it accepts nobody else, serves the clients
+-- it has until each has disconnected, and only then ends.
+data Lifecycle = Lifecycle
+  { lifecycleStopping :: !(TVar Bool)
+  , lifecycleConnections :: !(TVar Int)
+  }
+
+newLifecycle :: IO Lifecycle
+newLifecycle = Lifecycle <$> newTVarIO False <*> newTVarIO 0
+
+-- | Ask the daemon to stop.  Returns whether this call was the first to ask.
+requestStop :: Lifecycle -> IO Bool
+requestStop lifecycle = atomically $ do
+  stopping <- readTVar (lifecycleStopping lifecycle)
+  writeTVar (lifecycleStopping lifecycle) True
+  pure (not stopping)
+
+-- | The number of clients connected now.
+openConnections :: Lifecycle -> IO Int
+openConnections lifecycle = readTVarIO (lifecycleConnections lifecycle)
+
+serve :: ServerConfig -> Lifecycle -> IO ()
+serve config lifecycle =
   -- C++ listening_sockets with no options uses settings.nixDaemonSocketFile,
   -- derived from nixStateDir (guix-daemon.cc:396, globals.cc:68).  The
   -- client's GUIX_DAEMON_SOCKET must not redirect this daemon elsewhere.
-  serveSocket config (configStateDirectory config <> "/daemon-socket/socket")
+  serveSocket config lifecycle (configStateDirectory config <> "/daemon-socket/socket")
 
-serveSocket :: ServerConfig -> ByteString -> IO ()
-serveSocket config path = do
+serveSocket :: ServerConfig -> Lifecycle -> ByteString -> IO ()
+serveSocket config lifecycle path = do
   listener <- openListener path
-  serveListener config listener
+  serveListener config lifecycle listener
 
-serveListener :: ServerConfig -> Socket -> IO ()
-serveListener config listener = do
+-- | Serve the clients of one listening socket.  Returns once the daemon has
+-- been asked to stop and has nothing left to do: the socket is closed, every
+-- client has disconnected, and no build that a departed client left behind is
+-- still being cleaned up.
+serveListener :: ServerConfig -> Lifecycle -> Socket -> IO ()
+serveListener config lifecycle listener = do
   initialiseState config
   users <- loadUserPool (configStateDirectory config) (setting "build-users-group" "" (configDefaultSettings config))
   -- HS-12: one shared scheduler per daemon process — one job limit and one goal
@@ -81,10 +118,27 @@ serveListener config listener = do
   shared <- newShared (settingInt "build-max-jobs" 1 (configDefaultSettings config))
   let sharedConfig = config { configBuildUsers = users, configSharedScheduler = Just shared }
   counter <- newMVar (0 :: Integer)
-  forever $ do
-    client <- acceptSocket listener
-    _ <- forkFinally (handleClient sharedConfig counter client) (const (closeSocket client))
-    pure ()
+  let connections = lifecycleConnections lifecycle
+      stopping = readTVar (lifecycleStopping lifecycle) >>= check
+      accept = do
+        next <- acceptSocketUnless stopping listener
+        case next of
+          Nothing -> pure ()
+          Just client -> do
+            -- Counted here, not in the client's thread: once this loop has
+            -- returned, no client is still on its way into the count.
+            atomically (modifyTVar' connections (+ 1))
+            _ <- forkFinally (handleClient sharedConfig counter client)
+              (const (closeSocket client `finally` atomically (modifyTVar' connections (subtract 1))))
+            accept
+  accept
+  -- Later clients are refused, as they are once the C++ listening process is
+  -- gone.  The socket file stays, as it does there.
+  closeSocket listener
+  atomically $ do
+    clients <- readTVar connections
+    workers <- goalWorkers shared
+    check (clients == 0 && workers == 0)
 
 initialiseState :: ServerConfig -> IO ()
 initialiseState config = do

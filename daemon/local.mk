@@ -169,6 +169,7 @@ EXTRA_DIST += \
   daemon/test/differential/socket-idle.sh daemon/test/differential/socket-idle.hs \
   daemon/test/differential/child-wait.sh daemon/test/differential/child-wait.hs \
   daemon/test/differential/authenticate-busy.sh daemon/test/differential/authenticate-busy.hs \
+  daemon/test/differential/stop-drain.sh daemon/test/differential/stop-drain.scm \
   daemon/test/differential/wait-stack.sh daemon/test/differential/wait-stack.hs \
   daemon/test/differential/offload-idle.sh daemon/test/differential/offload-idle.hs \
   daemon/test/differential/offload-eof.sh daemon/test/differential/offload-eof.hs \

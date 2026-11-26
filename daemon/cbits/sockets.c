@@ -10,6 +10,7 @@
 #include <sys/select.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <errno.h>
 #include <string.h>
 #include <stdint.h>
@@ -126,6 +127,42 @@ int goonix_accept(int fd) {
     while (ready < 0 && errno == EINTR);
     if (ready < 0) return -1;
   }
+}
+
+/* Accept one client from a non-blocking listening socket.  Returns the
+   client, -2 when no connection is waiting (the caller waits for the socket
+   in the runtime's I/O manager, where the wait can be given up), -1 on any
+   other error. */
+int goonix_accept_ready(int fd) {
+  for (;;) {
+    int client = accept4(fd, NULL, NULL, SOCK_CLOEXEC);
+    if (client >= 0) return client;
+    if (errno == EINTR || errno == ECONNABORTED) continue;
+    if (errno == EAGAIN || errno == EWOULDBLOCK) return -2;
+    return -1;
+  }
+}
+
+/* Whether a signal was being ignored when the listening process started.
+   The C++ daemon installs no handler for SIGTERM, SIGINT and SIGHUP in that
+   process, so one that it inherited as ignored stays ignored: `nohup', and a
+   shell without job control that starts the daemon in the background, rely
+   on it.  The Haskell runtime replaces the SIGINT disposition before any
+   Haskell code runs, so the dispositions are recorded from a constructor,
+   which runs before that. */
+static unsigned long ignored_at_start;
+
+__attribute__((constructor)) static void record_ignored_signals(void) {
+  static const int signals[] = { SIGHUP, SIGINT, SIGTERM };
+  for (size_t i = 0; i < sizeof signals / sizeof signals[0]; i++) {
+    struct sigaction action;
+    if (sigaction(signals[i], NULL, &action) == 0 && action.sa_handler == SIG_IGN)
+      ignored_at_start |= 1UL << signals[i];
+  }
+}
+
+int goonix_ignored_at_start(int sig) {
+  return sig > 0 && sig < 32 && ((ignored_at_start >> sig) & 1UL);
 }
 
 int goonix_peer_uid(int fd, uid_t *uid) {

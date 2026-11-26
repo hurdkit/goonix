@@ -27,13 +27,14 @@ module Goonix.Build.Shared
   , acquireSlot
   , releaseSlot
   , runningJobs
+  , goalWorkers
   ) where
 
-import Control.Concurrent (forkIO, killThread, ThreadId)
+import Control.Concurrent (forkIOWithUnmask, killThread, ThreadId)
 import Control.Concurrent.STM
-  ( TVar, TMVar, atomically, newTVarIO, newEmptyTMVarIO, newTVar, newEmptyTMVar
+  ( STM, TVar, TMVar, atomically, newTVarIO, newEmptyTMVarIO, newTVar, newEmptyTMVar
   , readTVar, writeTVar, modifyTVar', retry, putTMVar, readTMVar )
-import Control.Exception (SomeException, throwIO, try, onException)
+import Control.Exception (SomeException, throwIO, try, onException, finally, mask_)
 import Control.Monad (forM_, when)
 import Data.ByteString (ByteString)
 import qualified Data.Map.Strict as Map
@@ -48,6 +49,11 @@ data Shared = Shared
   -- is never tighter than a client's request.
   , sharedGoals :: !(TVar (Map.Map ByteString Goal))
   -- ^ One goal per derivation, with the clients waiting on it.
+  , sharedWorkers :: !(TVar Int)
+  -- ^ Daemon-owned worker threads that have not ended yet.  A worker whose
+  -- last client left is killed and its goal dropped at once, but it still has
+  -- its builder to stop and its build directory to remove; this count is how
+  -- a daemon that is stopping knows that work is over.
   }
 
 data Goal = Goal
@@ -65,7 +71,11 @@ data Goal = Goal
 data GoalResult = GoalSucceeded | GoalFailed SomeException
 
 newShared :: Int -> IO Shared
-newShared limit = Shared <$> newTVarIO 0 <*> newTVarIO (max 0 limit) <*> newTVarIO Map.empty
+newShared limit = Shared <$> newTVarIO 0 <*> newTVarIO (max 0 limit) <*> newTVarIO Map.empty <*> newTVarIO 0
+
+-- | The number of daemon-owned workers still running, cleanup included.
+goalWorkers :: Shared -> STM Int
+goalWorkers shared = readTVar (sharedWorkers shared)
 
 sharedSlots :: Shared -> IO Int
 sharedSlots shared = atomically (readTVar (sharedLimit shared))
@@ -191,18 +201,24 @@ startGoal shared derivation build = do
           pure True
       Nothing -> pure False
   when fork $ do
-    worker <- forkIO $ do
-      outcome <- try build
-      let result = either GoalFailed (const GoalSucceeded) outcome
-      atomically $ do
-        goals <- readTVar (sharedGoals shared)
-        case Map.lookup derivation goals of
-          Just goal -> do
-            writeTVar (goalDone goal) (Just result)
-            waiters <- readTVar (goalWaiters goal)
-            mapM_ (\w -> putTMVar w result) waiters
-          Nothing -> pure ()
-      atomically $ modifyTVar' (sharedGoals shared) (Map.delete derivation)
+    let ended = atomically (modifyTVar' (sharedWorkers shared) (subtract 1))
+        run = do
+          outcome <- try build
+          let result = either GoalFailed (const GoalSucceeded) outcome
+          atomically $ do
+            goals <- readTVar (sharedGoals shared)
+            case Map.lookup derivation goals of
+              Just goal -> do
+                writeTVar (goalDone goal) (Just result)
+                waiters <- readTVar (goalWaiters goal)
+                mapM_ (\w -> putTMVar w result) waiters
+              Nothing -> pure ()
+          atomically $ modifyTVar' (sharedGoals shared) (Map.delete derivation)
+    -- The worker is counted until it has ended.  It starts masked, so that a
+    -- kill sent before it has run a single step still passes through `ended'.
+    worker <- mask_ $ do
+      atomically (modifyTVar' (sharedWorkers shared) (+ 1))
+      forkIOWithUnmask (\unmask -> unmask run `finally` ended) `onException` ended
     atomically $ do
       goals <- readTVar (sharedGoals shared)
       case Map.lookup derivation goals of
