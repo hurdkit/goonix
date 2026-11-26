@@ -7,7 +7,7 @@ import Control.Monad (forM_, unless)
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as C
 import Data.IORef (modifyIORef', newIORef, readIORef)
-import Goonix.Store.Database (Value (..), execute, openReadWrite, closeDatabase)
+import Goonix.Store.Database (Value (..), execute, queryValues, openReadWrite, closeDatabase)
 import Goonix.Store.RecordSignature
 import Goonix.Store.Records
 import System.IO (hClose, openTempFile)
@@ -21,7 +21,7 @@ record path signature origin = BuildRecord (C.replicate 64 'a')
 
 main :: IO ()
 main = do
-  let raw = B.concat [C.pack "(signature (hash sha256 \"XwH1KY", B.pack [0xa5, 0x24, 0x5c, 0x62, 0x36, 0x6f, 0x42, 0x25, 0xb8], C.pack "\"))"]
+  let raw = B.concat [C.pack "(signature (hash sha256 \"XwH1KY", B.pack [0xa5, 0x00, 0x24, 0x5c, 0x62, 0x36, 0x6f, 0x42, 0x25, 0xb8], C.pack "\"))"]
   encoded <- loadRecordSignature raw
   assert "legacy raw high bytes normalize at load" (encoded == encodeRecordSignature raw)
   decoded <- decodeRecordSignature encoded
@@ -53,13 +53,34 @@ main = do
   initialiseRecords db
   let good = record "/gnu/store/good" (encodeRecordSignature raw) "good-test"
       bad = record "/gnu/store/bad" "not base64" "bad-test"
-  addRecord db good
-  addRecord db bad
+  addRecord db good { recordSignature = raw }
+  storedGood <- queryValues db "select signature from GoonixBuildRecords where path = ?;" [Bytes (recordPath good)]
+  assert "raw insertion stores canonical base64 with length-delimited bytes" (storedGood == [[Bytes encoded]])
+  execute db "insert into GoonixBuildRecords (resolvedHash,resolvedDerivation,output,path,origin,relocationChecked,signature) values (?,?,?,?,?,?,?);"
+    [Bytes (recordResolvedHash bad), Bytes (recordResolvedDerivation bad), Bytes (recordOutput bad),
+     Bytes (recordPath bad), Bytes (recordOrigin bad), Integer 0, Bytes (recordSignature bad)]
   warnings <- newIORef []
   let recordColumnsForTest = "resolvedHash, resolvedDerivation, output, path, origin, relocationChecked, signature"
   execute db "insert into GoonixBuildRecords (resolvedHash,resolvedDerivation,output,path,origin,relocationChecked,signature) values (?,?,?,?,?,?,?);"
     [Bytes (C.replicate 64 'b'), Bytes (recordResolvedDerivation good), Bytes "out",
-     Bytes raw, Bytes "legacy-test", Integer 0, Bytes raw]
+     Bytes "/gnu/store/legacy", Bytes "legacy-test", Integer 0, Bytes raw]
+  let legacyRecord = record "/gnu/store/legacy" encoded "legacy-test"
+  addRecord db legacyRecord { recordResolvedHash = C.replicate 64 'b' }
+  storedLegacy <- queryValues db "select signature from GoonixBuildRecords where resolvedHash = ? and output = 'out';" [Bytes (C.replicate 64 'b')]
+  assert ("legacy raw and encoded reimport are one logical row; stored=" ++ show storedLegacy) (storedLegacy == [[Bytes raw]])
+  reimported <- queryRecords db (C.replicate 64 'b') "out"
+  assert "raw twin reimport returns the canonical signature" (map recordSignature reimported == [encoded])
+  execute db "insert into GoonixBuildRecords (resolvedHash,resolvedDerivation,output,path,origin,relocationChecked,signature) values (?,?,?,?,?,?,?);"
+    [Bytes (C.replicate 64 'b'), Bytes (recordResolvedDerivation good), Bytes "out",
+     Bytes "/gnu/store/legacy", Bytes "legacy-test", Integer 0, Bytes encoded]
+  twins <- queryValues db "select count(*) from GoonixBuildRecords where resolvedHash = ? and output = 'out';" [Bytes (C.replicate 64 'b')]
+  assert "fixture really contains raw and encoded twins" (twins == [[Integer 2]])
+  initialiseRecords db
+  migrated <- queryValues db "select signature from GoonixBuildRecords where resolvedHash = ? and output = 'out';" [Bytes (C.replicate 64 'b')]
+  assert ("open-time migration collapses raw and encoded twins; stored=" ++ show migrated) (migrated == [[Bytes encoded]])
+  initialiseRecords db
+  reopened <- queryValues db "select signature from GoonixBuildRecords where resolvedHash = ? and output = 'out';" [Bytes (C.replicate 64 'b')]
+  assert "signature migration is idempotent" (reopened == migrated)
   byHash <- queryRecordsWithLog (\warning -> modifyIORef' warnings (warning :)) db
     ("select " <> recordColumnsForTest <> " from GoonixBuildRecords where resolvedHash = ? and output = ? order by id;")
     [Bytes (recordResolvedHash good), Bytes "out"]
