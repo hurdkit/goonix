@@ -524,20 +524,25 @@ Session: 4310
           (usleep 10000)
           (loop (+ tries 1))))
       ;; The builder starts some time after the lock is taken: look until
-      ;; the session has a child, for less long than the builder runs.
+      ;; a session of this process has the lock and a child, for less long
+      ;; than the builder runs.  This process may have more than one session
+      ;; for a moment: a daemon that has a process per session forks that
+      ;; process to start a builder, and until the child runs the builder
+      ;; /proc shows it with the session's command line.
       (let ((seen? (let loop ((tries 0))
-                     (match (filter mine? (daemon-sessions))
-                       ((session)
-                        (or (and (member lock
-                                         (daemon-session-locks-held session))
-                                 (pair? (daemon-session-children session))
-                                 (every process?
-                                        (daemon-session-children session)))
-                            (and (< tries 30)
-                                 (begin
-                                   (usleep 200000)
-                                   (loop (+ tries 1))))))
-                       (_ #f)))))
+                     (or (any (lambda (session)
+                                (and (member lock
+                                             (daemon-session-locks-held
+                                              session))
+                                     (pair? (daemon-session-children session))
+                                     (every process?
+                                            (daemon-session-children
+                                             session))))
+                              (filter mine? (daemon-sessions)))
+                         (and (< tries 30)
+                              (begin
+                                (usleep 200000)
+                                (loop (+ tries 1))))))))
         (join-thread thread)
         (->bool seen?)))))
 
