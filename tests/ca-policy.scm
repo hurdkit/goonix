@@ -18,6 +18,7 @@
              (ice-9 textual-ports)
              (ice-9 match)
              (srfi srfi-1)
+             (srfi srfi-34)
              (srfi srfi-64))
 
 (test-begin "ca-policy")
@@ -510,6 +511,103 @@ NarSize: 1234\nNarHash: sha256:~a\nReferences: \nSystem: ~a\nDeriver: ~a\n"
           (test-equal "a dependency shared by two packages is scanned exactly once"
             1
             (count (lambda (p) (string=? p shared-out)) scans)))))))
+
+(test-group "an adopted package's input lowering ignores the order of lowering"
+  ;; Under 'adopted an upstream package is lowered input-addressed, then
+  ;; adopted.  That input lowering must be upstream's derivation whatever the
+  ;; connection lowered before it.  bag->derivation asks for the derivation
+  ;; of the bag's first input while it builds its monadic value, and the
+  ;; cache key of that request holds the policy of that moment; the lowering
+  ;; runs later.  When the value was built under 'adopted and run under
+  ;; 'input, a first input that a running 'adopted policy had lowered before
+  ;; (as an input of a package built from source) came back as its adoption
+  ;; graft, and the daemon refused the input-addressed dependent.  In the
+  ;; other order the package built from source found the input's
+  ;; input-addressed derivation where its adoption belongs.  The leaf below
+  ;; is the first input of both dependents.
+  (let* ((leaf (trivial "ca-policy-order-leaf"
+                        #~(call-with-output-file #$output
+                            (lambda (p) (display "LEAF" p)))))
+         (top (trivial "ca-policy-order-top"
+                       #~(call-with-output-file #$output
+                           (lambda (p) (format p "~a/TOP" #$leaf)))
+                       `(("leaf" ,leaf))))
+         ;; Not upstream's, so built from source: its inputs are lowered
+         ;; while the 'adopted policy runs.
+         (local (trivial "ca-policy-order-local"
+                         #~(call-with-output-file #$output
+                             (lambda (p) (format p "~a/LOCAL" #$leaf)))
+                         `(("leaf" ,leaf))))
+         (marker (upstream-package-set
+                  (list->setq (list leaf top %bootstrap-guile))))
+         (upstream-top
+          (let ((fresh (open-connection-for-tests)))
+            (let ((drv (parameterize ((%package-addressing-policy 'input))
+                         (package-derivation fresh top))))
+              (close-connection fresh)
+              drv))))
+    (define (in-order first second)
+      ;; Apply FIRST, then SECOND, to one fresh connection under 'adopted and
+      ;; return both results.  A refusal by the daemon is returned as its
+      ;; message, so that it fails an assertion instead of ending the file.
+      (define (attempt step connection)
+        (guard (c ((store-protocol-error? c)
+                   (store-protocol-error-message c)))
+          (step connection)))
+      (let ((fresh (open-connection-for-tests)))
+        (parameterize ((%package-addressing-policy 'adopted)
+                       (%upstream-package? marker))
+          (let* ((one (attempt first fresh))
+                 (two (attempt second fresh)))
+            (close-connection fresh)
+            (list one two)))))
+    (define (lower package)
+      (lambda (connection) (package-derivation connection package)))
+    (define (lower-as-input package)
+      ;; As expand-input lowers a package input.
+      (lambda (connection)
+        (run-with-store connection
+          (package->derivation package (%current-system) #:graft? #f))))
+    (define (input-lowering adopted)
+      ;; The derivation an adoption graft rewrites: its input of its own name.
+      (and (derivation? adopted)
+           (find (lambda (drv)
+                   (string=? (derivation-name drv) (derivation-name adopted)))
+                 (map derivation-input-derivation
+                      (derivation-inputs adopted)))))
+    (define (leaf-input drv)
+      ;; The addressing of the leaf that DRV takes as an input.
+      (and (derivation? drv)
+           (map addressing
+                (filter (lambda (input)
+                          (string-prefix? "ca-policy-order-leaf"
+                                          (derivation-name input)))
+                        (map derivation-input-derivation
+                             (derivation-inputs drv))))))
+    (for-each
+     (match-lambda
+       ((label . first)
+        (match (in-order first (lower top))
+          ((_ adopted)
+           (test-equal (string-append "the package is adopted " label)
+             "content"
+             (if (derivation? adopted) (addressing adopted) adopted))
+           (test-equal (string-append "its input lowering is upstream's " label)
+             (bytes upstream-top)
+             (and=> (input-lowering adopted) bytes))))))
+     `(("on a fresh connection" . ,(lambda (connection) #t))
+       ("after its input was lowered as an input" . ,(lower-as-input leaf))
+       ("after a from-source dependent of its input" . ,(lower local))))
+    (match (list (in-order (lower local) (lambda (connection) #t))
+                 (in-order (lower top) (lower local)))
+      (((alone _) (_ after))
+       (test-equal "a from-source package takes its input's adoption"
+         '("content")
+         (leaf-input alone))
+       (test-assert "a from-source package is the same after an adopted dependent of its input"
+         (and (derivation? alone) (derivation? after)
+              (string=? (derivation-file-name alone)
+                        (derivation-file-name after))))))))
 
 (test-group "a gexp over an adopted input is content-addressed under adopted"
   ;; The plan's policy table (01-content-addressing.md, section 8): under

@@ -154,30 +154,46 @@ No direct-opaque or glibc-specific dependent promotion is applied."
               (adopt? (adopt-package? context)))
           (state-parameterize ((%package-addressing addressing)
                                (%package-derivation-name (bag-name bag)))
-            (let ((drv
-                   (if opaque-input?
-                       ;; Keep the complete upstream derivation, not just its
-                       ;; top-level marker: nested gexps and packages must be
-                       ;; input-addressed too, so the original output path and
-                       ;; its substitutes remain usable.
-                       (state-parameterize ((%package-addressing-policy 'input))
-                         (apply lower bag arguments))
-                       (apply lower bag arguments))))
-              (if adopt?
-                  (adopt-lowered-derivation lower bag arguments drv)
-                  drv))))
+            (cond (adopt?
+                   (adopt-lowered-derivation lower bag arguments))
+                  (opaque-input?
+                   ;; Keep the complete upstream derivation, not just its
+                   ;; top-level marker: nested gexps and packages must be
+                   ;; input-addressed too, so the original output path and
+                   ;; its substitutes remain usable.
+                   (input-lowering lower bag arguments))
+                  (else
+                   (apply lower bag arguments)))))
         (apply lower bag arguments))))
 
-(define (adopt-lowered-derivation lower bag arguments drv)
-  "Adopt DRV, the monadic input-addressed derivation of an upstream package
-under the 'adopted policy.  DRV is built with input-addressed inputs (the
-upstream graph); adoption then rewrites its references to adopted items.  If
+(define (input-lowering lower bag arguments)
+  "Return the monadic input-addressed lowering of BAG: upstream's derivation,
+its nested gexps and package inputs included.
+
+goonix: the monadic value is BUILT inside the 'input extent, not only run
+there.  LOWER asks for the derivation of the bag's first input while it
+builds its value, and of the others as the lowering runs (mapm over
+expand-input in guix/packages.scm); a request for a package computes its
+cache key at once, the policy included (package-addressing-key).  A value
+built under 'adopted and run under 'input therefore looked a first input
+that is a package up under the 'adopted key.  It then took that input's
+adoption where a running 'adopted policy had cached one, and the daemon
+refused the input-addressed dependent; where none was cached it filed the
+input's input-addressed derivation under the 'adopted key, which a package
+built from source found later in place of the adoption.  Either way the
+result depended on what the connection had lowered before."
+  (state-parameterize ((%package-addressing-policy 'input))
+    (apply lower bag arguments)))
+
+(define (adopt-lowered-derivation lower bag arguments)
+  "Lower BAG, the bag of an upstream package under the 'adopted policy,
+input-addressed, with input-addressed inputs (the upstream graph), and adopt
+that derivation; adoption then rewrites its references to adopted items.  If
 the scanner flags the item, re-lower the item ITSELF content-addressed from
 source instead; its inputs keep the 'adopted treatment.  An opaque item is
 excluded by adopt-package? and does not enter this path."
   (with-monad %store-monad
-    (>>= (state-parameterize ((%package-addressing-policy 'input))
-           drv)
+    (>>= (input-lowering lower bag arguments)
          (lambda (d)
            (lambda (store)
              (let ((adopt ((module-ref (resolve-module '(guix ca adopt))
