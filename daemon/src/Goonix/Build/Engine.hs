@@ -23,7 +23,7 @@ import Data.IORef (IORef, newIORef, readIORef, writeIORef, atomicWriteIORef, ato
 import Data.Time.Clock.POSIX (POSIXTime)
 import Control.Exception (IOException, SomeException, bracket, bracketOnError, catch, finally, fromException, mask, onException, throwIO, try)
 import Control.Concurrent.MVar (MVar)
-import Control.Monad ((>=>), foldM, forM, forM_, replicateM_, unless, void, when)
+import Control.Monad ((>=>), filterM, foldM, forM, forM_, replicateM_, unless, void, when)
 import Data.Bits ((.|.))
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import Data.ByteString (ByteString)
@@ -132,12 +132,18 @@ buildThingsInternal config rootFd store settings trace hook things mode cancel =
   -- mode with redirected outputs (re-downloading fixed-output inputs, rebuilding
   -- the whole input closure), which C++ never does.
   let inputMode = if mode == Repair then Repair else Normal
+  -- C++ Worker::isTopGoal: only a goal the client asked for requests a graph.
+  -- An input stays an input whatever outputs are wanted of it, so it is built
+  -- or substituted here and never looked up in a cache on its own.
+  let topGoals = Set.fromList [path | thing <- things
+        , let path = B.takeWhile (/= 33) thing, ".drv" `B.isSuffixOf` path]
+      topGoal path = Set.member path topGoals
   -- HS-11: graph lookups are separate jobs and hold no build slot.  Their CA
   -- dependent waits while another top goal can build, as C++ addWaitee does.
   let discover jobMode path wanted role = case role of
         GraphJob -> pure JobSpec
           { jobId = path, jobWanted = wanted, jobKind = GraphJob
-          , jobRun = \_ -> do
+          , jobRun = \_ _ -> do
               let actualPath = B.take (B.length path - B.length "\0graph") path
               case config of
                 Just serverConfig -> runGraphLookup rootFd store settings (configGuixProgram serverConfig)
@@ -146,7 +152,7 @@ buildThingsInternal config rootFd store settings trace hook things mode cancel =
               pure Done }
         DownloadJob -> pure JobSpec
           { jobId = path, jobWanted = wanted, jobKind = DownloadJob
-          , jobRun = \_ -> do
+          , jobRun = \_ _ -> do
               let actualPath = B.take (B.length path - B.length "\0download") path
               -- SubstitutionGoal::tryNext adds a goal for every missing
               -- reference before it starts the substituter.  The scheduler
@@ -177,7 +183,7 @@ buildThingsInternal config rootFd store settings trace hook things mode cancel =
           substitutionSettled <- newIORef False
           pure JobSpec
             { jobId = path, jobWanted = wanted, jobKind = BuildJob
-            , jobRun = \requested -> do
+            , jobRun = \requested pendingInput -> do
                 discovered <- readIORef phase
                 if discovered
                   then do
@@ -186,7 +192,23 @@ buildThingsInternal config rootFd store settings trace hook things mode cancel =
                     if goonixAddressed (Map.lookup "goonixAddressing" (environment drv))
                       then do
                         decision <- prepareCaGoalDecision substitutionSettled path drv requested graphRequested inputsRealised
-                        case decisionAction decision of
+                        -- C++ goonixHaveDerivation, once the graph has settled:
+                        -- an input goal of this request that is still running
+                        -- may supersede the graph's provisional choice.  Join
+                        -- only goals that already exist and are unresolved,
+                        -- and come back here when they settle, so that
+                        -- chosenOutputForCurrentGraph judges the choice against
+                        -- what was built.  Nothing is created by this wait: a
+                        -- new input goal or download would bypass the imported
+                        -- dependent in the ordinary case.
+                        graphSettled <- readIORef graphRequested
+                        pendingInputs <- if waitsForExistingInputs graphSettled
+                            (resolvedDerivation (Map.lookup "goonixResolved" (environment drv)))
+                            (decisionAction decision)
+                          then filterM pendingInput (Map.keys (inputDrvs drv)) else pure []
+                        if not (null pendingInputs)
+                          then pure (Need [(input, Set.empty, BuildJob) | input <- pendingInputs])
+                          else case decisionAction decision of
                           CaGraph -> do
                             writeIORef graphRequested True
                             -- C++ attaches the graph as an auxiliary waitee;
@@ -208,7 +230,7 @@ buildThingsInternal config rootFd store settings trace hook things mode cancel =
                             resolvedPath <- writeResolvedDerivation rootFd store path resolved
                             appendTempRoot rootFd resolvedPath
                             selected <- selectGoonixOutputs store path resolved
-                            prepared <- prepareLocalCaBuild rootFd store jobMode path selected
+                            prepared <- prepareLocalCaBuild (traceOutput trace) rootFd store jobMode path selected
                             buildPhaseWith requested path prepared resolvedPath
                           CaBuild -> do
                             -- C++ resolveGoonixBuild stores the resolved
@@ -226,7 +248,7 @@ buildThingsInternal config rootFd store settings trace hook things mode cancel =
                             -- valid facts but no adopted choice and the resumed
                             -- unresolved goal rebuilds an already realised input.
                             selected <- selectGoonixOutputs store path resolved
-                            prepared <- prepareResolvedBuild rootFd store jobMode path selected
+                            prepared <- prepareResolvedBuild (traceOutput trace) rootFd store jobMode path selected
                             buildPhaseWith requested path prepared resolvedPath
                           CaSubstituteInputs -> do
                             -- C++ goonixRealiseInputsFirst clears wantedOutputs
@@ -238,7 +260,7 @@ buildThingsInternal config rootFd store settings trace hook things mode cancel =
                       else buildPhase requested
                   else do
                     writeIORef phase True
-                    buildDerivation attemptedDownloads (discover inputMode) graphRequested config rootFd store settings trace hook jobMode requested path }
+                    buildDerivation attemptedDownloads (discover inputMode) graphRequested (topGoal path) config rootFd store settings trace hook jobMode requested path }
           where
             buildPhaseWith requested original prepared resolvedPath = do
                     -- HS-12: one goal per derivation across the clients of this
@@ -273,9 +295,9 @@ buildThingsInternal config rootFd store settings trace hook things mode cancel =
                     pure Done
             prepareCaGoalDecision substitutionSettled originalPath drv wanted graphRequested inputsRealised = do
               let resolved = resolvedDerivation (Map.lookup "goonixResolved" (environment drv))
-              prepared <- if resolved then prepareResolvedBuild rootFd store jobMode originalPath drv else pure drv
+              prepared <- if resolved then prepareResolvedBuild (traceOutput trace) rootFd store jobMode originalPath drv else pure drv
               choices <- forM (Map.toList (outputs prepared)) $ \(name, out) -> do
-                chosen <- chosenOutputForCurrentGraph store originalPath name
+                chosen <- chosenOutputForCurrentGraph (traceOutput trace) store originalPath name
                 valid <- if B.null chosen then pure False else isValidPath store chosen
                 pure (C.unpack name, CaOutputChoice
                   (C.unpack (if resolved && (B.null chosen || chosen /= outputPath out)
@@ -286,7 +308,7 @@ buildThingsInternal config rootFd store settings trace hook things mode cancel =
               pure (prepareCaGoal CaDecisionInput
                 { decisionNormal = jobMode == Normal
                 , decisionResolved = resolved
-                , decisionTopGoal = Set.null wanted
+                , decisionTopGoal = topGoal originalPath
                 , decisionGraphRequested = alreadyRequested
                 , decisionInputsRealised = realised
                 , decisionSubstitutionSettled = settled
@@ -324,8 +346,8 @@ buildThings :: Fd -> Store -> Settings -> [ByteString] -> BuildMode -> IO ()
 buildThings rootFd store settings things mode =
   buildThingsWithTrace rootFd store settings (BuildTrace (\_ _ _ _ -> pure ()) (\_ -> pure ()) (\_ _ -> pure ()) (\_ -> pure ())) things mode
 
-buildDerivation :: IORef (Set.Set ByteString) -> (ByteString -> Set.Set ByteString -> JobKind -> IO JobSpec) -> IORef Bool -> Maybe ServerConfig -> Fd -> Store -> Settings -> BuildTrace -> Maybe HookPool -> BuildMode -> Set.Set ByteString -> ByteString -> IO (Outcome [Dependency])
-buildDerivation attemptedDownloads discover graphRequested config rootFd store settings trace hook mode wanted drvPath = do
+buildDerivation :: IORef (Set.Set ByteString) -> (ByteString -> Set.Set ByteString -> JobKind -> IO JobSpec) -> IORef Bool -> Bool -> Maybe ServerConfig -> Fd -> Store -> Settings -> BuildTrace -> Maybe HookPool -> BuildMode -> Set.Set ByteString -> ByteString -> IO (Outcome [Dependency])
+buildDerivation attemptedDownloads discover graphRequested topGoal config rootFd store settings trace hook mode wanted drvPath = do
   appendTempRoot rootFd drvPath
   valid <- isValidPath store drvPath
   unless valid $ case config of
@@ -372,7 +394,7 @@ buildDerivation attemptedDownloads discover graphRequested config rootFd store s
         CaSubstituteInputs
           | Map.null (inputDrvs drv) -> do
               resolved <- resolveDerivation (storeDirectory store) drvPath drv (realisedOutputPath store)
-              prepared <- prepareResolvedBuild rootFd store mode drvPath resolved
+              prepared <- prepareResolvedBuild (traceOutput trace) rootFd store mode drvPath resolved
               resolvedPath <- writeResolvedDerivation rootFd store drvPath resolved
               appendTempRoot rootFd resolvedPath
               buildDerivationPrepared Nothing config rootFd store settings trace hook mode wanted drvPath prepared resolvedPath
@@ -405,12 +427,12 @@ buildDerivation attemptedDownloads discover graphRequested config rootFd store s
     prepareCaGoalDecision originalPath drv wanted graphRequested = do
       let selectedOutputs = if Set.null wanted then outputs drv else Map.restrictKeys (outputs drv) wanted
           resolved = resolvedDerivation (Map.lookup "goonixResolved" (environment drv))
-      prepared <- if resolved then prepareResolvedBuild rootFd store mode originalPath drv else pure drv
+      prepared <- if resolved then prepareResolvedBuild (traceOutput trace) rootFd store mode originalPath drv else pure drv
       choices <- forM (Map.toList (outputs prepared)) $ \(name, out) -> do
         -- Unresolved prepareGoonixGoal uses the current choice, even before it
         -- is valid.  Resolved prepareResolvedBuild exposes only a valid choice;
         -- an invalid one remains a token until the local build fallback.
-        path <- chosenOutputForCurrentGraph store originalPath name
+        path <- chosenOutputForCurrentGraph (traceOutput trace) store originalPath name
         valid <- if B.null path then pure False else isValidPath store path
         pure (C.unpack name, CaOutputChoice
           (C.unpack (if resolved && not valid then B.empty else path)) valid (not (B.null path)))
@@ -418,7 +440,7 @@ buildDerivation attemptedDownloads discover graphRequested config rootFd store s
       pure (prepareCaGoal CaDecisionInput
         { decisionNormal = mode == Normal
         , decisionResolved = resolved
-        , decisionTopGoal = Set.null wanted
+        , decisionTopGoal = topGoal
         , decisionGraphRequested = alreadyRequested
         , decisionInputsRealised = False
         , decisionSubstitutionSettled = False
@@ -429,7 +451,7 @@ buildDerivation attemptedDownloads discover graphRequested config rootFd store s
     -- C++ prepareResolvedBuild: root the choices, select each output's realised
     -- path; a check builds at the logical token, never the selected final path.
     prepareResolvedCaBuild originalPath resolved =
-      prepareResolvedBuild rootFd store mode originalPath resolved
+      prepareResolvedBuild (traceOutput trace) rootFd store mode originalPath resolved
     tokenOutputs originalPath drv' =
       let outputs' = Map.mapWithKey (\output out ->
             if not (B.null (outputHash out)) then out
@@ -464,7 +486,7 @@ buildDerivation attemptedDownloads discover graphRequested config rootFd store s
             _ -> pure False
           candidateValid <- if goonixAddressed (Map.lookup "goonixAddressing" (environment drv)) && mode == Normal
             then and <$> forM (Map.toList (outputs drv)) (\(name, out) -> do
-              chosen <- chosenOutputForCurrentGraph store drvPath name
+              chosen <- chosenOutputForCurrentGraph (traceOutput trace) store drvPath name
               if not (B.null chosen) && chosen == outputPath out
                 then isValidPath store chosen
                 else pure True)
@@ -476,9 +498,9 @@ buildDerivation attemptedDownloads discover graphRequested config rootFd store s
               pure (Need ([(input, selected, BuildJob) | (input, selected) <- Map.toList (inputDrvs drv)]
                 ++ [(downloadJobId source, Set.empty, DownloadJob) | source <- sources]))
 
-prepareLocalCaBuild :: Fd -> Store -> BuildMode -> ByteString -> Derivation -> IO Derivation
-prepareLocalCaBuild rootFd store mode originalPath resolved = do
-  prepared <- prepareResolvedBuild rootFd store mode originalPath resolved
+prepareLocalCaBuild :: (ByteString -> IO ()) -> Fd -> Store -> BuildMode -> ByteString -> Derivation -> IO Derivation
+prepareLocalCaBuild report rootFd store mode originalPath resolved = do
+  prepared <- prepareResolvedBuild report rootFd store mode originalPath resolved
   if mode /= Normal
     then pure prepared
     else do
@@ -491,12 +513,12 @@ prepareLocalCaBuild rootFd store mode originalPath resolved = do
         { environment = foldl (\env (output, out) -> Map.insert output (outputPath out) env)
             (environment tokenised) (Map.toList (outputs tokenised)) }
 
-prepareResolvedBuild :: Fd -> Store -> BuildMode -> ByteString -> Derivation -> IO Derivation
-prepareResolvedBuild rootFd store mode originalPath resolved = do
+prepareResolvedBuild :: (ByteString -> IO ()) -> Fd -> Store -> BuildMode -> ByteString -> Derivation -> IO Derivation
+prepareResolvedBuild report rootFd store mode originalPath resolved = do
   choices <- allChoices (database store) originalPath
   mapM_ (appendTempRoot rootFd . snd) choices
   selected <- forM (Map.toList (outputs resolved)) $ \(name, out) -> do
-    chosen <- chosenOutputForCurrentGraph store originalPath name
+    chosen <- chosenOutputForCurrentGraph report store originalPath name
     pure (name, if B.null chosen then out else out { outputPath = chosen })
   let withEnv = resolved { outputs = Map.fromList selected }
       synced = withEnv { environment = foldl (\env (name, out) ->

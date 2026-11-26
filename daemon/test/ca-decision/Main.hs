@@ -46,4 +46,17 @@ main = do
       decision = prepareCaGoal base { decisionChoices = two }
   assert "one incomplete output selects substitution" (decisionAction decision == CaSubstituteOutputs)
   assert "selected output names survive preparation" (decisionOutputs decision == Map.map choicePath two)
+  -- The wait for input goals that already exist: arguments are graph settled,
+  -- derivation resolved, decision.
+  let waits =
+        [ ("imported choice waits for inputs being built here", True, False, CaSubstituteOutputs, True)
+        , ("graph miss waits for inputs being built here", True, False, CaSubstituteInputs, True)
+        , ("unresolved build waits for inputs being built here", True, False, CaBuild, True)
+        , ("nothing is joined before the graph has settled", False, False, CaSubstituteOutputs, False)
+        , ("a goal without a graph lookup joins nothing", False, False, CaSubstituteInputs, False)
+        , ("a resolved derivation joins nothing", True, True, CaSubstituteOutputs, False)
+        , ("a finished goal joins nothing", True, False, CaDone, False)
+        ]
+  forM_ waits $ \(name, settled, resolved, action, expected) ->
+    assert name (waitsForExistingInputs settled resolved action == expected)
   putStrLn "CA decision table: PASS"

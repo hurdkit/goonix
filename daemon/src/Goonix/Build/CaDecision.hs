@@ -13,6 +13,7 @@ module Goonix.Build.CaDecision
   , CaGoalAction (..)
   , CaGoalDecision (..)
   , prepareCaGoal
+  , waitsForExistingInputs
   ) where
 
 import qualified Data.Map.Strict as Map
@@ -76,3 +77,13 @@ prepareCaGoal input = CaGoalDecision action (Map.map choicePath (decisionChoices
       | decisionNormal input && all validChoice choices = CaDone
       | any missingChoice choices = CaSubstituteOutputs
       | otherwise = CaBuild
+
+-- | goonixHaveDerivation, after prepareGoonixGoal: once its graph lookup has
+-- settled, an unresolved goal that is not already done waits for the input
+-- goals that exist in its request before it acts on the decision.  An input
+-- being built here may supersede the choice the graph named; the goal decides
+-- again when those inputs have settled.  The arguments are: the graph lookup
+-- of this goal has settled, the derivation is resolved, and the decision.
+waitsForExistingInputs :: Bool -> Bool -> CaGoalAction -> Bool
+waitsForExistingInputs graphSettled resolved action =
+  graphSettled && not resolved && action /= CaDone

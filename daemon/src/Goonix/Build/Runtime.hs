@@ -28,7 +28,7 @@ data JobSpec = JobSpec
   { jobId :: !ByteString
   , jobWanted :: !(Set.Set ByteString)
   , jobKind :: !JobKind
-  , jobRun :: !(Set.Set ByteString -> IO (Outcome [Dependency]))
+  , jobRun :: !(Set.Set ByteString -> (ByteString -> IO Bool) -> IO (Outcome [Dependency]))
   }
 
 data Outcome a = Done | Need a deriving (Eq, Show)
@@ -39,6 +39,7 @@ data RuntimeEvent = Cancelled | Finished | Progress Result | Stalled [ByteString
 
 data Runtime = Runtime
   { rtSpecs :: !(TVar (Map.Map ByteString JobSpec))
+  , rtState :: !(TVar State)
   , rtQueue :: !(TQueue Result)
   , rtActive :: !(TVar (Map.Map ByteString (ThreadId, MVar ())))
   , rtFailures :: !(TVar (Map.Map ByteString SomeException))
@@ -57,7 +58,7 @@ runScheduledWithCancel = runScheduledShared Nothing
 runScheduledShared :: Maybe Shared -> Int -> Maybe Int -> Bool -> (ByteString -> Set.Set ByteString -> JobKind -> IO JobSpec) -> [JobSpec] -> IO () -> IO ()
 runScheduledShared shared slots downloadSlots keepGoing discover initialSpecs cancel = do
   state <- foldM add (initialState (max 0 slots) downloadSlots keepGoing) initialSpecs
-  runtime <- Runtime <$> newTVarIO Map.empty <*> newTQueueIO
+  runtime <- Runtime <$> newTVarIO Map.empty <*> newTVarIO state <*> newTQueueIO
     <*> newTVarIO Map.empty <*> newTVarIO Map.empty <*> pure keepGoing <*> newTVarIO False <*> pure shared
   forM_ initialSpecs (register runtime)
   watcher <- forkIO $ cancel >> atomically (writeTVar (rtCancelled runtime) True)
@@ -72,6 +73,7 @@ runScheduledShared shared slots downloadSlots keepGoing discover initialSpecs ca
 
     dispatch runtime state = do
       let (next, actions) = step Tick state
+      atomically $ writeTVar (rtState runtime) next
       forM_ actions (perform runtime)
       event <- atomically $ do
         stopped <- readTVar (rtCancelled runtime)
@@ -111,12 +113,16 @@ runScheduledShared shared slots downloadSlots keepGoing discover initialSpecs ca
         Left exception -> do
           atomically $ writeTVar (rtFailures runtime) =<<
             Map.insert name exception <$> readTVar (rtFailures runtime)
+          atomically $ writeTVar (rtState runtime) next
           forM_ actions (perform runtime)
           unless (rtKeepGoing runtime) $ uninterruptibleMask_ $ do
             cancelActive runtime
             throwIO (originalError exception)
           pure next
-        Right Done -> forM_ actions (perform runtime) >> pure next
+        Right Done -> do
+          atomically $ writeTVar (rtState runtime) next
+          forM_ actions (perform runtime)
+          pure next
         Right (Need required) -> do
           next <- either (throwIO . storeError) pure
             (addDependencyJobsWithKinds [(path, kind) | (path, _, kind) <- required] next)
@@ -126,8 +132,15 @@ runScheduledShared shared slots downloadSlots keepGoing discover initialSpecs ca
               then atomically $ writeTVar (rtSpecs runtime) =<<
                 Map.adjust (\spec -> spec { jobWanted = Set.union (jobWanted spec) wanted }) dependency <$> readTVar (rtSpecs runtime)
               else discover dependency wanted dependencyKind >>= register runtime
+          atomically $ writeTVar (rtState runtime) next
           forM_ actions (perform runtime)
           pure next
+
+    pendingDerivation runtime path = do
+      current <- atomically $ readTVar (rtState runtime)
+      pure $ case Map.lookup path (jobs current) of
+        Just job -> kind job == BuildJob && (status job == Waiting || status job == Running)
+        Nothing -> False
 
     perform runtime (Start name) = do
       specs <- atomically $ readTVar (rtSpecs runtime)
@@ -145,14 +158,14 @@ runScheduledShared shared slots downloadSlots keepGoing discover initialSpecs ca
               -- loop) so the loop stays free to process completions that
               -- release slots.  Released once acquired, even if the job fails.
               result <- case rtShared runtime of
-                Nothing -> try (jobRun spec (jobWanted spec))
+                Nothing -> try (jobRun spec (jobWanted spec) (pendingDerivation runtime))
                 Just shared | jobKind spec == GraphJob ->
                   -- A graph goal is not a build goal: it must not occupy the
                   -- daemon-wide slot while another derivation builds.
-                  try (jobRun spec (jobWanted spec))
+                  try (jobRun spec (jobWanted spec) (pendingDerivation runtime))
                 Just shared -> do
                   acquireSlot shared
-                  (try (jobRun spec (jobWanted spec))) `finally` releaseSlot shared
+                  (try (jobRun spec (jobWanted spec) (pendingDerivation runtime))) `finally` releaseSlot shared
               atomically $ writeTQueue (rtQueue runtime) (Result name result))
               `finally` (void (tryPutMVar done ()))
           atomically $ do

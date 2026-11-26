@@ -63,9 +63,12 @@ readDerivation path = do
 -- | A stored choice belongs to the current input graph only when the resolved
 -- derivation still has an authenticated record for it.  C++
 -- chosenOutputForCurrentGraph drops it otherwise, before selecting a candidate
--- for substitution.  A valid local choice survives absent historical inputs.
-chosenOutputForCurrentGraph :: Store -> ByteString -> ByteString -> IO ByteString
-chosenOutputForCurrentGraph store unresolved output = do
+-- for substitution, and says so: the message is how a client learns that an
+-- imported choice lost to an input built here.  A valid local choice survives
+-- absent historical inputs; a choice dropped because an input has no choice at
+-- all is dropped without a message, as in C++.
+chosenOutputForCurrentGraph :: (ByteString -> IO ()) -> Store -> ByteString -> ByteString -> IO ByteString
+chosenOutputForCurrentGraph report store unresolved output = do
   current <- chosenOutput (database store) unresolved output
   if B.null current then pure B.empty else do
     original <- readDerivation unresolved
@@ -86,7 +89,12 @@ chosenOutputForCurrentGraph store unresolved output = do
           records <- queryRecords (database store) (resolvedHashOf resolved) output
           if any (\record -> recordPath record == current) records
             then pure current
-            else dropChoice (database store) unresolved output >> pure B.empty
+            else do
+              unless missing $
+                report ("goonix: dropping choice `" <> current <> "' of `" <> unresolved
+                  <> "': input choices changed\n")
+              dropChoice (database store) unresolved output
+              pure B.empty
 
 -- | C++ selectGoonixOutput: keep a valid local choice; else the preferred path
 -- if valid; else the first valid fact; else nothing (a stale choice stays).

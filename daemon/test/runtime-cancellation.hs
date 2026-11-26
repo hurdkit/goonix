@@ -23,7 +23,7 @@ main = do
   started <- newMVar (0 :: Int)
   stopped <- newMVar (0 :: Int)
   cancelledSignal <- newEmptyMVar
-  let spec name = JobSpec name Set.empty BuildJob $ \_ -> do
+  let spec name = JobSpec name Set.empty BuildJob $ \_ _ -> do
         modifyMVar_ started (\n -> pure (n + 1))
         (forever (threadDelay 1000000)) `onException` modifyMVar_ stopped (\n -> pure (n + 1))
   result <- newEmptyMVar
@@ -45,7 +45,7 @@ main = do
   check "both workers started" =<< (== 2) <$> readMVar started
   check "both workers cleaned up" =<< (== 2) <$> readMVar stopped
 
-  let stalled = JobSpec "stalled" Set.empty BuildJob (const (pure Done))
+  let stalled = JobSpec "stalled" Set.empty BuildJob (\_ _ -> pure Done)
   idle <- try (runScheduled 0 Nothing False (\_ _ _ -> pure stalled) [stalled]) :: IO (Either StoreError ())
   check "idle unfinished request errors" (case idle of
     Left (StoreError message _) -> C.isInfixOf "waiting jobs: stalled" message

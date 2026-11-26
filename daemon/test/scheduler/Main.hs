@@ -3,6 +3,7 @@
 module Main (main) where
 
 import Control.Concurrent (threadDelay)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar)
 import Control.Monad (forM_, unless)
 import Data.ByteString (ByteString)
 import qualified Data.Map.Strict as Map
@@ -114,7 +115,7 @@ main = do
   caCalls <- newIORef (0 :: Int)
   let discover name _wanted kind = pure JobSpec
         { jobId = name, jobWanted = Set.empty, jobKind = kind
-        , jobRun = \_ -> do
+        , jobRun = \_ _ -> do
             atomicModifyIORef' calls (\seen -> (seen ++ [name], ()))
             if kind == GraphJob
               then pure Done
@@ -137,7 +138,7 @@ main = do
   missParentCalls <- newIORef (0 :: Int)
   let missDiscover name _wanted kind = pure JobSpec
         { jobId = name, jobWanted = Set.empty, jobKind = kind
-        , jobRun = \_ -> do
+        , jobRun = \_ _ -> do
             atomicModifyIORef' missCalls (\seen -> (seen ++ [name], ()))
             case kind of
               GraphJob -> pure Done
@@ -164,7 +165,7 @@ main = do
   completedParent <- newIORef (0 :: Int)
   let completedDiscover name _wanted kind = pure JobSpec
         { jobId = name, jobWanted = Set.empty, jobKind = kind
-        , jobRun = \_ -> do
+        , jobRun = \_ _ -> do
             atomicModifyIORef' completedCalls (\seen -> (seen ++ [name], ()))
             case (name, kind) of
               (_, GraphJob) -> pure Done
@@ -200,4 +201,103 @@ main = do
       (graphDone, graphActions) = step (Completed graphPath) targetDone
   assert "held input starts only after source closure and graph"
     (graphActions == [Start "input.drv"])
+  -- The join in the pure model: a dependency on a job that is already running
+  -- starts nothing and leaves that job alone; its completion starts the
+  -- dependent again.
+  let joinInitial = either error id $ do
+        withInput <- addJob "held-input.drv" BuildJob [] (initialState 2 Nothing True)
+        addJob "dependent.drv" BuildJob [] withInput
+      (joinRunning, joinStarts) = step Tick joinInitial
+      (joinWaiting, joinActions) =
+        step (NeedsDependencies "dependent.drv" ["held-input.drv"]) joinRunning
+      (_, joinResumed) = step (Completed "held-input.drv") joinWaiting
+  assert "the input and the dependent start together"
+    (joinStarts == [Start "held-input.drv", Start "dependent.drv"])
+  assert "joining a running input starts nothing"
+    (null joinActions && status (jobs joinWaiting Map.! "held-input.drv") == Running
+      && status (jobs joinWaiting Map.! "dependent.drv") == Waiting)
+  assert "the settled input starts the dependent again"
+    (joinResumed == [Start "dependent.drv"])
+  -- After graph import, only an already-existing unresolved input is joined.
+  -- Its completion re-enters the dependent so it revalidates its choice.  No
+  -- job is created by this wait (C++ goonixHaveDerivation).  The input is
+  -- really held: it ends only when the dependent has seen it pending.
+  let holdGraph = "dependent.drv\0graph"
+  heldCalls <- newIORef []
+  heldParentCalls <- newIORef (0 :: Int)
+  heldDiscoveries <- newIORef []
+  heldRelease <- newEmptyMVar
+  let heldDiscover name _wanted kind = do
+       atomicModifyIORef' heldDiscoveries (\seen -> (seen ++ [name], ()))
+       pure JobSpec
+        { jobId = name, jobWanted = Set.empty, jobKind = kind
+        , jobRun = \_ pendingInput -> do
+            atomicModifyIORef' heldCalls (\seen -> (seen ++ [name], ()))
+            case (name, kind) of
+              (_, GraphJob) -> pure Done
+              ("held-input.drv", BuildJob) -> do
+                readMVar heldRelease
+                pure Done
+              ("dependent.drv", BuildJob) -> do
+                n <- atomicModifyIORef' heldParentCalls (\n -> (n + 1, n))
+                if n == 0
+                  then pure (Need [(holdGraph, Set.empty, GraphJob)])
+                  else do
+                    held <- pendingInput "held-input.drv"
+                    case n of
+                      1 -> do
+                        assert "dependent joins the already-running input" held
+                        putMVar heldRelease ()
+                        pure (Need [("held-input.drv", Set.empty, BuildJob)])
+                      _ -> do
+                        assert "settled input lets revalidation proceed" (not held)
+                        pure Done
+              _ -> error ("unexpected job discovery: " ++ show (name, kind))
+        }
+  heldInput <- heldDiscover "held-input.drv" Set.empty BuildJob
+  heldInitial <- heldDiscover "dependent.drv" Set.empty BuildJob
+  heldResult <- timeout 3000000
+    (runScheduledShared Nothing 2 Nothing True heldDiscover [heldInput, heldInitial] (threadDelay 3000000))
+  assert "held input wait completes after revalidation" (heldResult == Just ())
+  heldOrder <- readIORef heldCalls
+  heldJobs <- readIORef heldDiscoveries
+  -- The input and the dependent start together, so only the dependent's own
+  -- sequence is ordered: graph, the join, and the pass after the input.
+  assert "the dependent decides again after the joined input"
+    (filter (/= "held-input.drv") heldOrder == ["dependent.drv", holdGraph, "dependent.drv", "dependent.drv"])
+  assert "the joined input runs once" (length (filter (== "held-input.drv") heldOrder) == 1)
+  assert "the wait creates no job" (heldJobs == ["held-input.drv", "dependent.drv", holdGraph])
+  -- The ordinary graph-sharing case has no input goal in this worker.  The
+  -- imported choice is used directly; no absent input or download is created.
+  let plainGraph = "plain.drv\0graph"
+  plainCalls <- newIORef []
+  plainParentCalls <- newIORef (0 :: Int)
+  plainDiscoveries <- newIORef []
+  let plainDiscover name _wanted kind = do
+        atomicModifyIORef' plainDiscoveries (\seen -> (seen ++ [name], ()))
+        pure JobSpec
+          { jobId = name, jobWanted = Set.empty, jobKind = kind
+          , jobRun = \_ pendingInput -> do
+              atomicModifyIORef' plainCalls (\seen -> (seen ++ [name], ()))
+              case (name, kind) of
+                (_, GraphJob) -> pure Done
+                ("plain.drv", BuildJob) -> do
+                  n <- atomicModifyIORef' plainParentCalls (\n -> (n + 1, n))
+                  if n == 0
+                    then pure (Need [(plainGraph, Set.empty, GraphJob)])
+                    else do
+                      absent <- pendingInput "absent-input.drv"
+                      assert "an absent input is not joined" (not absent)
+                      pure Done
+                _ -> error ("unexpected job: " ++ show (name, kind))
+          }
+  plainInitial <- plainDiscover "plain.drv" Set.empty BuildJob
+  plainResult <- timeout 1000000
+    (runScheduledShared Nothing 1 Nothing True plainDiscover [plainInitial] (threadDelay 1000000))
+  assert "plain graph sharing completes without input work" (plainResult == Just ())
+  plainOrder <- readIORef plainCalls
+  plainJobs <- readIORef plainDiscoveries
+  assert "plain sharing runs the graph then uses its answer"
+    (plainOrder == ["plain.drv", plainGraph, "plain.drv"])
+  assert "plain sharing discovers no input or download" (plainJobs == ["plain.drv", plainGraph])
   putStrLn "scheduler properties: PASS"
