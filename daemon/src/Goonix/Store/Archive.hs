@@ -11,7 +11,7 @@ module Goonix.Store.Archive
   , verifySignature
   ) where
 
-import Control.Exception (SomeException, throwIO, try)
+import Control.Exception (SomeException, catch, mask, onException, throwIO, try)
 import Control.Monad (unless, void, when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as B
@@ -29,8 +29,9 @@ import Goonix.Store.Files (deleteTree, restoreNar, deduplicateTree)
 import Goonix.Store.GuixProgram (guixProgram, canonPath)
 import qualified Goonix.Config as Config
 import System.Posix.ByteString (RawFilePath)
-import System.IO (Handle, hPutStrLn, hFlush)
-import System.Process (CreateProcess (..), StdStream (..), createProcess, proc, waitForProcess)
+import Data.Maybe (catMaybes)
+import System.IO (Handle, hClose, hPutStrLn, hFlush)
+import System.Process (CreateProcess (..), StdStream (..), createProcess, proc, terminateProcess, waitForProcess)
 import System.Posix.Env (getEnv)
 import System.Posix.Files (getFileStatus, fileMode)
 import Data.Bits ((.&.))
@@ -326,13 +327,32 @@ signHash hash = do
 verifySignature :: ByteString -> IO ByteString
 verifySignature signature = authenticate ("verify " ++ show (B.length signature) ++ ":" ++ C.unpack signature)
 
+-- | One request to `guix authenticate'.  The helper serves requests until its
+-- input ends and exits only then, so it is dismissed here, as soon as its reply
+-- has been read: both pipes are closed and it is terminated before it is waited
+-- for.  Waiting with its input still open left the end of input to the
+-- handle's finalizer, that is to the next garbage collection: soon in a daemon
+-- that has gone idle, and not for a long time while a build keeps another
+-- thread polling, so that a record could be neither verified nor signed during
+-- a build.  The signal makes the wait independent of who else holds the
+-- input: a child spawned by another thread meanwhile may have inherited the
+-- pipe.
 authenticate :: String -> IO ByteString
 authenticate command = do
   program <- C.unpack <$> guixProgram
-  (input, output, _, process) <- createProcess (proc program ["authenticate"])
-    { std_in = CreatePipe, std_out = CreatePipe }
-  case (input, output) of
-    (Just inHandle, Just outHandle) -> do
+  mask $ \restore -> do
+    (input, output, _, process) <- createProcess (proc program ["authenticate"])
+      { std_in = CreatePipe, std_out = CreatePipe }
+    let dismiss = do
+          mapM_ (\handle -> hClose handle `catch` \(_ :: SomeException) -> pure ())
+            (catMaybes [input, output])
+          terminateProcess process
+          void (waitForProcess process)
+    payload <- restore (exchange input output) `onException` dismiss
+    dismiss
+    pure payload
+  where
+    exchange (Just inHandle) (Just outHandle) = do
       hPutStrLn inHandle command
       hFlush inHandle
       reply <- readReplyHeader outHandle
@@ -341,9 +361,8 @@ authenticate command = do
           len = read (C.unpack lenText) :: Int
       payload <- B.hGet outHandle len
       when (code /= "0") (throwIO (storeError (C.unpack payload)))
-      _ <- waitForProcess process
       pure payload
-    _ -> throwIO (storeError "cannot create authentication pipes")
+    exchange _ _ = throwIO (storeError "cannot create authentication pipes")
 
 readReplyHeader :: Handle -> IO ByteString
 readReplyHeader handle = go B.empty

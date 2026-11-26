@@ -30,6 +30,11 @@
 #     poll's pinned buffer + frame held alive until the child exits).  Waits on a
 #     12s child under -K64k -T, samples live bytes: FAILS pre-fix (live grows ~7KB/s),
 #     PASSES after (flat).  Compiles the daemon's Wait.hs.
+#   - authenticate-busy.sh: a request to `guix authenticate' must return while
+#     another thread polls a builder, and leave no helper behind.  The daemon
+#     waited for the helper with its input open, so only a garbage collection
+#     ended the wait: FAILS pre-fix (the request does not return), PASSES after.
+#     Compiles the daemon sources.
 # Fails if ANY of them fails, naming the failing test.
 #
 # export-memory.sh is deliberately NOT here: it needs a running daemon and a
@@ -65,6 +70,7 @@ if test -f "$root/daemon/src/Goonix/Config.hs"; then
   run offload-idle bash "$here/offload-idle.sh" "$root"
   run offload-eof bash "$here/offload-eof.sh" "$root"
   run offload-flood bash "$here/offload-flood.sh" "$root"
+  run authenticate-busy bash "$here/authenticate-busy.sh" "$root"
 else
   echo 'SKIP: Haskell compile regressions (configured without the Haskell daemon; generated Goonix.Config.hs is absent)'
 fi
