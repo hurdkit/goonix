@@ -63,7 +63,7 @@ require_impl() { # binary expected-marker forbidden-marker label
 # Any source newer than the binary means the binary does not describe this tree.
 newer_sources() { # binary dirs...
   local bin=$1; shift
-  find "$@" -type f \( -name '*.hs' -o -name '*.c' -o -name '*.cc' -o -name '*.hh' \) \
+  find "$@" -type f \( -name '*.hs' -o -name '*.c' -o -name '*.cc' -o -name '*.hh' -o -name '*.inc' \) \
     -newer "$bin" -print 2>/dev/null | head -5
 }
 

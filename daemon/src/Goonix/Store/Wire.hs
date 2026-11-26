@@ -22,6 +22,10 @@ module Goonix.Store.Wire
   , workerMagic1
   , workerMagic2
   , protocolVersion
+  , goonixVersionWord
+  , goonixPeerLevel
+  , goonixOperationLevel
+  , goonixSettingsLevel
   , stderrNext
   , stderrRead
   , stderrWrite
@@ -132,9 +136,65 @@ data DecodeResult a
 workerMagic1, workerMagic2, protocolVersion :: Word32
 workerMagic1 = 0x6e697863
 workerMagic2 = 0x6478696f
--- goonix: 0x166 adds the resolved-derivation graph record queries (82-84),
--- 0x167 the session query (85).  A client asks for 85 only from 0x167 on.
-protocolVersion = 0x167
+-- Upstream's number, with the meaning upstream gives it.  What goonix adds to
+-- the protocol goes with the signal below, never with a version.
+protocolVersion = 0x164
+
+-- goonix: the signal by which a goonix daemon and client know each other.
+--
+-- The worker protocol of goonix has operations (82 to 85) and a setting
+-- ("goonix-deep-scan") that upstream's does not have.  A peer of upstream
+-- must never be sent one of them, and must never be taken for a peer that
+-- knows them.  The protocol version cannot tell the two apart: it is
+-- upstream's number, and what a number means is upstream's to say.
+--
+-- At the start of a connection the daemon and then the client each send one
+-- word that holds their protocol version.  Upstream reads the major version
+-- in bits 8 to 15 of that word and the minor version in bits 0 to 7
+-- (GET_PROTOCOL_MAJOR and GET_PROTOCOL_MINOR in the C++ daemon,
+-- 'protocol-major' and 'protocol-minor' in the client), and nothing above;
+-- the word is read as 32 bits.  A goonix peer puts its signal there: a tag
+-- in bits 24 to 31 and a level in bits 16 to 23.  The sixteen bits below
+-- stay the version.
+--
+-- The level says which operations of goonix the peer knows: each has the
+-- level that introduced it.  A word without the tag has level zero, which is
+-- that of upstream's peers and of the goonix peers that came before the
+-- signal.  An operation of goonix is used on a connection only when both of
+-- its ends gave a level that has it: the client does not send it to a daemon
+-- below that level, and the daemon answers one from a client below that
+-- level as it answers an operation that does not exist.  The C++ daemon has
+-- the same in nix/libstore/goonix-protocol.hh, the client in
+-- (guix goonix-protocol).
+goonixProtocolTag, goonixProtocolLevel, goonixSettingsLevel :: Word32
+-- What bits 24 to 31 of a goonix peer's version word hold.
+goonixProtocolTag = 0x67
+-- The level of this daemon: it knows every operation that
+-- 'goonixOperationLevel' gives a level.
+goonixProtocolLevel = 1
+-- The level from which a client that is not trusted may choose
+-- "goonix-deep-scan" with wopSetOptions.
+goonixSettingsLevel = 1
+
+-- | The word this daemon sends as its version in the greeting: the version in
+-- the bits upstream reads, and above them the tag and the level.
+goonixVersionWord :: Word32 -> Word32
+goonixVersionWord version =
+  (version .&. 0xffff) .|. (goonixProtocolLevel `shiftL` 16) .|. (goonixProtocolTag `shiftL` 24)
+
+-- | The goonix level that a version word carries, as a peer sent it in the
+-- greeting, or 0 if the word does not have the tag of a goonix peer.
+goonixPeerLevel :: Word32 -> Word32
+goonixPeerLevel word
+  | (word `shiftR` 24) .&. 0xff == goonixProtocolTag = (word `shiftR` 16) .&. 0xff
+  | otherwise = 0
+
+-- | The level from which a goonix peer has the operation, or 0 if it is not
+-- one of those that upstream's daemon does not have.
+goonixOperationLevel :: Word32 -> Word32
+goonixOperationLevel operation
+  | operation `elem` [82, 83, 84, 85] = 1
+  | otherwise = 0
 
 stderrNext, stderrRead, stderrWrite, stderrLast, stderrError :: Word32
 stderrNext = 0x6f6c6d67
@@ -205,7 +265,7 @@ operations =
   , Operation 82 "wopQueryRealisedOutput" [SString path, SString (name "output")] [SString path]
   , Operation 83 "wopQueryBuildRecords" [SString (name "resolvedHash"), SString (name "output")] [SStrings strings]
   , Operation 84 "wopQueryBuildGraph" [SString path] [SStrings strings, SStrings (name "hints")]
-  -- goonix: the sessions of a daemon that is one process; not in the C++ daemon.
+  -- goonix: the sessions of a daemon that is one process.
   , Operation 85 "wopQuerySessions" [] [SStrings strings]
   ]
 

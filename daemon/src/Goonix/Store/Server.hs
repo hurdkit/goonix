@@ -301,7 +301,8 @@ handleConnection :: ServerConfig -> Session -> Store -> Socket -> IORef Settings
 handleConnection config session store client settingsRef rootFd rootPath = do
   magic <- readIntSocket client
   unless (magic == workerMagic1) (throwIO (userError "protocol mismatch"))
-  writeSocket client (encodeInt workerMagic2 <> encodeInt protocolVersion)
+  -- goonix: upstream's version below the signal (Wire.hs).
+  writeSocket client (encodeInt workerMagic2 <> encodeInt (goonixVersionWord protocolVersion))
   clientVersion <- readIntSocket client
   let minor = clientVersion .&. 0xff
   when (minor >= 14) $ do
@@ -333,10 +334,14 @@ handleConnection config session store client settingsRef rootFd rootPath = do
 
 dispatch :: ServerConfig -> Session -> Store -> Socket -> IORef Settings -> Fd -> ByteString -> Word32 -> Word32 -> IO ()
 dispatch config session store client settingsRef rootFd rootPath clientVersion operation = case operation of
+  -- goonix: for a client that did not give the signal, an operation of the
+  -- fork is one that does not exist (Wire.hs).  Nothing of it is read.
+  _ | goonixPeerLevel clientVersion < goonixOperationLevel operation ->
+      throwIO (StoreError (C.pack ("invalid operation " ++ show operation)) 1)
   19 -> do
     settings <- readIORef settingsRef
     fields <- readSetOptions client clientVersion
-    case applySetOptions (clientVersion .&. 0xff) fields settings of
+    case applySetOptions clientVersion fields settings of
       Left message -> throwIO (StoreError (C.pack message) 1)
       Right updated -> writeIORef settingsRef updated
     writeFrame client stderrLast
@@ -529,7 +534,8 @@ dispatch config session store client settingsRef rootFd rootPath clientVersion o
     writeFrame client stderrLast
     writeSocket client (encodeStrings (substituteURLs settings))
   -- goonix: resolved-output and signed-record queries (HS-11).  No choice
-  -- mutation in a query and no client registration (C++ nix-daemon.cc).
+  -- mutation in a query and no client registration (C++
+  -- nix-daemon/goonix-operations.inc).
   82 -> do
     drvPath <- readStorePathStrict store client
     output <- readStringSocket client

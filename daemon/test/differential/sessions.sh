@@ -7,7 +7,9 @@
 # daemon is one process for all its sessions and shows none of that, so it
 # keeps the same facts and answers operation 85 with them.  The C++ daemon
 # knows the operation and answers it with no session: /proc shows them all.
-# Both announce a protocol version from which a client may ask.
+# The operation is goonix's: both daemons say in the greeting, with a signal
+# that upstream's client does not read, that they know it, and answer it for
+# a client that gave the same signal.
 #
 # One client holds three connections: one builds, with a builder that waits
 # to be let go, one is idle, one asks.  Checked for the Haskell daemon:
@@ -24,9 +26,12 @@
 # session, and the connection that asked is still served.
 # Checked for both: the building and the idle connection are served to the
 # end, and a connection opened afterwards is served; (guix daemon-sessions),
-# which asks only a daemon whose version has the operation, asks this one
-# and reads its answer; the daemon's standard error has no "invalid
-# operation" line.
+# which asks only a daemon that gave the signal, asks this one and reads its
+# answer; the daemon's standard error has no "invalid operation" line.  Then
+# a second client, which gives no signal in its greeting, as a client of
+# upstream: the daemon announces to it the protocol version of this tree's
+# client, refuses it operation 85 exactly as it refuses an operation that no
+# daemon has, and serves it what upstream has.
 #
 # Usage: sessions.sh [DAEMON] [FIXTURE]
 set -euo pipefail
@@ -56,7 +61,7 @@ fi
 launcher= scope=
 fail() {
   echo "FAIL: $*" >&2
-  for log in daemon.log client.log; do
+  for log in daemon.log client.log no-signal.log; do
     if test -s "$fixture/$log"; then echo "--- $log" >&2; tail -20 "$fixture/$log" >&2; fi
   done
   exit 1
@@ -102,6 +107,15 @@ grep -Fqx 'the client of this tree asked the daemon and read its answer' "$fixtu
 if grep -F 'invalid operation' "$fixture/daemon.log" >&2; then
   fail "the daemon refused an operation"
 fi
+# The client of upstream: no signal, so no operation of goonix.
+status=0
+goonix_run_capped "$root/pre-inst-env" guile --no-auto-compile \
+  "$root/daemon/test/differential/sessions-no-signal.scm" >"$fixture/no-signal.log" 2>&1 || status=$?
+test "$status" -eq 0 || fail "the client without the signal ended with status $status"
+grep -Fqx 'refused as an operation that does not exist' "$fixture/no-signal.log" \
+  || fail "a client without the signal was not refused operation 85"
+grep -Fqx "served upstream's operations" "$fixture/no-signal.log" \
+  || fail "a client without the signal was not served"
 if test "$SESSIONS_EXPECT" = report; then
   echo "sessions reported by the daemon: PASS"
 else

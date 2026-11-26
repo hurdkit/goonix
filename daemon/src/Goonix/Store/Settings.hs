@@ -16,12 +16,14 @@ module Goonix.Store.Settings
   , defaultDaemonOptions
   ) where
 
+import Data.Bits ((.&.))
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as C
 import qualified Data.Map.Strict as Map
 import Data.Word (Word32)
 import qualified Goonix.Config as Config
+import Goonix.Store.Wire (goonixPeerLevel, goonixSettingsLevel)
 
 data Settings = Settings
   { values :: !(Map.Map ByteString ByteString)
@@ -55,8 +57,12 @@ settingInt key fallback settings = case reads (C.unpack (setting key (C.pack (sh
   [(number, "")] -> number
   _ -> fallback
 
+-- | Apply the fields of wopSetOptions.  The first argument is the word the
+-- client sent as its version in the greeting: its minor version says which
+-- fields there are, and its goonix level whether the client has the setting
+-- of goonix (Wire.hs).
 applySetOptions :: Word32 -> [ByteString] -> Settings -> Either String Settings
-applySetOptions minor fields initial = do
+applySetOptions clientVersion fields initial = do
   (keepFailedValue, rest1) <- takeField fields
   (keepGoingValue, rest2) <- takeField rest1
   (fallbackValue, rest3) <- takeField rest2
@@ -87,10 +93,15 @@ applySetOptions minor fields initial = do
         else settings4
   pure (foldl applyPair settings5 pairs)
   where
+    minor = clientVersion .&. 0xff
     zero = B.replicate 8 0
     intValue = littleInt
     applyPair settings (key, value)
-      | key `elem` ["build-timeout", "build-max-silent-time", "build-max-log-size", "build-max-jobs", "build-cores", "build-repeat", "multiplexed-build-output", "goonix-deep-scan"] = setSetting key value settings
+      | key `elem` ["build-timeout", "build-max-silent-time", "build-max-log-size", "build-max-jobs", "build-cores", "build-repeat", "multiplexed-build-output"] = setSetting key value settings
+      -- goonix: any client may make its own builds stricter with this one
+      -- (C++ nix-daemon.cc), if it gave the signal.  Without the signal the
+      -- name is handled as upstream handles a name it does not list.
+      | key == "goonix-deep-scan" && goonixPeerLevel clientVersion >= goonixSettingsLevel = setSetting key value settings
       | key == "user-name" = settings
       | trusted settings = setSetting key value settings
       | otherwise = setSetting ("untrusted-" <> key) value settings

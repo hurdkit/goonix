@@ -7,7 +7,9 @@
 ;; Haskell daemon names its sessions) or `none' (the C++ daemon names no
 ;; session: each of its sessions is a process that /proc shows).  At the end
 ;; the client of this tree, (guix daemon-sessions), asks too: it asks only a
-;; daemon whose version has the operation, and both daemons announce it.
+;; daemon that gave the signal of goonix in the greeting, and both daemons
+;; give it.  The connections of this file are opened by that client, so they
+;; carry its signal; sessions-no-signal.scm is the client without one.
 (use-modules (guix store) (guix serialization) (guix derivations) (guix tests)
              (guix daemon-sessions)
              (gnu packages bootstrap)
@@ -208,8 +210,8 @@ denotes: a list of (NUMBER CLIENT LOCKS CHILDREN)."
          (assert #f "a connection the daemon has ended is reported: "
                  sessions)))))
   (say "sessions reported after the build and after two clients left"))
-;; The client of this tree asks a daemon only if the version that the daemon
-;; announced has the operation.  Either daemon is asked, and names itself.
+;; The client of this tree asks a daemon only if the daemon gave the signal of
+;; goonix in the greeting.  Either daemon is asked, and names itself.
 (match (query-daemon-report (getenv "GUIX_DAEMON_SOCKET"))
   ((? daemon-report? report)
    (assert (eqv? (daemon-report-pid report) daemon-pid)

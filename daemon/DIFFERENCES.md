@@ -64,13 +64,26 @@ prints, beside the ones it finds in `/proc`.
 
 The C++ daemon has the operation too and answers it with the version of the
 layout, its PID and no session: `/proc` shows every one of its sessions, and
-one named in the answer as well would be listed twice. Both daemons announce
-the protocol version that has the operation, and `(guix daemon-sessions)`
-asks a daemon only if the version it announced is at least that one. A daemon
-of an earlier version, upstream's among them, is not asked: it would refuse,
-end the connection that asked and write "invalid operation 85" on its
-standard error. What `guix processes` shows for this daemon differs from what
-it shows for the C++ daemon:
+one named in the answer as well would be listed twice.
+
+The operation is goonix's, as are the three queries of content addressing
+(operations 82 to 84) and the `goonix-deep-scan` setting: upstream's protocol
+has none of them. In this both daemons are the same. They announce upstream's
+protocol version, which means what it means upstream, and say that they know
+these operations with a signal that upstream does not read: in the word of
+the greeting that holds the version, above the sixteen bits of major and
+minor version, a tag in bits 24 to 31 and a level in bits 16 to 23. The
+client of goonix puts the same in the word it sends. A daemon answers one of
+these operations only for a client that gave the signal, and refuses it for
+any other as it refuses an operation that does not exist; it takes the
+setting from a client that is not trusted only if that client gave the
+signal. The client sends them only to a daemon that gave the signal. So
+`(guix daemon-sessions)` asks a daemon only if it gave the signal. A daemon
+that gave none, upstream's among them and goonix's from before the signal,
+whatever version it announces, is not asked: it would refuse, end the
+connection that asked and write "invalid operation 85" on its standard
+error. What `guix processes` shows for this daemon differs from what it shows
+for the C++ daemon:
 
 - `SessionPID` is the daemon's PID for every session: there is no other
   process. The sessions are told apart by their numbers. `guix processes`
@@ -105,7 +118,9 @@ client that builds on one connection, keeps a second idle and asks on a
 third: for this daemon the sessions it reports, for the C++ daemon its
 answer without sessions, and for both that the other connections are served,
 that `(guix daemon-sessions)` asks and reads the answer, and that nothing is
-refused.
+refused. A second client then gives no signal in its greeting: for both
+daemons it is refused the operation as one that does not exist, and served
+what upstream has.
 
 Because it is one process, the daemon also creates the store and state
 directories once at start-up (`initialiseState`) rather than per client as the
