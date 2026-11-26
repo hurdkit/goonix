@@ -18,6 +18,7 @@
              (gnu build marionette)
              (gnu packages virtualization)
              (ice-9 match)
+             (ice-9 textual-ports)
              (srfi srfi-64))
 
 (define store (open-connection))
