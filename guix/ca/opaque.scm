@@ -15,6 +15,7 @@
   #:use-module (ice-9 match)
   #:use-module (srfi srfi-1)
   #:export (%opaque-packages
+            opaque-name?
             opaque-package?
             opaque-package-names))
 
@@ -30,6 +31,12 @@
 ;;;
 ;;; The table starts from `guix ca scan`'s result on this store: glibc,
 ;;; qemu-minimal and file (plan section 4.3).
+;;;
+;;; Adoption (guix ca adopt) applies the same table to the items it reaches
+;;; through an adopted dependent's references, by derivation name: an item
+;;; the table names is not adopted, and the dependent keeps its reference to
+;;; the item's input-addressed path.  Both callers go through opaque-name?,
+;;; which needs no package, so the table stays the one source.
 ;;;
 ;;; Refreshing the table: re-run `guix ca scan` over the store and add the
 ;;; packages it flags; and from a build farm, the `--check=relocation` results
@@ -51,17 +58,25 @@
   "Return the names in the opaque table."
   (map car %opaque-packages))
 
+(define (opaque-name? name version)
+  "Whether the opaque table names NAME at VERSION: an entry (NAME) matches
+every version, an entry (NAME V) only version V.  VERSION may be #f (a name
+with no version part), which only an entry without a version matches.
+
+This is the table's one test.  opaque-package? applies it to a package's name
+and version, and (guix ca adopt) to a derivation's name split into the two.
+It takes no package, so adoption can use it on derivations alone."
+  (any (match-lambda
+         ((n) (string=? n name))
+         ((n v) (and version (string=? n name) (string=? v version))))
+       %opaque-packages))
+
 (define (opaque-package? package)
   "Whether PACKAGE is marked opaque: either it carries the opaque
 self-references property, or the goonix opaque table names it (by name, and
 by version where the entry gives one).  The policy applies this at lowering
 exactly as the opaque property alone was applied."
   (or (eq? 'opaque (assq-ref (package-properties package) 'self-references))
-      (let ((name (package-name package))
-            (version (package-version package)))
-        (any (match-lambda
-               ((n) (string=? n name))
-               ((n v) (and (string=? n name) (string=? v version))))
-             %opaque-packages))))
+      (opaque-name? (package-name package) (package-version package))))
 
 ;;; opaque.scm ends here

@@ -185,6 +185,10 @@ excluded by adopt-package? and does not enter this path."
                            store d)))
                (if (eq? adopt d)
                    ;; Flagged item: build it content-addressed from source.
+                   ;; (adopt-derivation also returns an item the opaque
+                   ;; table names unchanged, but adopt-package? keeps such a
+                   ;; package out of this path, so only flagged and
+                   ;; glibc-named items arrive here.)
                    ;;
                    ;; goonix: only the item's OWN derivation is content.
                    ;; LOWER is the plain bag lowerer, so the item does not

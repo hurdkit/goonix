@@ -16,6 +16,10 @@
   #:use-module (guix grafts)
   #:use-module ((guix utils) #:select (%current-system))
   #:use-module ((guix ca) #:select (glibc-name?))
+  #:use-module ((guix ca opaque) #:select (opaque-name?))
+  #:use-module ((guix build utils)
+                #:select ((package-name->name+version
+                           . derivation-name->name+version)))
   #:use-module (guix ca graft)
   #:use-module (guix ca scan)
   #:use-module (ice-9 match)
@@ -39,6 +43,13 @@
 ;;; An item the scanner flags (a split, UTF-16 or hidden self-reference, or a
 ;;; self-referencing name or link), and glibc, is not adopted: its package is
 ;;; lowered content-addressed from source instead (see guix/ca/policy).
+;;;
+;;; An item the opaque table (guix ca opaque) names is not adopted either.
+;;; The policy never adopts such a package itself; here it is reached as a
+;;; reference of an adopted dependent, which then keeps the reference to the
+;;; item's input-addressed path, and no graft is made for it.  The table
+;;; exists because the scanner cannot see every self path, so a clean scan
+;;; does not overrule it.
 ;;;
 ;;; Code:
 
@@ -124,11 +135,28 @@ The rule itself is (guix ca)'s glibc-name?, shared with the policy's
 lower-bag-with-addressing so the two cannot drift."
   (glibc-name? (derivation-name drv)))
 
+(define (opaque-derivation? drv)
+  "Whether the opaque table names DRV.  A package's derivation is named
+NAME-VERSION; the name is split as upstream splits derivation names (the
+first hyphen followed by a digit starts the version), and the table is
+matched with opaque-name?, as opaque-package? matches a package.  So
+commencement's file-boot0 is not file."
+  (call-with-values
+      (lambda () (derivation-name->name+version (derivation-name drv)))
+    opaque-name?))
+
+(define (refused-by-name? drv)
+  "Whether DRV is refused adoption by its name alone, without reading its
+contents: glibc, or an item the opaque table names."
+  (or (glibc-derivation? drv)
+      (opaque-derivation? drv)))
+
 (define (adopted-item? store drv)
-  "Whether DRV's output can be adopted: it is not glibc and the scanner does
-not flag it.  DRV's output must already be realised, except for glibc, which
-is refused by name and whose contents are therefore never read."
-  (and (not (glibc-derivation? drv))
+  "Whether DRV's output can be adopted: it is not glibc, the opaque table does
+not name it, and the scanner does not flag it.  DRV's output must already be
+realised, except for an item refused by name, whose contents are therefore
+never read."
+  (and (not (refused-by-name? drv))
        (not (item-flagged? store (realised-output-path store drv "out")))))
 
 (define graft-derivation/shallow*
@@ -166,7 +194,9 @@ content-addressed derivation whose output is DRV's tree with every store
 reference rewritten to its adopted counterpart and its own path rewritten to
 the content address.  References are adopted recursively; an item the scanner
 flags, and glibc, is built content-addressed from source instead of adopted
-(its derivation is returned unchanged for the policy to re-lower).  The
+(its derivation is returned unchanged for the policy to re-lower).  An item
+the opaque table names is returned unchanged too: a dependent keeps its
+input-addressed reference, and the policy never adopts such a package.  The
 rewrite goes through graft-derivation/shallow under
 %graft-content-addressed?, so it is the two-pass content-addressed graft.
 
@@ -195,13 +225,16 @@ separately in item-flagged?."
     ;; over all outputs needs them present.  (derivation-input drv) defaults
     ;; to every output, so substitutes are used; upstream does the same when
     ;; lowering needs an item's contents (references-oracle, guix/grafts.scm).
-    ;; glibc is the one case that needs no contents: it is re-lowered from
-    ;; source, so its input-addressed outputs are not fetched for that.
-    (unless (glibc-derivation? drv)
+    ;; An item refused by name needs no contents: glibc is re-lowered from
+    ;; source, and a dependent keeps its reference to an opaque table item,
+    ;; whose referenced output is valid already.  Their other outputs are
+    ;; not fetched for that.
+    (unless (refused-by-name? drv)
       (build-derivations store (list (derivation-input drv))))
     (cond
-     ;; Flagged items and glibc are not adopted; the policy re-lowers them
-     ;; content-addressed from source.  Here we return the derivation itself.
+     ;; Flagged items, glibc and opaque table items are not adopted.  Here we
+     ;; return the derivation itself: a dependent's reference to it is not
+     ;; grafted, and the policy re-lowers a flagged item or glibc from source.
      ((not (adopted-item? store drv)) drv)
      (else
       (let* ((outputs (derivation-output-names drv))
