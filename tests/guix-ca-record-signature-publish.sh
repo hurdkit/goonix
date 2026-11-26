@@ -36,6 +36,14 @@ GUIX_CONFIGURATION_DIRECTORY=$root/etc ./pre-inst-env ./nix/records-test \
 export GOONIX_CPP_SIGNATURE=$root/cpp-signature
 ./pre-inst-env guile --no-auto-compile tests/ca-record-signature-cpp-client.scm
 ./pre-inst-env guile --no-auto-compile tests/ca-record-signature-publish-fixture.scm
+# The fixture rewrites a real signed row to its legacy raw form after the
+# daemon has opened the store.  Restart so startup migration and the publish
+# path see that legacy row, rather than the daemon's pre-fixture open.
+kill "$daemon"; wait "$daemon" 2>/dev/null || true
+./pre-inst-env ./guix-daemon --disable-chroot --listen="$root/socket" \
+  --substitute-urls= >>"$root/server.log" 2>&1 & daemon=$!
+trap 'kill "$daemon" 2>/dev/null || true; wait 2>/dev/null || true' EXIT
+for i in $(seq 1 100); do test -S "$root/socket" && break; sleep .1; done
 sqlite3 "$root/db/db.sqlite" '.timeout 10000' 'PRAGMA wal_checkpoint(FULL);'
 ./pre-inst-env guix publish --listen=127.0.0.1 --port="$port" -C0 \
   >"$root/publish.log" 2>&1 & publish=$!
@@ -57,7 +65,9 @@ raw=$(sqlite3 "$root/db/db.sqlite" '.timeout 10000' \
   "SELECT hex(signature) FROM GoonixBuildRecords
    WHERE path = '$(sed -n 's/.*(output "\([^"]*\)").*/\1/p' "$root/fixture.scm")';")
 export GOONIX_RESPONSE=$root/response
-export GOONIX_EXPECTED_HEX=$(printf '%s' "$raw" | tr A-F a-f)
+# The database now stores canonical base64.  The client compares the decoded
+# signer bytes, never the base64 text, with the signature served by publish.
+export GOONIX_EXPECTED_HEX=$(printf '%s' "$raw" | tr A-F a-f | xxd -r -p | base64 -d | xxd -p -c 9999)
 ./pre-inst-env guile --no-auto-compile tests/ca-record-signature-publish-client.scm
 
 # The exact legacy failure shape: raw high bytes in a quoted S-expression.

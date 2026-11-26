@@ -10,8 +10,13 @@
 (define shell-source (getenv "GOONIX_SHELL_SOURCE"))
 (define shell (add-to-store store "two-store-shell" #t "sha256" shell-source))
 (define sleep-source (getenv "GOONIX_SLEEP_SOURCE"))
-(define sleep-path (and sleep-source
-                        (add-to-store store "two-store-sleep" #t "sha256" sleep-source)))
+(define sleep-tools
+  (and sleep-source
+       (add-file-tree-to-store store
+         `("two-store-sleep-tools" directory
+            ("busybox" executable (file ,sleep-source))
+            ("sleep" symlink "busybox")))))
+(define sleep-path (and sleep-tools (string-append sleep-tools "/sleep")))
 
 (define* (ca-drv name script #:key (inputs '()) (addressing 'content)
                 (env-vars '()) (sources '()))
@@ -43,10 +48,10 @@
 (define (make-input)
   (ca-drv "two-store-input"
           (string-append
-           (format #f "if test -e '~a/hold-enabled'; then until test -e '~a/hold-released'; do \"$sleep\" 1; done; fi; "
-                   (getenv "GOONIX_ASYNC_ROOT") (getenv "GOONIX_ASYNC_ROOT"))
+           (format #f "if test -e '~a/hold-enabled'; then printf 'held\\n' > '~a/hold-started'; until test -e '~a/hold-released'; do \"$sleep\" 1 || exit 75; done; fi; "
+                   (getenv "GOONIX_ASYNC_ROOT") (getenv "GOONIX_ASYNC_ROOT") (getenv "GOONIX_ASYNC_ROOT"))
            (nonreproducible-output))
-          #:sources (if sleep-path (list sleep-path) '())
+          #:sources (if sleep-tools (list sleep-tools) '())
           #:env-vars `(("sleep" . ,sleep-path))))
 (define (make-dependent input)
   (ca-drv "two-store-dependent"

@@ -29,6 +29,17 @@ done
 printf '#!/bin/sh\nexec /bin/sh "$@"\n' > "$root/shell"
 chmod 755 "$root/shell"
 
+# Use a static BusyBox and a correctly named sleep symlink in one store item.
+if test -n "${GOONIX_SLEEP_SOURCE:-}"; then
+  sleep_source=$GOONIX_SLEEP_SOURCE
+else
+  sleep_source=$(nix eval --raw --impure --expr \
+    'let pkgs = import <nixpkgs> {}; in "${pkgs.pkgsStatic.busybox}/bin/busybox"')
+  test -x "$sleep_source" || nix build --impure --no-link --expr \
+    'let pkgs = import <nixpkgs> {}; in pkgs.pkgsStatic.busybox'
+fi
+export GOONIX_SLEEP_SOURCE=$sleep_source
+
 server_pid= publisher_pid= client_pid= bad_pid= silent_pid= empty_pid= concurrent_pid=
 completed=false
 cleanup() {
@@ -52,7 +63,6 @@ export GUIX_DAEMON_SOCKET=$server/socket GUIX_LOG_DIRECTORY=$server/log
 export GUIX_ALLOW_UNAUTHENTICATED_SUBSTITUTES=no
 export GOONIX_SHELL_SOURCE=$root/shell
 export GOONIX_BUILD_MARKER=$root/server-build-marker
-export GOONIX_SLEEP_SOURCE=$(command -v sleep)
 export GOONIX_ASYNC_ROOT=$root
 ./pre-inst-env ./guix-daemon --disable-chroot --listen="$server/socket" \
   --substitute-urls= >"$root/server.log" 2>&1 & server_pid=$!
@@ -178,6 +188,14 @@ grep -F 'answer imported' "$root/concurrent-client.log"
 builder_line=$(grep -nE '@ build-started .*-two-store-input.drv' "$root/concurrent-client.log" | sed -n '1s/:.*//p')
 import_line=$(grep -nE 'two-store-dependent.drv.: answer imported' "$root/concurrent-client.log" | sed -n '1s/:.*//p')
 test -n "$builder_line" && test -n "$import_line" && test "$builder_line" -lt "$import_line"
+# The ordering assertion is meaningful only while the input builder is held.
+for i in $(seq 1 100); do
+  test ! -e "$root/hold-started" || break
+  if ! kill -0 "$concurrent_pid" 2>/dev/null; then cat "$root/concurrent-client.log"; exit 1; fi
+  sleep .1
+done
+test -e "$root/hold-started"
+kill -0 "$concurrent_pid"
 : > "$root/hold-released"
 wait "$concurrent_pid"
 concurrent_pid=
@@ -196,6 +214,7 @@ perl -MIO::Socket::INET -e '
   my $s=IO::Socket::INET->new(LocalAddr=>"127.0.0.1",LocalPort=>'"$empty_port"',Listen=>20,ReuseAddr=>1) or die $!;
   open my $f,">>","'$root'/empty-publish.log" or die $!;
   select((select($f),$|=1)[0]);
+  $SIG{CHLD} = "IGNORE";
   while (my $c=$s->accept) {
     my $pid=fork(); die "fork: $!" unless defined $pid;
     if ($pid==0) {

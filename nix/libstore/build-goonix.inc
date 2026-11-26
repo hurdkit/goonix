@@ -14,6 +14,12 @@ GoalPtr LocalStore::makeGoonixGraphGoal(Worker & worker, const Path & path)
     return worker.makeGoonixGraphGoal(path);
 }
 
+GoalPtr Worker::existingDerivationGoal(const Path & path)
+{
+    auto found = derivationGoals.find(path);
+    return found == derivationGoals.end() ? GoalPtr() : found->second.lock();
+}
+
 void Worker::goonixSetChildDeadline(pid_t pid, time_t deadline)
 {
     children[pid].deadline = deadline;
@@ -68,6 +74,19 @@ bool DerivationGoal::goonixHaveDerivation()
     missingPaths = prepared.missingPaths;
     fixedOutput = prepared.fixedOutput;
     nrRounds = prepared.rounds;
+    /* A local input goal may supersede the graph's provisional choice.  Join
+       only goals that already exist; creating input substitution goals here
+       would bypass the imported dependent graph in the ordinary case. */
+    if (goonixGraphSettled && !resolvedDerivation(drv)) {
+        for (auto & input : drv.inputDrvs) {
+            GoalPtr inputGoal = worker.existingDerivationGoal(input.first);
+            if (inputGoal) addWaitee(inputGoal);
+        }
+        if (!waitees.empty()) {
+            state = &DerivationGoal::haveDerivation;
+            return true;
+        }
+    }
     if (prepared.action == GoonixGoalAction::substituteOutputs) {
         for (auto & output : originalDrv.outputs) {
             Path chosen = worker.store.chosenOutputForCurrentGraph(originalDrvPath,

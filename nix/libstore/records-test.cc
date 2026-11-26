@@ -213,6 +213,112 @@ int main(int argc, char ** argv)
     }
     std::cout << "goonix signing helper with forced stderr: PASS\n";
 
+    /* Publishing normalises a legacy raw S-expression only in the returned
+       record.  Reimporting that authenticated fact must not add a second
+       row just because its encoded signature differs from the stored raw
+       bytes.  Keep the real signed fixture: do not relax authentication. */
+    {
+        sqlite3 * fixture;
+        if (sqlite3_open((settings.nixDBPath + "/db.sqlite").c_str(), &fixture) != SQLITE_OK)
+            throw Error("could not open legacy-record fixture database");
+        auto sql = std::format("update GoonixBuildRecords set signature = ? "
+            "where resolvedHash = '{}' and output = 'out';", hash);
+        sqlite3_stmt * update = nullptr;
+        int result = sqlite3_prepare_v2(fixture, sql.c_str(), -1, &update, nullptr);
+        const string raw = goonixBase64Decode(records.at(0).signature);
+        if (result == SQLITE_OK)
+            result = sqlite3_bind_text(update, 1, raw.data(), raw.size(), SQLITE_TRANSIENT);
+        if (result == SQLITE_OK) result = sqlite3_step(update);
+        sqlite3_finalize(update);
+        sqlite3_close(fixture);
+        if (result != SQLITE_DONE) throw Error("could not restore raw signature fixture");
+
+        auto legacy = store.queryGoonixBuildRecords(hash, "out");
+        store.recordGoonixBuild(drv, "out", drv, hash, "local-test", false,
+            legacy.at(0).signature);
+        auto after = store.queryGoonixBuildRecords(hash, "out");
+        if (legacy.size() != 1 || after.size() != 1 ||
+            after.at(0).signature != records.at(0).signature) {
+            std::cerr << "goonix legacy signature reimport deduplication: FAIL\n";
+            return 1;
+        }
+        std::cout << "goonix legacy signature reimport deduplication: PASS\n";
+    }
+
+    /* An old database may already contain both forms.  Opening the record
+       store must migrate to the encoded form and remove the duplicate. */
+    {
+        sqlite3 * fixture;
+        if (sqlite3_open((settings.nixDBPath + "/db.sqlite").c_str(), &fixture) != SQLITE_OK)
+            throw Error("could not open legacy-migration fixture database");
+        /* Start with only the raw legacy fact.  The encoded twin is inserted
+           below, as it was by the old reimport path. */
+        auto sql = std::format("delete from GoonixBuildRecords "
+            "where resolvedHash = '{}' and output = 'out' and origin = 'local-test';", hash);
+        int result = sqlite3_exec(fixture, sql.c_str(), nullptr, nullptr, nullptr);
+        const string raw = goonixBase64Decode(records.at(0).signature);
+        const string encoded = records.at(0).signature;
+        for (auto & signature : {raw, encoded}) {
+            sql = std::format(
+                "insert into GoonixBuildRecords "
+                "(resolvedHash, resolvedDerivation, output, path, origin, "
+                "relocationChecked, signature) values "
+                "('{}', '{}', 'out', '{}', 'local-test', 0, ?);",
+                hash, drv, drv);
+            sqlite3_stmt * insert = nullptr;
+            if (result == SQLITE_OK)
+                result = sqlite3_prepare_v2(fixture, sql.c_str(), -1, &insert, nullptr);
+            if (result == SQLITE_OK)
+                result = sqlite3_bind_blob(insert, 1, signature.data(), signature.size(),
+                    SQLITE_TRANSIENT);
+            if (result == SQLITE_OK) result = sqlite3_step(insert);
+            sqlite3_finalize(insert);
+        }
+        sqlite3_close(fixture);
+        if (result != SQLITE_DONE) throw Error("could not create raw/encoded twin fixture");
+
+        store.initialiseGoonixRecords();
+        auto migrated = store.queryGoonixBuildRecords(hash, "out");
+        sqlite3 * check;
+        if (sqlite3_open((settings.nixDBPath + "/db.sqlite").c_str(), &check) != SQLITE_OK)
+            throw Error("could not inspect migrated record database");
+        sqlite3_stmt * count = nullptr;
+        int rows = -1, rawRows = -1;
+        result = sqlite3_prepare_v2(check, "select count(*), "
+            "sum(substr(signature, 1, 1) = '(') from GoonixBuildRecords "
+            "where path = ?1 and origin = 'local-test';", -1, &count, nullptr);
+        if (result == SQLITE_OK)
+            result = sqlite3_bind_text(count, 1, drv.c_str(), -1, SQLITE_TRANSIENT);
+        if (result == SQLITE_OK && sqlite3_step(count) == SQLITE_ROW) {
+            rows = sqlite3_column_int(count, 0);
+            rawRows = sqlite3_column_int(count, 1);
+        }
+        sqlite3_finalize(count);
+        sqlite3_close(check);
+        store.initialiseGoonixRecords();
+        auto reopened = store.queryGoonixBuildRecords(hash, "out");
+        if (migrated.size() != 1 || reopened.size() != 1 || rows != 1 || rawRows != 0 ||
+            migrated.at(0).signature != records.at(0).signature) {
+            std::cerr << "goonix legacy signature migration: FAIL\n";
+            return 1;
+        }
+        std::cout << "goonix legacy signature migration: PASS\n";
+        /* The pre-existing mixed-record fixture starts from one raw row.
+           Restore that shape after proving the separate migration invariant. */
+        if (sqlite3_open((settings.nixDBPath + "/db.sqlite").c_str(), &fixture) != SQLITE_OK)
+            throw Error("could not restore mixed-record fixture database");
+        auto restore = std::format("update GoonixBuildRecords set signature = ? "
+            "where resolvedHash = '{}' and output = 'out' and origin = 'local-test';", hash);
+        sqlite3_stmt * update = nullptr;
+        result = sqlite3_prepare_v2(fixture, restore.c_str(), -1, &update, nullptr);
+        if (result == SQLITE_OK)
+            result = sqlite3_bind_blob(update, 1, raw.data(), raw.size(), SQLITE_TRANSIENT);
+        if (result == SQLITE_OK) result = sqlite3_step(update);
+        sqlite3_finalize(update);
+        sqlite3_close(fixture);
+        if (result != SQLITE_DONE) throw Error("could not restore mixed-record raw row");
+    }
+
     /* One bad row must not hide its valid sibling.  The bad row has a
        distinct path, so this is a mixed aggregate, not a failed direct read. */
     {
