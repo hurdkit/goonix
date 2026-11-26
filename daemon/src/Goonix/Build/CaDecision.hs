@@ -47,6 +47,11 @@ data CaGoalDecision = CaGoalDecision
 -- immediately before it.  A graph miss does not imply that a locally realised
 -- output is absent.  Resolved content outputs use the selected path even when
 -- it still needs fetching; only a later failed fetch restores the token.
+-- 'decisionSubstitutionSettled' says that this goal has asked for its selected
+-- outputs to be substituted and that request has settled (C++
+-- goonixSubstitutionRequested); 'decisionInputsRealised' that its input goals
+-- have settled.  For an unresolved derivation 'CaBuild' means: resolve, then
+-- build unless the resolved derivation is already realised.
 prepareCaGoal :: CaDecisionInput -> CaGoalDecision
 prepareCaGoal input = CaGoalDecision action (Map.map choicePath (decisionChoices input))
   where
@@ -69,10 +74,16 @@ prepareCaGoal input = CaGoalDecision action (Map.map choicePath (decisionChoices
           && decisionTopGoal input && decisionGraphAvailable input
           && not (all validChoice choices) = CaGraph
       | not (decisionResolved input) =
-          if decisionNormal input && all validChoice choices then CaDone
-          -- Check/repair must still resolve and run the builder; its valid
-          -- ordinary choice is not a completed reproducibility check.
-          else if not (decisionNormal input) && all validChoice choices then CaBuild
+          -- An unresolved goal is finished by its choices only when it asked
+          -- for them to be substituted (goonixSelectedOutputsSubstituted).
+          -- Valid choices alone do not finish it: prepareGoonixGoal sends
+          -- every other unresolved goal to its inputs, in every mode, and the
+          -- goal is done, or built for a check, only as the resolved
+          -- derivation.  So an input whose output was collected is realised
+          -- again when its dependent is requested, and resolving never meets
+          -- an input that is not realised.
+          if decisionNormal input && decisionSubstitutionSettled input
+              && all validChoice choices then CaDone
           else if decisionInputsRealised input then CaBuild else CaSubstituteInputs
       | decisionNormal input && all validChoice choices = CaDone
       | any missingChoice choices = CaSubstituteOutputs

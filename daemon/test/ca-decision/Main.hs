@@ -29,7 +29,22 @@ main = do
         , ("graph miss with realised inputs resolves", base { decisionGraphRequested = True, decisionInputsRealised = True }, CaBuild)
         , ("graph miss with pending inputs waits", base { decisionGraphRequested = True, decisionInputsRealised = False }, CaSubstituteInputs)
         , ("no-cache leaf resolves", base { decisionResolved = True, decisionGraphAvailable = False, decisionInputsRealised = False }, CaBuild)
-        , ("valid unresolved choice is done", base { decisionChoices = choice "chosen" True }, CaDone)
+        -- An unresolved goal is not finished by valid choices: it goes to its
+        -- inputs, then resolves (build-ca.cc prepareGoonixGoal).  Only the
+        -- goal that asked for its selected outputs is finished by them.
+        , ("valid unresolved choice realises its inputs first",
+            base { decisionInputsRealised = False, decisionChoices = choice "chosen" True }, CaSubstituteInputs)
+        , ("valid unresolved choice of an input realises its inputs first",
+            base { decisionTopGoal = False, decisionInputsRealised = False, decisionChoices = choice "chosen" True }, CaSubstituteInputs)
+        , ("valid unresolved choice resolves once its inputs are realised", base { decisionChoices = choice "chosen" True }, CaBuild)
+        , ("substituted selected outputs finish the unresolved goal",
+            base { decisionInputsRealised = False, decisionSubstitutionSettled = True,
+                   decisionChoices = choice "chosen" True }, CaDone)
+        , ("check of unresolved valid choice realises its inputs first",
+            base { decisionNormal = False, decisionInputsRealised = False, decisionChoices = choice "chosen" True }, CaSubstituteInputs)
+        , ("check of unresolved valid choice is not finished by a substitution",
+            base { decisionNormal = False, decisionInputsRealised = False, decisionSubstitutionSettled = True,
+                   decisionChoices = choice "chosen" True }, CaSubstituteInputs)
         , ("check of unresolved valid choice resolves and builds", base { decisionNormal = False, decisionChoices = choice "chosen" True }, CaBuild)
         , ("missing chosen output is substituted", base { decisionChoices = choice "chosen" False }, CaSubstituteOutputs)
         , ("settled missing selected output falls back to local build",

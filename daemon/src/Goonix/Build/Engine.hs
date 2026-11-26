@@ -253,7 +253,13 @@ buildThingsInternal config rootFd store settings trace hook things mode cancel =
                             -- unresolved goal rebuilds an already realised input.
                             selected <- selectGoonixOutputs store path resolved
                             prepared <- prepareResolvedBuild (traceOutput trace) rootFd store jobMode path selected
-                            buildPhaseWith requested path prepared resolvedPath
+                            -- C++ prepareResolvedBuild: a resolved derivation
+                            -- whose outputs are all realised is done in normal
+                            -- mode.  That is how an unresolved goal with valid
+                            -- choices ends, after its inputs.
+                            realised <- resolvedBuildRealised store jobMode prepared
+                            if realised then pure Done
+                              else buildPhaseWith requested path prepared resolvedPath
                           CaSubstituteInputs -> do
                             -- C++ goonixRealiseInputsFirst clears wantedOutputs
                             -- before adding input waitees.  Do not restart a
@@ -264,7 +270,7 @@ buildThingsInternal config rootFd store settings trace hook things mode cancel =
                       else buildPhase requested
                   else do
                     writeIORef phase True
-                    buildDerivation attemptedDownloads (discover inputMode) graphRequested (topGoal path) config rootFd store settings trace hook jobMode requested path }
+                    buildDerivation attemptedDownloads (discover inputMode) graphRequested substitutionSettled (topGoal path) config rootFd store settings trace hook jobMode requested path }
           where
             buildPhaseWith requested original prepared resolvedPath = do
                     -- HS-12: one goal per derivation across the clients of this
@@ -350,8 +356,8 @@ buildThings :: Fd -> Store -> Settings -> [ByteString] -> BuildMode -> IO ()
 buildThings rootFd store settings things mode =
   buildThingsWithTrace rootFd store settings (BuildTrace (\_ _ _ _ -> pure ()) (\_ -> pure ()) (\_ _ -> pure ()) (\_ -> pure ())) things mode
 
-buildDerivation :: IORef (Set.Set ByteString) -> (ByteString -> Set.Set ByteString -> JobKind -> IO JobSpec) -> IORef Bool -> Bool -> Maybe ServerConfig -> Fd -> Store -> Settings -> BuildTrace -> Maybe HookPool -> BuildMode -> Set.Set ByteString -> ByteString -> IO (Outcome [Dependency])
-buildDerivation attemptedDownloads discover graphRequested topGoal config rootFd store settings trace hook mode wanted drvPath = do
+buildDerivation :: IORef (Set.Set ByteString) -> (ByteString -> Set.Set ByteString -> JobKind -> IO JobSpec) -> IORef Bool -> IORef Bool -> Bool -> Maybe ServerConfig -> Fd -> Store -> Settings -> BuildTrace -> Maybe HookPool -> BuildMode -> Set.Set ByteString -> ByteString -> IO (Outcome [Dependency])
+buildDerivation attemptedDownloads discover graphRequested substitutionSettled topGoal config rootFd store settings trace hook mode wanted drvPath = do
   appendTempRoot rootFd drvPath
   valid <- isValidPath store drvPath
   unless valid $ case config of
@@ -393,15 +399,24 @@ buildDerivation attemptedDownloads discover graphRequested topGoal config rootFd
         CaGraph -> do
           writeIORef graphRequested True
           pure (Need [(drvPath <> "\0graph", Set.empty, GraphJob)])
-        CaSubstituteOutputs -> pure (Need [(downloadJobId (C.pack path), Set.empty, DownloadJob)
-          | path <- Map.elems (decisionOutputs decision), not (null path)])
+        CaSubstituteOutputs -> do
+          -- C++ goonixSubstitutionRequested: the goal that asked for its
+          -- selected outputs is finished by them once they are valid; any
+          -- other unresolved goal goes on to its inputs.
+          writeIORef substitutionSettled True
+          pure (Need [(downloadJobId (C.pack path), Set.empty, DownloadJob)
+            | path <- Map.elems (decisionOutputs decision), not (null path)])
         CaSubstituteInputs
           | Map.null (inputDrvs drv) -> do
               resolved <- resolveDerivation (storeDirectory store) drvPath drv (realisedOutputPath store)
               prepared <- prepareResolvedBuild (traceOutput trace) rootFd store mode drvPath resolved
               resolvedPath <- writeResolvedDerivation rootFd store drvPath resolved
               appendTempRoot rootFd resolvedPath
-              buildDerivationPrepared Nothing config rootFd store settings trace hook mode wanted drvPath prepared resolvedPath
+              -- C++ prepareResolvedBuild: a resolved derivation whose
+              -- outputs are all realised is done in normal mode.
+              realised <- resolvedBuildRealised store mode prepared
+              unless realised $
+                buildDerivationPrepared Nothing config rootFd store settings trace hook mode wanted drvPath prepared resolvedPath
               pure Done
           | otherwise -> do
               -- C++ outputsSubstituted adds a substitution goal for every
@@ -501,6 +516,14 @@ buildDerivation attemptedDownloads discover graphRequested topGoal config rootFd
               sources <- sourceDependencies store drv
               pure (Need ([(input, selected, BuildJob) | (input, selected) <- Map.toList (inputDrvs drv)]
                 ++ [(downloadJobId source, Set.empty, DownloadJob) | source <- sources]))
+
+-- | C++ prepareResolvedBuild, allRealised: in normal mode a prepared resolved
+-- derivation whose every output is valid needs no build.  A check or a repair
+-- always runs.
+resolvedBuildRealised :: Store -> BuildMode -> Derivation -> IO Bool
+resolvedBuildRealised store mode prepared
+  | mode == Normal = allOutputsValid store prepared
+  | otherwise = pure False
 
 prepareLocalCaBuild :: (ByteString -> IO ()) -> Fd -> Store -> BuildMode -> ByteString -> Derivation -> IO Derivation
 prepareLocalCaBuild report rootFd store mode originalPath resolved = do
