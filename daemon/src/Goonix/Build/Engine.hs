@@ -154,13 +154,17 @@ buildThingsInternal config rootFd store settings trace hook things mode cancel =
           { jobId = path, jobWanted = wanted, jobKind = DownloadJob
           , jobRun = \_ _ -> do
               let actualPath = B.take (B.length path - B.length "\0download") path
+              -- SubstitutionGoal::init: a path that is valid already is done,
+              -- and no substituter is asked about it.  The sources of every
+              -- derivation a request walks come through here.
+              alreadyValid <- isValidPath store actualPath
               -- SubstitutionGoal::tryNext adds a goal for every missing
               -- reference before it starts the substituter.  The scheduler
               -- must model that dependency, rather than repeatedly retrying a
               -- download whose closure is not present.
               infos <- case config of
-                Just serverConfig -> substitutableInfos serverConfig settings (traceOutput trace) [actualPath]
-                Nothing -> pure []
+                Just serverConfig | not alreadyValid -> substitutableInfos serverConfig settings (traceOutput trace) [actualPath]
+                _ -> pure []
               case infos of
                 ((_, _, references, _, _):_) -> do
                   present <- mapM (isValidPath store) references
