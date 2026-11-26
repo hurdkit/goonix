@@ -20,6 +20,7 @@
   #:use-module (guix ca adopt)
   #:use-module (guix packages)
   #:use-module (guix build-system)
+  #:use-module (guix build-system trivial)
   #:use-module (guix derivations)
   #:use-module (ice-9 match)
   #:use-module (srfi srfi-1)
@@ -254,6 +255,88 @@
       (test-equal "a bootstrap dependent remains input-addressed"
         'input
         (gexp-addressing 'input (derivation-input adopted) '() #f #f #f)))))
+
+(test-group "a flagged item is rebuilt from source alone, its inputs keep 'adopted"
+  ;; No builds.  adopt-derivation is replaced: the flagged item comes back
+  ;; unchanged, which selects the policy's from-source fallback, and every
+  ;; other item gets a stub derivation standing for its adopted form.  The
+  ;; item has a commencement input (bootar), an opaque one (file) and an
+  ;; ordinary upstream one (hello).  The fallback must make the item itself
+  ;; content-addressed and lower its inputs as any 'adopted dependent does.
+  (let* ((bootar (module-ref (resolve-module '(gnu packages commencement))
+                             'bootar))
+         (flagged
+          (package
+            (name "ca-opaque-flagged-dependent")
+            (version "1")
+            (source #f)
+            (build-system trivial-build-system)
+            (arguments
+             (list #:guile %bootstrap-guile
+                   #:builder #~(call-with-output-file #$output
+                                 (lambda (p) (display "FLAGGED" p)))))
+            (inputs (list bootar file hello))
+            (synopsis "flagged fallback fixture")
+            (description "flagged fallback fixture")
+            (home-page #f)
+            (license #f)))
+         (input-drv (lambda (package)
+                      (parameterize ((%package-addressing-policy 'input))
+                        (package-derivation store package #:graft? #f))))
+         (stubs (make-hash-table))
+         (stub (lambda (drv)
+                 (let ((key (derivation-file-name drv)))
+                   (or (hash-ref stubs key)
+                       (let ((s (derivation store
+                                            (string-append
+                                             "adopted-stub-"
+                                             (derivation-name drv))
+                                            "/bin/sh" '("-c" "exit 1"))))
+                         (hash-set! stubs key s)
+                         s)))))
+         (adopt-module (resolve-module '(guix ca adopt)))
+         (real-adopt (module-ref adopt-module 'adopt-derivation))
+         (top
+          (dynamic-wind
+            (lambda ()
+              (module-set! adopt-module 'adopt-derivation
+                           (lambda (store drv . rest)
+                             (if (string=? (derivation-name drv)
+                                           "ca-opaque-flagged-dependent-1")
+                                 drv
+                                 (stub drv)))))
+            (lambda ()
+              (parameterize ((%package-addressing-policy 'adopted)
+                             (%upstream-package?
+                              (lambda (package)
+                                (or (eq? package flagged)
+                                    (upstream-package? package)))))
+                (package-derivation store flagged #:graft? #f)))
+            (lambda ()
+              (module-set! adopt-module 'adopt-derivation real-adopt))))
+         (input-named
+          ;; The .drv file name of TOP's input for PACKAGE, or of its stub.
+          (lambda (package)
+            (let ((name (string-append (package-name package) "-"
+                                       (package-version package))))
+              (any (lambda (input)
+                     (let ((drv (derivation-input-derivation input)))
+                       (and (member (derivation-name drv)
+                                    (list name
+                                          (string-append "adopted-stub-" name)))
+                            (derivation-file-name drv))))
+                   (derivation-inputs top))))))
+    (test-equal "the flagged item itself is content-addressed"
+      "content" (addressing top))
+    (test-equal "its commencement input keeps its input-policy .drv"
+      (derivation-file-name (input-drv bootar))
+      (input-named bootar))
+    (test-equal "its opaque input keeps its input-policy .drv"
+      (derivation-file-name (input-drv file))
+      (input-named file))
+    (test-assert "its ordinary input is adopted, not rebuilt from source"
+      (let ((name (input-named hello)))
+        (and name (string-contains name "-adopted-stub-hello-"))))))
 
 (test-group "the adopted hello package closure respects opaque inputs"
   ;; This is a package-graph invariant, not a count of changed objects and
