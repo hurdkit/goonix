@@ -35,6 +35,11 @@
 #     waited for the helper with its input open, so only a garbage collection
 #     ended the wait: FAILS pre-fix (the request does not return), PASSES after.
 #     Compiles the daemon sources.
+#   - gate-file-slot.sh: after a rebuild, a CXX run of daemon/test/gate-file.sh
+#     followed by an HS run must test the Haskell daemon just built.  The CXX
+#     run put the Haskell daemon back from a slot only HS runs filled: FAILS
+#     pre-fix (the old daemon comes back), PASSES after.  Scratch tree, marked
+#     text files for daemons; nothing is built or started.
 # Fails if ANY of them fails, naming the failing test.
 #
 # export-memory.sh is deliberately NOT here: it needs a running daemon and a
@@ -60,6 +65,7 @@ run() { # name script...
 run cabal-modules bash "$here/cabal-modules.sh" "$root"
 run dedup-overflow bash "$here/dedup-overflow.sh" "$root/daemon/cbits/files.c"
 run delete-hardlink bash "$here/delete-hardlink.sh" "$root"
+run gate-file-slot bash "$here/gate-file-slot.sh" "$root"
 # These probes compile daemon modules that import the generated Goonix.Config.
 # A --disable-haskell-daemon tree deliberately has no rule for that module.
 if test -f "$root/daemon/src/Goonix/Config.hs"; then

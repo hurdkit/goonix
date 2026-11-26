@@ -12,6 +12,13 @@
 #     a run produced none (e.g. the seed died outside the dev shell), and an old
 #     file then read as a pass.
 # Each is now refused loudly instead.
+#
+# A fourth: a CXX run copies the C++ daemon over ./guix-daemon and puts the
+# Haskell daemon back from its slot on exit, but the slot was only ever filled
+# by an HS run.  After a rebuild, a CXX run that came first therefore replaced
+# the Haskell daemon just built with the slot's older one, under a new mtime,
+# and the HS run that followed tested that one without complaint.  A CXX run
+# now saves the tree's Haskell daemon to the slot before it replaces it.
 set -euo pipefail
 root=$(CDPATH= cd -- "$(dirname "$0")/../.." && pwd)
 cd "$root"
@@ -103,6 +110,15 @@ restore() {
 }
 trap restore EXIT
 if test "$mode" = CXX; then
+  # What restore() puts back must be the tree's CURRENT Haskell daemon.  Save
+  # it only when ./guix-daemon is one: a tree configured for C++ alone, or an
+  # earlier CXX run that was killed before its restore, leaves a C++ daemon
+  # here, and that must not enter the Haskell slot.
+  if test -x "$root/guix-daemon" \
+      && test "$(has_symbol "$root/guix-daemon" 'GoonixziStore')" -ne 0 \
+      && test "$(has_symbol "$root/guix-daemon" '_ZN3nix')" -eq 0; then
+    cp "$root/guix-daemon" "$root/.scratch/guix-daemon-haskell"
+  fi
   cp "$root/.scratch/hs0-cxx-daemon" "$root/guix-daemon"
 else
   cp "$root/.scratch/guix-daemon-haskell" "$root/guix-daemon"
