@@ -35,7 +35,7 @@ nix/libstore/worker-protocol.hh 6 2
 nix/libutil/util.cc 18 1
 nix/libutil/util.hh 2 1
 nix/local.mk 39 0
-nix/nix-daemon/nix-daemon.cc 49 0
+nix/nix-daemon/nix-daemon.cc 7 0
 tests/channels.scm 9 1
 tests/import/egg.scm 6 0
 tests/import/opam.scm 4 0

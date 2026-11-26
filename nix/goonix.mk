@@ -1,5 +1,8 @@
 # goonix: optional unprivileged compressed-output scanner.
 if BUILD_DAEMON
+# The worker operations that upstream's daemon does not have.
+guix_daemon_SOURCES += %D%/nix-daemon/goonix-operations.inc
+
 if HAVE_LIBARCHIVE
 libexec_PROGRAMS = goonix-ca-scan
 goonix_ca_scan_SOURCES = %D%/goonix-ca-scan.cc
