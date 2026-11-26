@@ -52,8 +52,11 @@ for i in $(seq 1 100); do
   if timeout 1 bash -c "</dev/tcp/127.0.0.1/$port" 2>/dev/null; then break; fi
   sleep .1
 done
-kill "$server_pid"; wait "$server_pid" 2>/dev/null || true
-server_pid=
+# The serving daemon accepts no more clients.  The cache keeps its connection
+# and is served on it: by a session process that outlives the C++ daemon, or
+# by the Haskell daemon, which stays until its last client is done.  So the
+# daemon's PID is not waited for here; it ends with the cache, in cleanup.
+kill "$server_pid"
 export GUIX_CONFIGURATION_DIRECTORY=$client/etc GUIX_DATABASE_DIRECTORY=$client/db
 export GUIX_STATE_DIRECTORY=$client/state GUIX_DAEMON_SOCKET=$client/socket
 export GUIX_LOG_DIRECTORY=$client/log GOONIX_TAMPER_URL=http://127.0.0.1:$port
