@@ -12,6 +12,7 @@ module Goonix.Build.Engine
   , buildThingsWithCancel
   , ensureStorePath
   , BuildTrace (..)
+  , Held (..)
   ) where
 
 import Goonix.Build.CaDecision
@@ -95,7 +96,24 @@ data BuildTrace = BuildTrace
   , traceSucceeded :: ByteString -> IO ()
   , traceFailed :: ByteString -> String -> IO ()
   , traceOutput :: ByteString -> IO ()
+  , traceHolding :: forall a. Held -> IO a -> IO a
+  -- ^ Run an action while the client's session is on record as holding
+  -- something for it.  The C++ daemon needs no such record: each of its
+  -- sessions is a process, whose open lock files and child processes anyone
+  -- can read in /proc, and that is where `guix processes' reads them.  The
+  -- sessions of one process cannot be told apart there.
   }
+
+-- | What a session holds while the engine works for it: the lock file of an
+-- output it builds or substitutes, from before it waits for the lock until
+-- it has let go of it, as the file is open in a C++ session process all that
+-- time; or a builder, or the offload hook that builds in its place, by PID.
+data Held = HeldLock ByteString | HeldChild Int
+  deriving (Eq, Ord, Show)
+
+-- | A trace for work that no client's session answers for.
+holdingNothing :: Held -> IO a -> IO a
+holdingNothing _ action = action
 
 buildThingsWithTrace :: Fd -> Store -> Settings -> BuildTrace -> [ByteString] -> BuildMode -> IO ()
 buildThingsWithTrace rootFd store settings trace things mode =
@@ -354,7 +372,7 @@ ensureStorePath config rootFd store settings trace path = do
 
 buildThings :: Fd -> Store -> Settings -> [ByteString] -> BuildMode -> IO ()
 buildThings rootFd store settings things mode =
-  buildThingsWithTrace rootFd store settings (BuildTrace (\_ _ _ _ -> pure ()) (\_ -> pure ()) (\_ _ -> pure ()) (\_ -> pure ())) things mode
+  buildThingsWithTrace rootFd store settings (BuildTrace (\_ _ _ _ -> pure ()) (\_ -> pure ()) (\_ _ -> pure ()) (\_ -> pure ()) holdingNothing) things mode
 
 buildDerivation :: IORef (Set.Set ByteString) -> (ByteString -> Set.Set ByteString -> JobKind -> IO JobSpec) -> IORef Bool -> IORef Bool -> Bool -> Maybe ServerConfig -> Fd -> Store -> Settings -> BuildTrace -> Maybe HookPool -> BuildMode -> Set.Set ByteString -> ByteString -> IO (Outcome [Dependency])
 buildDerivation attemptedDownloads discover graphRequested substitutionSettled topGoal config rootFd store settings trace hook mode wanted drvPath = do
@@ -666,6 +684,8 @@ tolerantTrace trace = BuildTrace
   , traceSucceeded = \drv -> swallow (traceSucceeded trace drv)
   , traceFailed = \drv reason -> swallow (traceFailed trace drv reason)
   , traceOutput = \bytes -> swallow (traceOutput trace bytes)
+  -- What the goal holds stays on the record of the session that started it.
+  , traceHolding = traceHolding trace
   }
   where
     swallow action = action `catch` (\(_ :: SomeException) -> pure ())
@@ -677,7 +697,8 @@ buildWithHook userPool rootFd store settings trace pool mode originalPath drvPat
         when (mode == Normal) $ replicateM_ (max 0 (settingInt "build-repeat" 0 settings)) $
           runBuilder userPool rootFd store settings trace Check originalPath drvPath drv
       withOutputLocks action =
-        foldr (\path inner -> withPathLock path inner) action (map outputPath (Map.elems (outputs drv)))
+        foldr (\path inner -> traceHolding trace (HeldLock (path <> ".lock")) (withPathLock path inner))
+          action (map outputPath (Map.elems (outputs drv)))
       tryBuild Nothing = withOutputLocks $ do
         ready <- allOutputsValid store drv
         if ready && mode == Normal then pure () else localBuild
@@ -696,7 +717,7 @@ buildWithHook userPool rootFd store settings trace pool mode originalPath drvPat
                 -- must never be offered to another derivation.
                 writeIORef (fst currentPool) Nothing
                 finally
-                  (do
+                  (traceHolding trace (HeldChild (fromIntegral (hookPid hook))) $ do
                     inputRoots <- Set.toList <$> derivationInputs store drvPath drv
                     inputs <- Set.toList . Set.fromList . concat <$> mapM (referenceClosure store) (drvPath:inputRoots)
                     let outputPaths = map outputPath (Map.elems (outputs drv))
@@ -851,7 +872,8 @@ trySubstitute config rootFd store settings trace path = do
           then do
             traceOutput trace ("@ substituter-failed " <> path <> " incomplete-closure\n")
             pure False
-          else withPathLock path $ substituteNow deriver references
+          else traceHolding trace (HeldLock (path <> ".lock")) $
+            withPathLock path $ substituteNow deriver references
         where
         substituteNow deriver references = do
           validNow <- isValidPath store path
@@ -980,8 +1002,8 @@ runBuilderWithUser buildUser rootFd store settings trace mode originalPath drvPa
   lastOutput <- getPOSIXTime >>= newIORef
   drained <- newEmptyMVar
   _ <- forkIO $ copyLog childPid (settingBool "multiplexed-build-output" False settings) readHandle logHandle trace lastOutput `finally` putMVar drained ()
-  (status, timeoutReason) <- waitForBuilder settings childPid wait lastOutput
-    `onException` killBuilder childPid
+  (status, timeoutReason) <- traceHolding trace (HeldChild childPid)
+    (waitForBuilder settings childPid wait lastOutput `onException` killBuilder childPid)
   takeMVar drained `onException` hClose readHandle
   hClose readHandle
   closeLog logHandle

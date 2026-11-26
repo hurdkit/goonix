@@ -17,7 +17,7 @@ preparation. The C++ daemon instead isolates each client in its own process.
 Haskell thread rather than by the `SIGPOLL` flag (inventory 1.3).
 
 `SIGTERM`, `SIGINT` and `SIGHUP` ask the daemon to stop; they do not end it at
-once (inventory 1.1 and 1.3). The C++ daemon leaves all three at their default
+once (inventory 1.3 and 9.25). The C++ daemon leaves all three at their default
 action in its listening process: the signal ends that process, nobody new is
 accepted, and each connected client keeps its own process, which runs in a
 session of its own and serves it to the end. One process cannot both end and
@@ -37,7 +37,7 @@ socket file is left in place, as it is there. What differs:
   operations together with the daemon. A signal for the C++ listening
   process, or for its process group, does not reach the clients' processes.
 - While it waits, the daemon has said so once on its standard error, with the
-  number of clients it waits for. With no client connected it says nothing.
+  PIDs of the clients it waits for. With no client connected it says nothing.
 - A further `SIGTERM`, `SIGINT` or `SIGHUP` changes nothing while it waits.
   There is no per-client process to signal either: the C++ daemon ends one
   client's session, with "interrupted by the user", when that session's
@@ -48,6 +48,53 @@ socket file is left in place, as it is there. What differs:
 with a build in flight and a second, idle connection; the signal; no new
 connection; the build's result; the daemon gone afterwards, by the signal. For
 this daemon it also checks that the process is still there while a client is.
+
+`guix processes` reads the sessions of the C++ daemon in `/proc`: a process per
+session, with the client's PID as its second argument, the lock files of its
+builds among its open files and its builders among its children. The sessions
+of this daemon are threads of one process and show none of that. The daemon
+keeps those facts itself and gives them to a client that asks, with operation
+85 of the worker protocol, `wopQuerySessions`, which the C++ daemon does not
+have (inventory 1.6 and 9.25). The operation takes no argument and returns
+one list of strings: the version of the layout; the daemon's PID; then, for
+each session other than the asking one, its number, the PID of its client,
+the number of its lock files followed by their names, and the number of its
+child processes followed by their PIDs. `(guix daemon-sessions)` makes of
+that the sessions `guix processes` prints, beside the ones it finds in
+`/proc`. A daemon that refuses the operation, as the C++ daemon and
+upstream's do, adds none; the C++ daemon then ends the connection that asked,
+with a line on its standard error, and its other connections are not
+affected. What `guix processes` shows differs from what it shows for the C++
+daemon:
+
+- `SessionPID` is the daemon's PID for every session: there is no other
+  process. The sessions are told apart by their numbers, which `guix
+  processes` does not print. In its normalized format the `Session` records
+  of one daemon therefore share the `PID` that the format declares as their
+  key.
+- `LockHeld` lists the lock files of the outputs the session itself builds or
+  substitutes, from before it waits for a lock until it has let go of it. A
+  session that waits for a build which another session started waits inside
+  the process (see the shared scheduler below) and holds no lock file. The
+  C++ session that waits has the lock file open and is listed with it.
+- `ChildPID` lists the session's builders and the offload hooks that build in
+  their place. The helpers that a C++ session process keeps as children,
+  `guix substitute` and `guix authenticate`, are children of the whole
+  daemon here and are listed under no session.
+- A build that goes on after the session that started it has left, because
+  another session waits for it, is on no session's record.
+- Lock files are given to a trusted client only: root and the user the daemon
+  runs as. Those are the users to whom `/proc` shows the open files of the
+  C++ session processes. A remote client is refused the operation: the PIDs
+  mean nothing on its host.
+- A daemon that has been told to stop accepts no connection and can no longer
+  be asked. It has written the PIDs of the clients it waits for to its
+  standard error.
+
+`daemon/test/differential/sessions.sh` runs against either daemon, with a
+client that builds on one connection, keeps a second idle and asks on a
+third: for this daemon the sessions it reports, for the C++ daemon the
+refusal, and for both that the other connections are served.
 
 Because it is one process, the daemon also creates the store and state
 directories once at start-up (`initialiseState`) rather than per client as the

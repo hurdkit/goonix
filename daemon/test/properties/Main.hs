@@ -67,7 +67,7 @@ checkWire = do
       Left err -> throwIO (userError (show err))
       Right decoded -> decoded @?= ["", bytes, C.replicate 17 'x']
   forM_ operations $ \operation -> operationByCode (operationCode operation) @?= Just operation
-  map operationCode operations @?= [1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 16, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 80, 81]
+  map operationCode operations @?= [1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 16, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 80, 81, 82, 83, 84, 85]
   forM_ [0 .. 255] $ \n -> decodeInt (encodeInt n) @?= Right n
   forM_ [0, 1, 255, 256, 65535, 65536, maxBound :: Word64] $ \n ->
     decodeWord64 (encodeWord64 n) @?= Right n

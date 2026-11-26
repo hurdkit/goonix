@@ -11,7 +11,7 @@ module Goonix.Store.Server
   , Lifecycle
   , newLifecycle
   , requestStop
-  , openConnections
+  , connectedClients
   , handleConnection
   , ServerConfig (..)
   , defaultConfig
@@ -20,15 +20,15 @@ module Goonix.Store.Server
   ) where
 
 import Control.Concurrent (forkFinally)
-import Control.Concurrent.MVar (MVar, newMVar, modifyMVar)
 import Control.Concurrent.STM (TVar, atomically, check, modifyTVar', newTVarIO, readTVar, readTVarIO, writeTVar)
-import Control.Exception (IOException, SomeException, bracket, catch, finally, fromException, throwIO, try)
+import Control.Exception (IOException, SomeException, bracket, bracket_, catch, finally, fromException, throwIO, try)
 import Control.Monad (unless, when)
 import Data.Bits ((.&.))
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as C
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
+import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import Data.Word (Word32, Word64)
 import Goonix.Store.GuixProgram (absPath)
@@ -40,7 +40,7 @@ import Goonix.Store.Settings
 import Goonix.Store.Socket
 import Goonix.Store.Substitute (substitutablePaths, substitutableInfos, substitutePath)
 import Goonix.Store.Archive (exportPathTo, importPathsFrom)
-import Goonix.Build.Engine (BuildMode (..), BuildTrace (..), buildThings, buildThingsWithConfig, buildThingsWithCancel, ensureStorePath)
+import Goonix.Build.Engine (BuildMode (..), BuildTrace (..), Held (..), buildThings, buildThingsWithConfig, buildThingsWithCancel, ensureStorePath)
 import Goonix.Build.Users (loadUserPool)
 import Goonix.Build.Shared (goalWorkers, newShared)
 import Goonix.Store.Hash (algorithmFromName, hashDigest, Hash (..), HashAlgorithm (..))
@@ -74,11 +74,36 @@ import System.IO (hPutStrLn, stderr)
 -- it has until each has disconnected, and only then ends.
 data Lifecycle = Lifecycle
   { lifecycleStopping :: !(TVar Bool)
-  , lifecycleConnections :: !(TVar Int)
+  , lifecycleSessions :: !(TVar (Map.Map Integer Session))
+  -- ^ The connected clients, by session number.
+  , lifecycleNextSession :: !(TVar Integer)
+  }
+
+-- | One connected client.
+--
+-- The C++ daemon has a process per session.  `guix processes' finds those
+-- processes in /proc: the client's PID is the second argument of each, the
+-- lock files of its builds are among its open files, its builders among its
+-- children.  The sessions of this daemon are threads of one process, with
+-- one PID, one table of open files and one set of children, so the daemon
+-- keeps the same facts itself and gives them to a client that asks
+-- (operation 85, 'sessionReport').
+data Session = Session
+  { sessionNumber :: !Integer
+  -- ^ Tells the sessions of this process apart; never used twice.  The
+  -- session's file of temporary roots is named after it.
+  , sessionClient :: !Int
+  -- ^ The PID of the client, from the socket's peer credentials; 0 when
+  -- the socket has none (TCP).
+  , sessionHeld :: !(TVar (Map.Map Held Int))
+  -- ^ What the engine holds for this session now, each with the number of
+  -- times it is held.
+  , sessionOthers :: !(TVar (Map.Map Integer Session))
+  -- ^ The table this session is in.
   }
 
 newLifecycle :: IO Lifecycle
-newLifecycle = Lifecycle <$> newTVarIO False <*> newTVarIO 0
+newLifecycle = Lifecycle <$> newTVarIO False <*> newTVarIO Map.empty <*> newTVarIO 1
 
 -- | Ask the daemon to stop.  Returns whether this call was the first to ask.
 requestStop :: Lifecycle -> IO Bool
@@ -87,9 +112,60 @@ requestStop lifecycle = atomically $ do
   writeTVar (lifecycleStopping lifecycle) True
   pure (not stopping)
 
--- | The number of clients connected now.
-openConnections :: Lifecycle -> IO Int
-openConnections lifecycle = readTVarIO (lifecycleConnections lifecycle)
+-- | The PIDs of the clients connected now, one per session.
+connectedClients :: Lifecycle -> IO [Int]
+connectedClients lifecycle = map sessionClient . Map.elems <$> readTVarIO (lifecycleSessions lifecycle)
+
+-- | Enter a client that has just been accepted into the table.
+openSession :: Lifecycle -> Socket -> IO Session
+openSession lifecycle client = do
+  pid <- maybe 0 fromIntegral <$> peerPid client
+  held <- newTVarIO Map.empty
+  atomically $ do
+    number <- readTVar (lifecycleNextSession lifecycle)
+    writeTVar (lifecycleNextSession lifecycle) (number + 1)
+    let session = Session number pid held (lifecycleSessions lifecycle)
+    modifyTVar' (lifecycleSessions lifecycle) (Map.insert number session)
+    pure session
+
+closeSession :: Session -> IO ()
+closeSession session = atomically $
+  modifyTVar' (sessionOthers session) (Map.delete (sessionNumber session))
+
+-- | Run an action with something on the session's record.
+holding :: Session -> Held -> IO a -> IO a
+holding session held = bracket_ (count 1) (count (-1))
+  where
+    count change = atomically $ modifyTVar' (sessionHeld session) $ Map.alter
+      (\current -> case maybe 0 id current + change of
+        0 -> Nothing
+        times -> Just (times :: Int)) held
+
+-- | The answer to operation 85: what `guix processes' prints of this
+-- daemon's sessions, as a list of strings.  First the version of this
+-- layout and the PID of the daemon.  Then, for each session other than the
+-- asking one, in the order of their numbers: the session's number, the PID
+-- of its client, the number of its lock files followed by their names, and
+-- the number of its child processes followed by their PIDs.  Numbers are in
+-- decimal.
+--
+-- The lock files go to a trusted client only.  `guix processes' reads them
+-- from the open files of the C++ session processes, which /proc shows to
+-- root and to the user the daemon runs as: the same clients.
+sessionReport :: Session -> Bool -> IO [ByteString]
+sessionReport asking withLocks = do
+  pid <- getProcessID
+  sessions <- atomically $ do
+    others <- Map.elems . Map.delete (sessionNumber asking) <$> readTVar (sessionOthers asking)
+    mapM (\session -> (,) session . Map.keys <$> readTVar (sessionHeld session)) others
+  pure ("1" : number pid : concatMap row sessions)
+  where
+    number value = C.pack (show (toInteger value))
+    row (session, held) =
+      let locks = if withLocks then [path | HeldLock path <- held] else []
+          children = [child | HeldChild child <- held]
+      in [number (sessionNumber session), number (sessionClient session), number (length locks)]
+           ++ locks ++ (number (length children) : map number children)
 
 serve :: ServerConfig -> Lifecycle -> IO ()
 serve config lifecycle =
@@ -117,28 +193,26 @@ serveListener config lifecycle listener = do
   -- request, but the shared limit bounds the whole process.
   shared <- newShared (settingInt "build-max-jobs" 1 (configDefaultSettings config))
   let sharedConfig = config { configBuildUsers = users, configSharedScheduler = Just shared }
-  counter <- newMVar (0 :: Integer)
-  let connections = lifecycleConnections lifecycle
-      stopping = readTVar (lifecycleStopping lifecycle) >>= check
+  let stopping = readTVar (lifecycleStopping lifecycle) >>= check
       accept = do
         next <- acceptSocketUnless stopping listener
         case next of
           Nothing -> pure ()
           Just client -> do
-            -- Counted here, not in the client's thread: once this loop has
-            -- returned, no client is still on its way into the count.
-            atomically (modifyTVar' connections (+ 1))
-            _ <- forkFinally (handleClient sharedConfig counter client)
-              (const (closeSocket client `finally` atomically (modifyTVar' connections (subtract 1))))
+            -- Entered here, not in the client's thread: once this loop has
+            -- returned, no client is still on its way into the table.
+            session <- openSession lifecycle client
+            _ <- forkFinally (handleClient sharedConfig session client)
+              (const (closeSocket client `finally` closeSession session))
             accept
   accept
   -- Later clients are refused, as they are once the C++ listening process is
   -- gone.  The socket file stays, as it does there.
   closeSocket listener
   atomically $ do
-    clients <- readTVar connections
+    sessions <- readTVar (lifecycleSessions lifecycle)
     workers <- goalWorkers shared
-    check (clients == 0 && workers == 0)
+    check (Map.null sessions && workers == 0)
 
 initialiseState :: ServerConfig -> IO ()
 initialiseState config = do
@@ -189,8 +263,8 @@ breakLastColon path = case B.break (== 58) (B.reverse path) of
   (reversedPort, rest) | not (B.null rest) -> Just (B.reverse (B.drop 1 rest), B.reverse reversedPort)
   _ -> Nothing
 
-handleClient :: ServerConfig -> MVar Integer -> Socket -> IO ()
-handleClient config counter client = do
+handleClient :: ServerConfig -> Session -> Socket -> IO ()
+handleClient config session client = do
   isTcpClient <- isTcp client
   credential <- peerUid client
   uid <- getRealUserID
@@ -199,15 +273,13 @@ handleClient config counter client = do
   settingsRef <- newIORef settings
   pid <- getProcessID
   credentialId <- pure (maybe 0 id credential)
-  rootName <- modifyMVar counter $ \value -> do
-    let next = value + 1
-    pure (next, C.pack (show pid <> "-" <> show next))
+  let rootName = C.pack (show pid <> "-" <> show (sessionNumber session))
   catch
     (withTempRootFile (temporaryRootsPath config <> "/" <> rootName) (storeGcLockPath config) $ \rootFd ->
       bracket (openStore (configStore config) (configDatabase config) (configStateDirectory config)) closeStore $ \store -> do
         -- goonix: the records tables are created if absent (HS-11).
         initCaRecords store
-        catch (handleConnection config store client settingsRef rootFd (temporaryRootsPath config <> "/" <> rootName)) report)
+        catch (handleConnection config session store client settingsRef rootFd (temporaryRootsPath config <> "/" <> rootName)) report)
     report
   where
     report exception = hPutStrLn stderr ("guix-daemon: " ++ show (exception :: SomeException))
@@ -221,8 +293,8 @@ temporaryRootsPath config = configStateDirectory config <> "/temproots"
 storeGcLockPath :: ServerConfig -> ByteString
 storeGcLockPath config = configStateDirectory config <> "/gc.lock"
 
-handleConnection :: ServerConfig -> Store -> Socket -> IORef Settings -> Fd -> ByteString -> IO ()
-handleConnection config store client settingsRef rootFd rootPath = do
+handleConnection :: ServerConfig -> Session -> Store -> Socket -> IORef Settings -> Fd -> ByteString -> IO ()
+handleConnection config session store client settingsRef rootFd rootPath = do
   magic <- readIntSocket client
   unless (magic == workerMagic1) (throwIO (userError "protocol mismatch"))
   writeSocket client (encodeInt workerMagic2 <> encodeInt protocolVersion)
@@ -242,7 +314,7 @@ handleConnection config store client settingsRef rootFd rootPath = do
       case next of
         Left (_ :: IOError) -> pure ()
         Right operation -> do
-          result <- try (dispatch config store client settingsRef rootFd rootPath clientVersion operation)
+          result <- try (dispatch config session store client settingsRef rootFd rootPath clientVersion operation)
           case result of
             Left exception -> do
               reportOperation (show operation) exception
@@ -255,8 +327,8 @@ handleConnection config store client settingsRef rootFd rootPath = do
               loop clientVersion
             Right () -> loop clientVersion
 
-dispatch :: ServerConfig -> Store -> Socket -> IORef Settings -> Fd -> ByteString -> Word32 -> Word32 -> IO ()
-dispatch config store client settingsRef rootFd rootPath clientVersion operation = case operation of
+dispatch :: ServerConfig -> Session -> Store -> Socket -> IORef Settings -> Fd -> ByteString -> Word32 -> Word32 -> IO ()
+dispatch config session store client settingsRef rootFd rootPath clientVersion operation = case operation of
   19 -> do
     settings <- readIORef settingsRef
     fields <- readSetOptions client clientVersion
@@ -286,13 +358,13 @@ dispatch config store client settingsRef rootFd rootPath clientVersion operation
     mode <- if clientVersion .&. 0xff >= 15 then readIntSocket client else pure 0
     settings <- readIORef settingsRef
     when (mode == 1 && not (trusted settings)) (throwIO (storeError "repairing is a privileged operation"))
-    buildThingsWithCancel config rootFd store settings (buildTrace settings client) things (if mode == 1 then Repair else if mode == 2 then Check else Normal) (waitForDisconnect client)
+    buildThingsWithCancel config rootFd store settings (buildTrace settings session client) things (if mode == 1 then Repair else if mode == 2 then Check else Normal) (waitForDisconnect client)
     writeFrame client stderrLast
     writeSocket client (encodeInt 1)
   10 -> do
     path <- readStorePath store client
     settings <- readIORef settingsRef
-    ensureStorePath config rootFd store settings (buildTrace settings client) path
+    ensureStorePath config rootFd store settings (buildTrace settings session client) path
     writeFrame client stderrLast
     writeSocket client (encodeInt 1)
   8 -> do
@@ -442,7 +514,7 @@ dispatch config store client settingsRef rootFd rootPath clientVersion operation
     settings <- readIORef settingsRef
     when (repair && not (trusted settings)) (throwIO (storeError "you are not privileged to repair paths"))
     paths <- queryAllValidPaths store
-    errors <- Collector.verifyStorePaths checkContents repair (repairStorePath config rootFd store settings (stderrEmit client)) store paths
+    errors <- Collector.verifyStorePaths checkContents repair (repairStorePath config session rootFd store settings (stderrEmit client)) store paths
     writeFrame client stderrLast
     writeSocket client (encodeBool errors)
   80 -> do
@@ -472,6 +544,15 @@ dispatch config store client settingsRef rootFd rootPath clientVersion operation
     (records, hints) <- queryGoonixBuildGraphWithLog store (stderrEmit client) drvPath
     writeFrame client stderrLast
     writeSocket client (encodeStrings (goonixRecordFields records True) <> encodeStrings hints)
+  -- goonix: this daemon's sessions, for `guix processes' (DIFFERENCES.md).
+  -- The C++ daemon does not know the operation.  The PIDs mean nothing on
+  -- another host, so a remote client gets the answer the C++ daemon gives.
+  85 -> do
+    settings <- readIORef settingsRef
+    when (remote settings) (throwIO (StoreError "invalid operation 85" 1))
+    report <- sessionReport session (trusted settings)
+    writeFrame client stderrLast
+    writeSocket client (encodeStrings report)
   _ -> throwIO (StoreError (C.pack ("invalid operation " ++ show operation)) 1)
   where
     readDerivationFile path = do
@@ -489,8 +570,8 @@ dispatch config store client settingsRef rootFd rootPath clientVersion operation
       writeFrame client stderrLast
       writeSocket client reply
 
-buildTrace :: Settings -> Socket -> BuildTrace
-buildTrace settings client = BuildTrace
+buildTrace :: Settings -> Session -> Socket -> BuildTrace
+buildTrace settings session client = BuildTrace
   { traceStarted = \drv platform log pid -> emit ("@ build-started " <> drv <> " - " <> platform <> " " <> log <> " " <> C.pack (show pid))
   , traceSucceeded = \drv -> emit ("@ build-succeeded " <> drv <> " -")
   , traceFailed = \drv reason -> emit ("@ build-failed " <> drv <> " - " <> C.pack reason)
@@ -502,6 +583,7 @@ buildTrace settings client = BuildTrace
       -- then fails on a missing build id.
       when (verbosity settings >= buildVerbosity settings) $
         writeSocket client (encodeInt stderrNext <> encodeString bytes)
+  , traceHolding = holding session
   }
   where
     -- C++ printMsg_ appends "\n" to every trace message (util.cc), so each
@@ -525,8 +607,8 @@ stderrEmit client bytes = writeSocket client (encodeInt stderrNext <> encodeStri
     -- after its HTTP response has been handled.
     line = if B.null bytes || B.last bytes == 10 then bytes else bytes <> "\n"
 
-repairStorePath :: ServerConfig -> Fd -> Store -> Settings -> (ByteString -> IO ()) -> ByteString -> IO Bool
-repairStorePath config rootFd store settings emit path = do
+repairStorePath :: ServerConfig -> Session -> Fd -> Store -> Settings -> (ByteString -> IO ()) -> ByteString -> IO Bool
+repairStorePath config session rootFd store settings emit path = do
   substituted <- trySubstituteForRepair config rootFd store settings emit path
   if substituted then pure True else do
     deriver <- queryDeriver store path
@@ -534,7 +616,7 @@ repairStorePath config rootFd store settings emit path = do
     if valid
       then do
         -- registerPath updates the existing valid entry after repair.
-        buildThingsWithConfig config rootFd store settings (BuildTrace (\_ _ _ _ -> pure ()) (\_ -> pure ()) (\_ _ -> pure ()) emit) [deriver] Repair
+        buildThingsWithConfig config rootFd store settings (BuildTrace (\_ _ _ _ -> pure ()) (\_ -> pure ()) (\_ _ -> pure ()) emit (holding session)) [deriver] Repair
         exists <- (Files.getSymbolicLinkStatus path >> pure True) `catchMissing` pure False
         registered <- isValidPath store path
         pure (exists && registered)

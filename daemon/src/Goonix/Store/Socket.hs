@@ -15,6 +15,7 @@ module Goonix.Store.Socket
   , readSocket
   , writeSocket
   , peerUid
+  , peerPid
   , isTcp
   , isListening
   , waitForDisconnect
@@ -50,6 +51,7 @@ foreign import ccall safe "goonix_listen_tcp" c_listen_tcp :: CString -> CString
 foreign import ccall safe "goonix_accept" c_accept :: CInt -> IO CInt
 foreign import ccall unsafe "goonix_accept_ready" c_accept_ready :: CInt -> IO CInt
 foreign import ccall unsafe "goonix_peer_uid" c_peer_uid :: CInt -> Ptr CUInt -> IO CInt
+foreign import ccall unsafe "goonix_peer_pid" c_peer_pid :: CInt -> Ptr CInt -> IO CInt
 foreign import ccall unsafe "goonix_is_tcp" c_is_tcp :: CInt -> IO CInt
 foreign import ccall unsafe "goonix_is_listening" c_is_listening :: CInt -> IO CInt
 foreign import ccall unsafe "goonix_peek_socket" c_peek_socket :: CInt -> IO CInt
@@ -195,6 +197,13 @@ peerUid :: Socket -> IO (Maybe CUInt)
 peerUid (Socket (Fd fd) _) = alloca $ \uid -> do
   result <- c_peer_uid fd uid
   if result == 0 then Just <$> peek uid else pure Nothing
+
+-- | The PID of the process at the other end of a Unix-domain socket, as it
+-- was when it connected (C++ acceptConnection, cred.pid).
+peerPid :: Socket -> IO (Maybe CInt)
+peerPid (Socket (Fd fd) _) = alloca $ \pid -> do
+  result <- c_peer_pid fd pid
+  if result == 0 then Just <$> peek pid else pure Nothing
 
 isTcp :: Socket -> IO Bool
 isTcp (Socket (Fd fd) _) = (== 1) <$> c_is_tcp fd

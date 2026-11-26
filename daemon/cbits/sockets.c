@@ -177,6 +177,19 @@ int goonix_peer_uid(int fd, uid_t *uid) {
 #endif
 }
 
+int goonix_peer_pid(int fd, pid_t *pid) {
+#ifdef SO_PEERCRED
+  struct ucred credential;
+  socklen_t size = sizeof credential;
+  if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &credential, &size) < 0) return -1;
+  if (credential.pid <= 0) { errno = ENOTSUP; return -1; }
+  *pid = credential.pid;
+  return 0;
+#else
+  (void)fd; (void)pid; errno = ENOTSUP; return -1;
+#endif
+}
+
 int goonix_is_tcp(int fd) {
   struct sockaddr_storage address;
   socklen_t size = sizeof address;

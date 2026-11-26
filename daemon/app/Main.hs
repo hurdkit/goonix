@@ -119,14 +119,16 @@ catchTerminationSignals lifecycle = do
         first <- requestStop lifecycle
         when first $ do
             atomicModifyIORef' stoppedBy (const (Just signal, ()))
-            clients <- openConnections lifecycle
-            -- Say why the process is still there.  With no client it ends as
-            -- silently as the C++ listening process does.
-            when (clients > 0) $ do
+            clients <- connectedClients lifecycle
+            -- Say why the process is still there, and for whom: from now on
+            -- nobody can connect to ask.  With no client it ends as silently
+            -- as the C++ listening process does.
+            when (not (null clients)) $ do
                 pid <- getProcessID
                 hPutStrLn stderr ("guix-daemon: PID " ++ show pid ++ " caught signal "
                     ++ show signal ++ "; accepting no more clients, ending when the "
-                    ++ show clients ++ " connected have finished")
+                    ++ show (length clients) ++ " connected have finished (client PIDs:"
+                    ++ concatMap ((' ' :) . show) clients ++ ")")
 
 -- | End the way the C++ listening process does: by the signal, with its
 -- default action, so that whoever waits for this process sees the same

@@ -204,6 +204,8 @@ operations =
   , Operation 82 "wopQueryRealisedOutput" [SString path, SString (name "output")] [SString path]
   , Operation 83 "wopQueryBuildRecords" [SString (name "resolvedHash"), SString (name "output")] [SStrings strings]
   , Operation 84 "wopQueryBuildGraph" [SString path] [SStrings strings, SStrings (name "hints")]
+  -- goonix: the sessions of a daemon that is one process; not in the C++ daemon.
+  , Operation 85 "wopQuerySessions" [] [SStrings strings]
   ]
 
 operationByCode :: Word32 -> Maybe Operation
