@@ -80,6 +80,7 @@ SH_TESTS +=					\
   tests/guix-ca-two-store.sh			\
   tests/guix-ca-files.sh			\
   tests/guix-ca-second-machine.sh		\
+  tests/guix-processes.sh			\
   tests/guix-pure-eval.sh			\
   tests/guix-pure-eval-system.sh		\
   tests/guix-goonix-defaults.sh			\

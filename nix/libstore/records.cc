@@ -301,6 +301,19 @@ Strings goonixRecordFields(const std::vector<BuildRecord> & records,
     return fields;
 }
 
+/* The Haskell daemon answers wopQuerySessions with the sessions it serves
+   from one process: `guix processes' has no other way to see them.  Here
+   each session is a process of its own, with its client's PID in its
+   command line, its lock files among its open files and its builders among
+   its children; a client that reads /proc has all of them, the asking one
+   included, and a session listed here would be listed twice.  So the answer
+   names the version of the layout, the daemon, and no session.  The daemon
+   is the process that accepted the connection: the parent of this one.  */
+Strings goonixSessionReport()
+{
+    return { "1", std::to_string(getppid()) };
+}
+
 void BuildRecords::choose(const Path & unresolved, const string & output,
     const Path & realised)
 {

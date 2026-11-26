@@ -37,7 +37,12 @@
 
             string-list->daemon-report
             query-daemon-report
-            reported-daemon-sessions))
+            reported-daemon-sessions
+
+            session-number
+            session-number->recutils
+            session-key
+            session-rec-type))
 
 ;;; Commentary:
 ;;;
@@ -52,13 +57,19 @@
 ;;; the daemon knows its sessions, so it is asked: the 'query-sessions'
 ;;; remote procedure returns them.
 ;;;
-;;; A daemon that does not know that procedure, the C++ daemon and upstream's
-;;; among them, answers with an error.  That, a connection that fails or
-;;; ends, and an answer this module cannot read all mean the same here: the
-;;; daemon reports no sessions, and what /proc shows is all there is.  The
-;;; question is put on a connection opened for it and closed afterwards, so a
-;;; daemon that ends the session of a client asking for an unknown operation
-;;; (the C++ daemon does) ends nothing else.
+;;; A daemon says in the version it announces whether it knows that
+;;; procedure, and one that does not is not asked: it would answer with an
+;;; error, end the session that asked and write a line about it in its log.
+;;; The daemon that has a process per session knows the procedure too, and
+;;; reports no session: /proc shows them all.  A daemon that is not asked, a
+;;; connection that fails or ends, and an answer this module cannot read all
+;;; mean the same here: the daemon reports no sessions, and what /proc shows
+;;; is all there is.  The question is put on a connection opened for it and
+;;; closed afterwards.
+;;;
+;;; A session that a daemon reported has a number, by which the daemon tells
+;;; its sessions apart: they all have the daemon's PID.  'guix processes'
+;;; prints it for those sessions, and for no other.
 ;;;
 ;;; Code:
 
@@ -80,6 +91,10 @@
   (children  reported-session-children))          ;list of integers, PIDs
 
 (define %report-version 1)
+
+(define %sessions-protocol-version
+  ;; The protocol version from which a daemon knows 'query-sessions'.
+  #x167)
 
 (define (string-list->daemon-report strings)
   "Return the <daemon-report> that STRINGS, the answer to 'query-sessions',
@@ -141,18 +156,18 @@ Unix-domain socket of this machine."
 
 (define* (query-daemon-report #:optional (uri (%daemon-socket-uri)))
   "Ask the daemon at URI for its sessions and return its <daemon-report>.
-Return #f if it gives none: no daemon answers at URI, the daemon does not know
-the question, or URI denotes another machine, whose processes are not those
-'guix processes' lists.  The connection this opens is not among the sessions
-of the report."
+Return #f if it gives none: no daemon answers at URI, the daemon announces a
+version that does not have the question and is not asked, or URI denotes
+another machine, whose processes are not those 'guix processes' lists.  The
+connection this opens is not among the sessions of the report."
   (define (close store)
     ;; Wait until the daemon has let go of the connection.  The C++ daemon
     ;; serves it from a process that carries the PID of its client, this
-    ;; process, as its second argument, and that process ends once it has
-    ;; refused the question; its end is the end of file here.  Returning
-    ;; earlier would leave it for the next reader of /proc to take for a
-    ;; session of this process.  Any daemon ends a connection whose client
-    ;; has finished writing.
+    ;; process, as its second argument, and that process ends once its
+    ;; client has finished writing; its end is the end of file here.
+    ;; Returning earlier would leave it for the next reader of /proc to take
+    ;; for a session of this process.  Any daemon ends a connection whose
+    ;; client has finished writing.
     (let ((port (store-connection-socket store)))
       (false-if-exception
        (begin
@@ -164,11 +179,13 @@ of the report."
       (false-if-exception (close-port port))))
 
   (define (ask store)
-    (catch 'system-error
-      (lambda ()
-        (guard (c ((or (store-error? c) (nar-error? c)) #f))
-          (string-list->daemon-report (query-sessions store))))
-      (const #f)))
+    ;; A daemon of an earlier version does not know the question.
+    (and (>= (store-connection-version store) %sessions-protocol-version)
+         (catch 'system-error
+           (lambda ()
+             (guard (c ((or (store-error? c) (nar-error? c)) #f))
+               (string-list->daemon-report (query-sessions store))))
+           (const #f))))
 
   (and (local-socket? uri)
        (let ((store (catch 'system-error
@@ -180,6 +197,47 @@ of the report."
               (let ((report (ask store)))
                 (close store)
                 report)))))
+
+(define %session-numbers
+  ;; The numbers of the sessions made from a daemon's report.  The record of
+  ;; (guix scripts processes) is upstream's and has no field for them.
+  (make-weak-key-hash-table))
+
+(define (session-number session)
+  "Return the number that its daemon gave SESSION, a session made by
+'reported-daemon-sessions', or #f for a session that no daemon reported."
+  (hashq-ref %session-numbers session))
+
+(define (session-number->recutils session port)
+  "Write to PORT the recutils field with the number of SESSION, if a daemon
+reported it; write nothing otherwise."
+  (and=> (session-number session)
+         (lambda (number)
+           (format port "SessionNumber: ~a~%" number))))
+
+(define (session-key session pid)
+  "Return what tells SESSION, whose process has PID, apart from every other
+session in the normalized output of 'guix processes': PID, or, for a session
+that a daemon reported and that shares PID with the others of that daemon,
+PID and the session's number."
+  (match (session-number session)
+    (#f pid)
+    (number (format #f "~a-~a" pid number))))
+
+(define %reported-session-rec-type
+  ;; The record descriptor of upstream's 'guix processes', without the
+  ;; declaration that the key, PID, is an integer.
+  "%rec: Session
+%type: ClientPID int
+%key: PID
+%mandatory: ClientPID ClientCommand")
+
+(define (session-rec-type sessions default)
+  "Return the recutils descriptor of the records of SESSIONS: DEFAULT, or, if
+a daemon reported one of them, one that fits the key 'session-key' returns."
+  (if (any session-number sessions)
+      %reported-session-rec-type
+      default))
 
 (define* (reported-daemon-sessions make-session lookup-process lookup-children
                                    #:optional (report (query-daemon-report)))
@@ -193,7 +251,8 @@ LOOKUP-PROCESS returns the process with the given PID among those read from
 given PID.  A session whose client is not among them is left out, as is every
 session of a daemon that is not among them: its PIDs are those of another
 machine or another PID name space.  Of the child processes a session names,
-those that are children of the daemon in /proc are kept."
+those that are children of the daemon in /proc are kept.  'session-number'
+returns, for each session returned, the number the daemon gave it."
   (match report
     (#f '())
     (($ <daemon-report> pid sessions)
@@ -209,12 +268,17 @@ those that are children of the daemon in /proc are kept."
                         (and=> (lookup-process
                                 (reported-session-client session))
                                (lambda (client)
-                                 (make-session
-                                  daemon client
-                                  (filter-map child
-                                              (reported-session-children
-                                               session))
-                                  (reported-session-locks session)))))
+                                 (let ((made (make-session
+                                              daemon client
+                                              (filter-map
+                                               child
+                                               (reported-session-children
+                                                session))
+                                              (reported-session-locks
+                                               session))))
+                                   (hashq-set! %session-numbers made
+                                               (reported-session-id session))
+                                   made))))
                       sessions)))))))
 
 ;;; daemon-sessions.scm ends here

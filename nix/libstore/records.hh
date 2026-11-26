@@ -34,6 +34,9 @@ string canonicalBuildRecordPayload(const BuildRecord & record);
 Strings goonixRecordFields(const std::vector<BuildRecord> & records,
     bool includeHash = false);
 
+/* The answer to wopQuerySessions, in the layout the Haskell daemon uses. */
+Strings goonixSessionReport();
+
 typedef std::map<std::pair<Path, string>, Path> OutputChoices;
 
 /* Permanent facts and local choices.  Deliberately independent of store
