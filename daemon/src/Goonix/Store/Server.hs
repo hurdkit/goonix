@@ -202,8 +202,12 @@ serveListener config lifecycle listener = do
             -- Entered here, not in the client's thread: once this loop has
             -- returned, no client is still on its way into the table.
             session <- openSession lifecycle client
+            -- The session leaves the table before the socket is closed: a
+            -- client that has seen the end of its connection is no longer
+            -- reported.  `guix processes' asks on a connection of its own
+            -- and waits for that end before it looks again.
             _ <- forkFinally (handleClient sharedConfig session client)
-              (const (closeSocket client `finally` closeSession session))
+              (const (closeSession session `finally` closeSocket client))
             accept
   accept
   -- Later clients are refused, as they are once the C++ listening process is

@@ -16,8 +16,9 @@
 #     child, which /proc shows as a child of the daemon running the builder;
 #     the idle session has neither;
 #   - the connection that asked is still served;
-#   - after the build no session holds anything, and a connection that was
-#     closed is no longer listed.
+#   - after the build no session holds anything, and a connection that the
+#     daemon has ended is no longer listed, from the moment its client can
+#     see that end.
 # Checked for the C++ daemon, which is what a client of either has to cope
 # with: the question is refused with "invalid operation 85" and the
 # connection that asked is ended, by a session process that says so on the

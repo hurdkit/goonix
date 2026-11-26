@@ -51,6 +51,16 @@
               (else
                (assert #f "unexpected frame " (number->string frame 16))))))))
 
+(define (leave store)
+  "End STORE's connection and return once the daemon has ended it too."
+  (let ((port (store-connection-socket store)))
+    (force-output port)
+    (shutdown port 1)
+    (let loop ()
+      (unless (eof-object? (get-u8 port))
+        (loop)))
+    (close-port port)))
+
 (define (closed? store)
   "Return true if the daemon has ended STORE's connection."
   (guard (c ((nar-error? c) #t))
@@ -184,18 +194,25 @@ denotes: a list of (NUMBER CLIENT LOCKS CHILDREN)."
     (sessions
      (assert #f "sessions after the build, with four connections open: "
              sessions)))
-  (close-connection idle)
-  (close-connection asking)
-  ;; The daemon notes the end of a connection in that connection's thread.
-  (let loop ((tries 0))
-    (match (report later)
-      (((_ _ () ()))
-       #t)
-      (sessions
-       (assert (< tries 100) "sessions after two connections were closed: "
-               sessions)
-       (usleep 50000)
-       (loop (+ tries 1)))))
+  ;; A connection that the daemon has ended is not reported any more, from
+  ;; the moment its client can know.  `guix processes' counts on that for
+  ;; the connection it asks on.
+  (leave idle)
+  (leave asking)
+  (match (report later)
+    (((_ _ () ()))
+     #t)
+    (sessions
+     (assert #f "sessions after the daemon ended two connections: " sessions)))
+  (let loop ((times 0))
+    (when (< times 50)
+      (leave (connect))
+      (match (report later)
+        (((_ _ () ()))
+         (loop (+ times 1)))
+        (sessions
+         (assert #f "a connection the daemon has ended is reported: "
+                 sessions)))))
   (say "sessions reported after the build and after two clients left"))
 (close-connection building)
 (close-connection later)
