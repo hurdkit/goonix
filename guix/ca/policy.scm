@@ -78,6 +78,16 @@
   ;; inherited records receive their new definition's location.
   (make-parameter upstream-package?))
 
+(define (bootstrap-package? package)
+  "Whether PACKAGE belongs to the bootstrap/commencement boundary.
+Match its module of definition, including bootstrap.scm locations that refer
+to bindings implemented in commencement.scm.  No package name list is needed."
+  (and=> (package-location package)
+         (lambda (location)
+           (member (location-file location)
+                   '("gnu/packages/commencement.scm"
+                     "gnu/packages/bootstrap.scm")))))
+
 (define %package-addressing
   (make-parameter 'input))
 
@@ -99,6 +109,9 @@
          (if (eq? (%package-addressing-policy) 'adopted)
              'input
              'resolved))
+        ((and (bootstrap-package? package)
+              (eq? (%package-addressing-policy) 'adopted))
+         'input)
         ((eq? 'opaque (assq-ref (package-properties package) 'self-references))
          (if (eq? (%package-addressing-policy) 'adopted)
              'input
@@ -119,7 +132,8 @@
 policy is 'adopted', PACKAGE is upstream's, and it is not marked opaque."
   (and (eq? (%package-addressing-policy) 'adopted)
        ((%upstream-package?) package)
-       (not (opaque-package? package))))
+       (not (or (opaque-package? package)
+                (bootstrap-package? package)))))
 
 (define (package-addressing-key)
   "Return the current mode and marker for the package derivation cache."
@@ -135,7 +149,8 @@ No direct-opaque or glibc-specific dependent promotion is applied."
         (let ((addressing (package-addressing context))
               (opaque-input?
                (and (eq? (%package-addressing-policy) 'adopted)
-                    (opaque-package? context)))
+                    (or (opaque-package? context)
+                        (bootstrap-package? context))))
               (adopt? (adopt-package? context)))
           (state-parameterize ((%package-addressing addressing)
                                (%package-derivation-name (bag-name bag)))

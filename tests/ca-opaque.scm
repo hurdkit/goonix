@@ -50,6 +50,11 @@
 (define store (open-connection-for-tests))
 (%graft? #f)
 
+(define stage0-posix
+  (module-ref (resolve-module '(gnu packages commencement)) 'stage0-posix))
+(define mes-boot
+  (module-ref (resolve-module '(gnu packages commencement)) 'mes-boot))
+
 (define (addressing drv)
   (assoc-ref (derivation-builder-environment-vars drv) "goonixAddressing"))
 
@@ -201,6 +206,55 @@
     (test-equal "a property-marked non-glibc package is also unadopted"
       '(input #f) (under-adopted marked))))
 
+(test-group "bootstrap packages retain upstream input addressing under adopted"
+  ;; No builds: adoption returns its original input derivation here, so this
+  ;; isolates the policy's handling of dependents from the scanner and network.
+  ;; Both source modules are covered.  Package locations can point at
+  ;; bootstrap.scm even for bindings implemented in commencement.scm.
+  (define (under-adopted package)
+    (parameterize ((%package-addressing-policy 'adopted))
+      (list (package-addressing package) (adopt-package? package))))
+  (for-each
+   (lambda (package)
+     (test-equal
+         (format #f "~a (~a) is input-addressed and unadopted under 'adopted"
+                 (package-name package)
+                 (location-file (package-location package)))
+       '(input #f) (under-adopted package)))
+   (list %bootstrap-guile stage0-posix mes-boot))
+  (test-equal "hello outside the bootstrap boundary remains adoptable"
+    '(input #t) (under-adopted hello))
+  (let* ((adopt-module (resolve-module '(guix ca adopt)))
+         (real-adopt (module-ref adopt-module 'adopt-derivation))
+         (identity-adopt (lambda (store drv . args) drv)))
+    (dynamic-wind
+      (lambda ()
+        (module-set! adopt-module 'adopt-derivation identity-adopt))
+      (lambda ()
+        (for-each
+         (lambda (package)
+           (let ((input (parameterize ((%package-addressing-policy 'input)
+                                       (%graft? #f))
+                          (package-derivation store package #:graft? #f)))
+                 (adopted (parameterize ((%package-addressing-policy 'adopted)
+                                        (%graft? #f))
+                            (package-derivation store package #:graft? #f))))
+             (test-equal
+                 (format #f "~a keeps its upstream .drv under 'adopted"
+                         (package-name package))
+               (derivation-file-name input) (derivation-file-name adopted))))
+         (list stage0-posix mes-boot)))
+      (lambda ()
+        (module-set! adopt-module 'adopt-derivation real-adopt))))
+  ;; Direct form of the dependent route, using the real bootstrap inputs.
+  ;; This is the no-build assertion that is RED before the boundary rule.
+  (parameterize ((%package-addressing-policy 'adopted))
+    (let ((adopted (parameterize ((%package-addressing-policy 'adopted))
+                     (package-derivation store stage0-posix #:graft? #f))))
+      (test-equal "a bootstrap dependent remains input-addressed"
+        'input
+        (gexp-addressing 'input (derivation-input adopted) '() #f #f #f)))))
+
 (test-group "the adopted hello package closure respects opaque inputs"
   ;; This is a package-graph invariant, not a count of changed objects and
   ;; not a build.  Production package-addressing decides every edge.
@@ -231,6 +285,16 @@
     (every (lambda (record)
              (let ((package (car record)))
                (or (not (opaque-package? package))
+                   (parameterize ((%package-addressing-policy 'adopted))
+                     (and (eq? 'input (package-addressing package))
+                          (not (adopt-package? package)))))))
+           records))
+  (test-assert "every bootstrap package in hello's closure stays input and unadopted"
+    (every (lambda (record)
+             (let ((package (car record)))
+               (or (not (member (location-file (package-location package))
+                                '("gnu/packages/commencement.scm"
+                                  "gnu/packages/bootstrap.scm")))
                    (parameterize ((%package-addressing-policy 'adopted))
                      (and (eq? 'input (package-addressing package))
                           (not (adopt-package? package)))))))
