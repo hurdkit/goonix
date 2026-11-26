@@ -166,6 +166,25 @@ export GOONIX_ASYNC_ROOT=$root
 : > "$root/hold-enabled"
 sed -i 's#--disable-chroot#--disable-chroot --debug#' "$root/concurrent-part.sh"
 sed -i "s#concurrent \"$root/fixture.scm\"#concurrent \"$root/fixture.scm\" >\"$root/concurrent-client.log\" 2>\&1#" "$root/concurrent-part.sh"
+# Hold the dependent's graph lookup until the input builder is running.  The
+# order asserted below is then a fact about the fixture and not about how long
+# a daemon takes between deciding to build the input and starting its builder.
+cat > "$root/gate-guix" <<EOF
+#!/bin/sh
+if test "\$1 \$2" = "substitute --goonix-graph"; then
+  IFS= read -r request || exit 1
+  case \$request in
+    *-two-store-dependent.drv\ *)
+      until test -e "$root/hold-started"; do sleep .1; done;;
+  esac
+  { printf '%s\n' "\$request"; cat; } | "$PWD/scripts/guix" "\$@"
+  exit \$?
+fi
+exec "$PWD/scripts/guix" "\$@"
+EOF
+chmod 755 "$root/gate-guix"
+sed -i "s#^./pre-inst-env ./guix-daemon#./pre-inst-env env GUIX=$root/gate-guix ./guix-daemon#" "$root/concurrent-part.sh"
+grep -q "GUIX=$root/gate-guix" "$root/concurrent-part.sh"
 unshare --user --map-root-user --mount bash -c \
   "mount --bind '$client/concurrent-store' '$store' && exec unshare --user --map-user=$(id -u) --map-group=$(id -g) bash '$root/concurrent-part.sh'" >"$root/concurrent-wrapper.log" 2>&1 &
 concurrent_pid=$!
