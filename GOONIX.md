@@ -7,7 +7,7 @@ unchanged next to this file.
 | | |
 |---|---|
 | Upstream | `https://codeberg.org/guix/guix.git`, branch `master` |
-| Fork point | commit `fd49d69fbe07557f0bf55bc7e556e60fc5b13082` (2026-11-11), Guix 1.5.0 development series |
+| Fork point | commit `fd49d69fbe07557f0bf55bc7e556e60fc5b13082` |
 | Our branch | `goonix`: the fork point plus our commits |
 | `main` | a mirror of upstream `master`, without our commits |
 | Licence | GPL-3.0-or-later, unchanged (see `COPYING`) |

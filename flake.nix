@@ -178,6 +178,9 @@
           # Guile 3.0's own ice-9/boot-9.go.  Keep the Guile libraries'
           # compiled paths, but remove only the interpreter's private cache.
           shellHook = ''
+            # The real-hold two-store fixture needs a static sleep applet.
+            # Use this flake's locked nixpkgs, never a channel or NIX_PATH.
+            export GOONIX_SLEEP_SOURCE=${pkgs.pkgsStatic.busybox}/bin/busybox
             goonix_guile=${pkgs.guile}
             GUILE_LOAD_COMPILED_PATH=$(IFS=:
               result=

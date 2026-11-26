@@ -7,6 +7,13 @@ if ! unshare --user --map-root-user --mount true 2>/dev/null; then
   exit 77
 fi
 
+# The pinned dev shell supplies a static BusyBox.  Never resolve a channel:
+# a clean test machine has no <nixpkgs> in its Nix search path.
+if test -z "${GOONIX_SLEEP_SOURCE:-}" || test ! -x "${GOONIX_SLEEP_SOURCE:-}"; then
+  printf 'GOONIX_SLEEP_SOURCE must name an executable static BusyBox; use nix develop .#default\n' >&2
+  exit 1
+fi
+
 root=$(mktemp -d "${GOONIX_TWO_STORE_TMPDIR:-${TMPDIR:-/tmp}}/goonix-two-store-XXXXXX")
 server=$root/server
 client=$root/client
@@ -28,17 +35,6 @@ done
 } > "$client/etc/acl"
 printf '#!/bin/sh\nexec /bin/sh "$@"\n' > "$root/shell"
 chmod 755 "$root/shell"
-
-# Use a static BusyBox and a correctly named sleep symlink in one store item.
-if test -n "${GOONIX_SLEEP_SOURCE:-}"; then
-  sleep_source=$GOONIX_SLEEP_SOURCE
-else
-  sleep_source=$(nix eval --raw --impure --expr \
-    'let pkgs = import <nixpkgs> {}; in "${pkgs.pkgsStatic.busybox}/bin/busybox"')
-  test -x "$sleep_source" || nix build --impure --no-link --expr \
-    'let pkgs = import <nixpkgs> {}; in pkgs.pkgsStatic.busybox'
-fi
-export GOONIX_SLEEP_SOURCE=$sleep_source
 
 server_pid= publisher_pid= client_pid= bad_pid= silent_pid= empty_pid= concurrent_pid=
 completed=false
