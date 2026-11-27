@@ -8,6 +8,7 @@
              (guix sets)
              (guix derivations)
              (guix gexp)
+             (guix package-overrides)
              (guix serialization)
              (guix build-system trivial)
              ((guix build utils) #:select (mkdir-p delete-file-recursively))
@@ -745,6 +746,90 @@ NarSize: 1234\nNarHash: sha256:~a\nReferences: \nSystem: ~a\nDeriver: ~a\n"
   (test-equal "all three are input-addressed under 'input"
     '(#f #f #f)
     (lowered-or 'failed (lambda () (same-named 'input)))))
+
+(test-group "an override holds while its replacement is suspended"
+  ;; While a replacement is lowered, the overrides in force are narrowed to
+  ;; those that do not lead to it, so that it can be built on top of its
+  ;; original (guix package-overrides).  Under 'adopted the replacement below
+  ;; is suspended inside that extent: it is upstream's, and adopting it
+  ;; requests a build.  The other items of the build accumulator must be
+  ;; lowered with the overrides of the gexp that holds them: with the
+  ;; narrowed list a package that depends on the original gets the original,
+  ;; and so does a reference to the original itself.  The other policies
+  ;; request no build there; they are run for comparison.
+  (define (override-seen policy)
+    ;; Lower, with the override ORIGINAL -> REPLACEMENT, a gexp that refers to
+    ;; ORIGINAL and to two packages that depend on it, one upstream's and one
+    ;; not; lower each of the three alone too.  Return whether the gexp's
+    ;; inputs are the packages lowered alone, then, for each input in the
+    ;; order of their names, whether its closure holds the replacement and
+    ;; whether it holds the original.
+    (let* ((text (lambda (text)
+                   #~(call-with-output-file #$output
+                       (lambda (p) (display #$text p)))))
+           (original (trivial "ca-policy-override-original" (text "ORIGINAL")))
+           (replacement (trivial "ca-policy-override-replacement"
+                                 (text "REPLACEMENT")))
+           (dependent (lambda (name)
+                        (trivial name
+                                 #~(call-with-output-file #$output
+                                     (lambda (p) (display #$original p)))
+                                 (list original))))
+           (upstream (dependent "ca-policy-override-upstream"))
+           (own (dependent "ca-policy-override-own"))
+           (marker (upstream-package-set
+                    (list->setq
+                     (list original replacement upstream %bootstrap-guile))))
+           (overrides (list (cons original replacement)))
+           (lower (lambda (mvalue)
+                    ;; MVALUE, a thunk returning a monadic value, run on a
+                    ;; connection of its own with the overrides in force.
+                    (let* ((fresh (open-connection-for-tests))
+                           (drv (parameterize ((%package-addressing-policy
+                                                policy)
+                                               (%upstream-package? marker)
+                                               (%package-overrides overrides))
+                                  (run-with-store fresh (mvalue)))))
+                      (close-connection fresh)
+                      drv)))
+           (alone (map (lambda (package)
+                         (lower (lambda () (package->derivation package))))
+                       (list original upstream own)))
+           (outer (lower (lambda ()
+                           (gexp->derivation "ca-policy-override-outer"
+                                             #~(list #$original #$upstream #$own)
+                                             #:guile-for-build
+                                             (%guile-for-build)))))
+           (inputs (sort (filter (lambda (drv)
+                                   (string-prefix? "ca-policy-override-"
+                                                   (derivation-name drv)))
+                                 (map derivation-input-derivation
+                                      (derivation-inputs outer)))
+                         (lambda (left right)
+                           (string<? (derivation-name left)
+                                     (derivation-name right))))))
+      (define (holds? drv which)
+        (let ((suffix (string-append "-ca-policy-override-" which "-1.drv")))
+          (any (lambda (file) (string-suffix? suffix file))
+               (hash-map->list (lambda (file bytes) file)
+                               (derivation-closure drv)))))
+      (cons (lset= string=?
+                   (map derivation-file-name alone)
+                   (map derivation-file-name inputs))
+            (map (lambda (drv)
+                   (list (holds? drv "replacement") (holds? drv "original")))
+                 inputs))))
+  (for-each
+   (lambda (policy)
+     (let ((seen (lowered-or '(failed) (lambda () (override-seen policy)))))
+       (test-assert (format #f "the gexp's inputs are as lowered alone under '~a"
+                            policy)
+         (eq? #t (car seen)))
+       (test-equal (format #f "each input holds the replacement, not the original, under '~a"
+                           policy)
+         '((#t #f) (#t #f) (#t #f))
+         (cdr seen))))
+   '(input mixed content full adopted)))
 
 (test-group "a gexp over an adopted input is content-addressed under adopted"
   ;; The plan's policy table (01-content-addressing.md, section 8): under
