@@ -42,6 +42,7 @@
   #:use-module ((guix diagnostics) #:select (leave warning info))
   #:use-module (guix progress)
   #:autoload   (guix swh) (swh-download commit-id?)
+  #:use-module (guix download-cache git)  ;goonix: the download cache
   #:use-module (rnrs bytevectors)
   #:use-module (ice-9 format)
   #:use-module (ice-9 match)
@@ -603,7 +604,15 @@ current settings unchanged."
 
   (with-libgit2
    (set-git-timeouts connection-timeout read-timeout)
-   (let* ((cache-exists? (openable-repository? cache-directory))
+   (let* ((mirrored?     ;goonix: the download cache's copy first
+           (update-from-download-cache url cache-directory ref
+                                       #:fetch-options
+                                       (make-default-fetch-options
+                                        #:verify-certificate?
+                                        verify-certificate?)
+                                       #:available? reference-available?
+                                       #:refspecs (ref->refspecs ref)))
+          (cache-exists? (openable-repository? cache-directory))
           (repository    (if cache-exists?
                              (repository-open cache-directory)
                              (clone/swh-fallback url ref cache-directory
@@ -618,13 +627,17 @@ current settings unchanged."
      ;; before as the requested reference are not fetched when cloning.
      (when (and (or cache-exists? (symref? ref))
                 (not (reference-available? repository ref)))
-       (remote-fetch (remote-lookup repository "origin")
-                     #:fetch-options (make-default-fetch-options
-                                      #:verify-certificate?
-                                      verify-certificate?)
-                     ;; Build refspecs from symbolic references so they are
-                     ;; created locally and updated if necessary.
-                     #:refspecs (ref->refspecs ref)))
+       ;; goonix: after the download cache's copy, a failure is not fatal.
+       (call-with-download-cache-fallback
+        mirrored? url
+        (lambda ()
+          (remote-fetch (remote-lookup repository "origin")
+                        #:fetch-options (make-default-fetch-options
+                                         #:verify-certificate?
+                                         verify-certificate?)
+                        ;; Build refspecs from symbolic references so they
+                        ;; are created locally and updated if necessary.
+                        #:refspecs (ref->refspecs ref)))))
      ;; Note: call 'commit-relation' from here because it's more efficient
      ;; than letting users re-open the checkout later on.
      (let* ((oid      (if check-out?

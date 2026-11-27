@@ -16,22 +16,38 @@
 ;;; You should have received a copy of the GNU General Public License
 ;;; along with GNU Guix.  If not, see <http://www.gnu.org/licenses/>.
 
-;;; goonix: the built-in download asks the download cache first.
+;;; goonix: the built-in downloads, of files and of Git checkouts, and the
+;;; checkouts of the 'guix' command ask the download cache first.
 
 (define-module (test-download-cache)
   #:use-module (guix download-cache)
   #:use-module (guix base32)
-  #:use-module ((guix download) #:select (url-fetch))
+  #:use-module ((guix download) #:select (url-fetch %download-methods))
+  #:use-module (guix git-download)
+  #:use-module ((guix git)
+                #:select (with-repository
+                          update-cached-checkout
+                          url-cache-directory
+                          %repository-cache-directory))
   #:use-module (guix derivations)
   #:use-module (guix monads)
   #:use-module (guix store)
   #:use-module (guix tests)
   #:use-module (guix tests http)
+  #:use-module (guix tests git)
+  #:use-module ((guix utils)
+                #:select (with-environment-variables
+                          call-with-temporary-directory))
   #:use-module ((guix build utils)
-                #:select (call-with-temporary-output-file))
+                #:select (call-with-temporary-output-file mkdir-p invoke))
+  #:use-module (git)
   #:use-module ((gcrypt hash) #:select (sha256))
   #:use-module (rnrs bytevectors)
+  #:use-module (ice-9 ftw)
+  #:use-module (ice-9 match)
   #:use-module (ice-9 textual-ports)
+  #:use-module (srfi srfi-11)
+  #:use-module (srfi srfi-26)
   #:use-module (srfi srfi-64))
 
 (define %store
@@ -130,5 +146,285 @@ daemon runs, 'guix perform-download', in an environment where CACHE, a URL or
   content
   (with-http-server `(("/origin/cached-file.txt" 200 ,content))
     (download (%local-url #:path "/origin/cached-file.txt") #f)))
+
+;;;
+;;; Git repositories: their address in the cache.
+;;;
+
+(define (unused-port)
+  "Return a TCP port of the loopback interface that nothing listens on."
+  (let ((sock (socket PF_INET SOCK_STREAM 0)))
+    (bind sock AF_INET INADDR_LOOPBACK 0)
+    (let ((port (sockaddr:port (getsockname sock))))
+      (close-port sock)
+      port)))
+
+(define (unreachable-url path)
+  "Return an HTTP URL ending in PATH on a port where nothing listens."
+  (string-append "http://127.0.0.1:" (number->string (unused-port)) path))
+
+(test-equal "address of a Git repository in the cache"
+  "http://cache.example:8480/git/https/git.savannah.gnu.org/git/sed.git"
+  (download-cache-git-url "http://cache.example:8480/"
+                          "https://git.savannah.gnu.org/git/sed.git"))
+
+(test-equal "no address for a repository that a cache does not serve"
+  '(#f #f #f #f #f #f #f #f #f)
+  (map (lambda (cache url)
+         (download-cache-git-url cache url))
+       '(#f "" "http://cache.example" "http://cache.example"
+         "http://cache.example" "http://cache.example" "http://cache.example"
+         "file:///srv/cache" "http://cache.example")
+       '("https://example.org/r.git" "https://example.org/r.git"
+         "git://example.org/r.git" "https://user@example.org/r.git"
+         "https://example.org/r.git?x=y" "https://example.org/a/../r.git"
+         "ssh://example.org/r.git" "https://example.org/r.git"
+         "file:///srv/r.git")))
+
+(test-equal "a file cache and file repositories, for tests only"
+  "file:///srv/cache/git/file//srv/r.git"
+  (parameterize ((%download-cache-local-files? #t))
+    (download-cache-git-url "file:///srv/cache" "file:///srv/r.git")))
+
+(test-equal "a cache that cannot be reached is found out, once a process"
+  '(#f #f)
+  (let* ((port  (unused-port))
+         (cache (string-append "http://127.0.0.1:" (number->string port))))
+    (let ((first (download-cache-reachable? cache))
+          (sock  (socket PF_INET SOCK_STREAM 0)))
+      ;; Something listens there now, but the answer kept is the first.
+      (setsockopt sock SOL_SOCKET SO_REUSEADDR 1)
+      (bind sock AF_INET INADDR_LOOPBACK port)
+      (listen sock 1)
+      (let ((second (download-cache-reachable? cache)))
+        (close-port sock)
+        (list first second)))))
+
+(test-assert "a cache that listens can be reached"
+  (let ((sock (socket PF_INET SOCK_STREAM 0)))
+    (bind sock AF_INET INADDR_LOOPBACK 0)
+    (listen sock 1)
+    (let ((answer (download-cache-reachable?
+                   (string-append "http://127.0.0.1:"
+                                  (number->string
+                                   (sockaddr:port (getsockname sock)))))))
+      (close-port sock)
+      answer)))
+
+(test-assert "derivations are the same with and without a cache"
+  (let ((git   (lambda ()
+                 (derivation-file-name
+                  (run-with-store %store
+                    (git-fetch (git-reference
+                                (url "https://example.org/r.git")
+                                (commit "v1.0"))
+                               'sha256 hash "r-checkout")))))
+        (plain (lambda ()
+                 (derivation-file-name
+                  (run-with-store %store
+                    (url-fetch "https://example.org/r.tar.gz" 'sha256 hash
+                               "r.tar.gz"))))))
+    (let ((without (list (git) (plain)))
+          (with    (with-environment-variables
+                       '(("GOONIX_DOWNLOAD_CACHE" "http://cache.example"))
+                     (parameterize ((%download-cache "http://cache.example"))
+                       (list (git) (plain))))))
+      (equal? without with))))
+
+;;;
+;;; The built-in Git download.
+;;;
+
+(define-syntax-rule (with-cache cache body ...)
+  "Evaluate BODY with CACHE, a URL, as the download cache; a file:// URL is
+accepted there, as are file:// repositories."
+  (parameterize ((%download-cache cache)
+                 (%download-cache-local-files? #t))
+    body ...))
+
+(define (copy-in-cache cache url repository)
+  "Put a bare clone of REPOSITORY where CACHE, a directory, keeps its copy of
+the repository at URL: below git/, URL with \"://\" written \"/\"."
+  (let* ((scheme (string-take url (string-index url #\:)))
+         (rest   (string-drop url (+ 3 (string-length scheme))))
+         (copy   (string-append cache "/git/" scheme "/" rest)))
+    (mkdir-p (dirname copy))
+    (invoke (git-command) "clone" "--quiet" "--bare" repository copy)
+    copy))
+
+(define (head-commit directory)
+  (with-repository directory repository
+    (oid->string (reference-target (repository-head repository)))))
+
+(define (perform-git-download* drv output)
+  "Run the procedure that 'guix perform-download' runs for DRV, a
+builtin:git-download derivation, writing to OUTPUT; return the names of the
+files in OUTPUT, or #f if there is none."
+  (with-environment-variables `(("PATH" ,(getenv "PATH")))
+    ((@@ (guix scripts perform-download) perform-git-download) drv output))
+  (and (file-exists? output)
+       (sort (scandir output (negate (cut member <> '("." ".."))))
+             string<?)))
+
+(define (git-download-derivation url commit)
+  (parameterize ((%download-methods '(upstream)))
+    (run-with-store %store
+      (git-fetch (git-reference (url url) (commit commit))
+                 'sha256 hash "cached-checkout"))))
+
+(unless (member "git-download" (built-in-builders %store))
+  (test-skip 1))
+(test-equal "built-in Git download: the commit comes from the cache's copy"
+  '("README" "doc")
+  ;; The repository itself cannot be reached.
+  (with-temporary-git-repository directory
+      '((add "README" "Hello.")
+        (add "doc/notes" "Notes.")
+        (commit "First"))
+    (call-with-temporary-directory
+     (lambda (tmp)
+       (let ((origin (unreachable-url "/project.git"))
+             (cache  (string-append tmp "/cache")))
+         (copy-in-cache cache origin directory)
+         (with-cache (string-append "file://" cache)
+           (perform-git-download* (git-download-derivation
+                                   origin (head-commit directory))
+                                  (string-append tmp "/out"))))))))
+
+(test-equal "built-in Git download: without the cache's copy, from scratch"
+  '(fallback #f)
+  ;; The cache has no copy: the usual download runs on an empty output.
+  (call-with-temporary-directory
+   (lambda (tmp)
+     (let ((output (string-append tmp "/out"))
+           (seen   'not-called))
+       (with-cache (string-append "file://" tmp)
+         (let ((result (git-fetch/download-cache
+                        (unreachable-url "/project.git")
+                        "0123456789abcdef0123456789abcdef01234567" output
+                        (lambda ()
+                          (set! seen (file-exists? output))
+                          'fallback)
+                        #:git-command (git-command))))
+           (list result seen)))))))
+
+(test-equal "built-in Git download: a cache that cannot be reached"
+  '(fallback #f)
+  (let ((cache (unreachable-url "")))
+    (with-cache cache
+      (list (git-fetch/download-cache "https://example.org/project.git"
+                                      "v1.0" "/nonexistent/output"
+                                      (const 'fallback))
+            (download-cache-reachable? cache)))))
+
+;;;
+;;; The client's Git checkouts.
+;;;
+
+(define (cached-checkout url ref checkouts)
+  "Update the checkout of URL to REF below CHECKOUTS, as 'guix pull' and
+'guix style' do.  Return the checkout's directory, its commit, and the URL of
+its remote \"origin\"."
+  (parameterize ((%repository-cache-directory checkouts))
+    (let-values (((directory commit _) (update-cached-checkout url #:ref ref)))
+      (list directory commit
+            (with-repository directory repository
+              (remote-url (remote-lookup repository "origin")))))))
+
+(define (file-contains? file text)
+  (and (string-contains (call-with-input-file file get-string-all) text) #t))
+
+(test-assert "checkout: cloned from the cache's copy, repository unreachable"
+  (with-temporary-git-repository directory
+      '((add "README" "Hello.")
+        (commit "First")
+        (tag "v1.0" "Release."))
+    (call-with-temporary-directory
+     (lambda (tmp)
+       (let ((origin    (unreachable-url "/project.git"))
+             (cache     (string-append tmp "/cache"))
+             (checkouts (string-append tmp "/checkouts")))
+         (copy-in-cache cache origin directory)
+         (match (with-cache (string-append "file://" cache)
+                  (cached-checkout origin '(tag-or-commit . "v1.0") checkouts))
+           ((checkout-directory commit remote)
+            (and (string=? commit (head-commit directory))
+                 ;; What is recorded names the repository, not the cache.
+                 (string=? checkout-directory
+                           (url-cache-directory origin checkouts))
+                 (string=? remote origin)
+                 (not (file-contains? (string-append checkout-directory
+                                                     "/.git/config")
+                                      cache))))))))))
+
+(test-assert "checkout: a branch, the repository unreachable after the copy"
+  ;; The remote's HEAD is asked for: the repository is asked after the
+  ;; copy, fails, and what the copy gave is used.
+  (with-temporary-git-repository directory
+      '((add "README" "Hello.")
+        (commit "First"))
+    (call-with-temporary-directory
+     (lambda (tmp)
+       (let ((origin (unreachable-url "/project.git"))
+             (cache  (string-append tmp "/cache")))
+         (copy-in-cache cache origin directory)
+         (match (with-cache (string-append "file://" cache)
+                  (cached-checkout origin '() (string-append tmp "/checkouts")))
+           ((_ commit remote)
+            (and (string=? commit (head-commit directory))
+                 (string=? remote origin)))))))))
+
+(test-equal "checkout: an existing one asks the copy, then the repository"
+  '(#t #t)
+  (with-temporary-git-repository directory
+      '((add "README" "Hello.")
+        (commit "First"))
+    (call-with-temporary-directory
+     (lambda (tmp)
+       (let* ((origin    (string-append "file://" directory))
+              (cache     (string-append tmp "/cache"))
+              (checkouts (string-append tmp "/checkouts"))
+              (tag       "refs/tags/only-in-the-copy")
+              (first     (cached-checkout origin '() checkouts))
+              (copy      (copy-in-cache cache origin directory)))
+         ;; The copy has a tag that the repository does not have.
+         (invoke (git-command) "-C" copy "update-ref" tag "HEAD")
+         (match (with-cache (string-append "file://" cache)
+                  (cached-checkout origin '() checkouts))
+           ((checkout-directory commit remote)
+            (list (string=? commit (head-commit directory))
+                  (with-repository checkout-directory repository
+                    (->bool (false-if-exception
+                             (reference-lookup repository tag))))))))))))
+
+(test-equal "checkout: the cache has no copy, so the repository is cloned"
+  '(#t #t)
+  (with-temporary-git-repository directory
+      '((add "README" "Hello.")
+        (commit "First"))
+    (call-with-temporary-directory
+     (lambda (tmp)
+       (let ((origin (string-append "file://" directory)))
+         (mkdir-p (string-append tmp "/cache"))
+         (match (with-cache (string-append "file://" tmp "/cache")
+                  (cached-checkout origin '() (string-append tmp "/checkouts")))
+           ((_ commit remote)
+            (list (string=? commit (head-commit directory))
+                  (string=? remote origin)))))))))
+
+(test-equal "checkout: a cache that cannot be reached"
+  '(#t #f)
+  (with-temporary-git-repository directory
+      '((add "README" "Hello.")
+        (commit "First"))
+    (call-with-temporary-directory
+     (lambda (tmp)
+       (let ((origin (string-append "file://" directory))
+             (cache  (unreachable-url "")))
+         (match (with-cache cache
+                  (cached-checkout origin '() (string-append tmp "/checkouts")))
+           ((_ commit remote)
+            (list (string=? commit (head-commit directory))
+                  (download-cache-reachable? cache)))))))))
 
 (test-end "download-cache")
