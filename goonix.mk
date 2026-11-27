@@ -18,6 +18,7 @@ MODULES +=					\
   guix/ca/opaque.scm				\
   guix/ca/files.scm				\
   guix/download-cache.scm			\
+  guix/download-cache/git.scm			\
   guix/daemon-sessions.scm			\
   guix/goonix-protocol.scm			\
   guix/ca/scan.scm				\

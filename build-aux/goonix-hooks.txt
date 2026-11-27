@@ -8,6 +8,7 @@ gnu/local.mk 4 0
 guix/config.scm.in 4 0
 guix/derivations.scm 42 2
 guix/gexp.scm 41 9
+guix/git.scm 21 8
 guix/grafts.scm 23 8
 guix/inferior.scm 6 1
 guix/packages.scm 26 2
@@ -16,7 +17,7 @@ guix/scripts/build.scm 22 2
 guix/scripts/deploy.scm 4 1
 guix/scripts/environment.scm 2 0
 guix/scripts/home.scm 6 1
-guix/scripts/perform-download.scm 3 1
+guix/scripts/perform-download.scm 13 7
 guix/scripts/processes.scm 14 4
 guix/scripts/publish.scm 46 0
 guix/scripts/shell.scm 21 6
