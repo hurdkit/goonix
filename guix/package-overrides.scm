@@ -11,6 +11,7 @@
 
 (define-module (guix package-overrides)
   #:use-module (guix monads)
+  #:use-module (guix ca parameters)
   #:use-module (ice-9 match)
   #:use-module (srfi srfi-1)
   #:export (%package-overrides
@@ -27,6 +28,14 @@
 ;;; While a replacement is lowered, whatever it replaces stays itself, so a
 ;;; replacement can be built on top of its original.  That holds however
 ;;; the replacement is reached, through its original or by name.
+;;;
+;;; The narrowed list is in force only while control is inside the
+;;; replacement's lowering.  A build accumulator suspends an item that
+;;; requests a build and lowers the other items before it resumes the first
+;;; one; under the adopted policy adopting a replacement requests one.  The
+;;; other items keep the overrides of the place they are lowered from, and
+;;; the replacement finds its narrowed list again when it resumes (see (guix
+;;; ca parameters)).
 ;;;
 ;;; (guix packages) has three hooks for this: the procedures that lower a
 ;;; package are passed through 'overridable', and the key under which each
@@ -84,6 +93,14 @@ no such pair."
               rest)))
       overrides))
 
+(define (narrowing-binder)
+  "Return the procedure that sets the narrowed overrides around the lowering
+of a replacement: the one (guix ca policy) chooses for the current policy."
+  ;; (guix ca policy) uses (guix packages), which uses this module, so the
+  ;; procedure is looked up when a package is lowered, as (guix packages)
+  ;; looks up the policy's part of its cache key.
+  ((module-ref (resolve-interface '(guix ca policy)) 'parameter-binder)))
+
 (define (overridable lower)
   "Return a procedure like LOWER, which takes a package and more arguments
 and returns its derivation in the store monad, that heeds
@@ -99,7 +116,8 @@ and returns its derivation in the store monad, that heeds
               (rest    (without-pairs-to package overrides)))
          (if (eq? rest overrides)
              (apply lower package arguments)
-             (state-parameterize ((%package-overrides rest))
+             (state-parameterize/with (narrowing-binder)
+                 ((%package-overrides rest))
                (apply lower package arguments))))))))
 
 ;;; package-overrides.scm ends here

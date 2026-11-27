@@ -4,6 +4,7 @@
 
 MODULES +=					\
   guix/pure-eval.scm				\
+  guix/ca/parameters.scm			\
   guix/package-overrides.scm			\
   guix/ca.scm					\
   guix/ca/derivation.scm				\
