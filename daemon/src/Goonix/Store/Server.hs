@@ -21,7 +21,7 @@ module Goonix.Store.Server
 
 import Control.Concurrent (forkFinally)
 import Control.Concurrent.STM (TVar, atomically, check, modifyTVar', newTVarIO, readTVar, readTVarIO, writeTVar)
-import Control.Exception (IOException, SomeException, bracket, bracket_, catch, finally, fromException, throwIO, try)
+import Control.Exception (Exception, IOException, SomeException, bracket, bracket_, catch, finally, fromException, throwIO, try)
 import Control.Monad (unless, when)
 import Data.Bits ((.&.))
 import Data.ByteString (ByteString)
@@ -297,6 +297,21 @@ temporaryRootsPath config = configStateDirectory config <> "/temproots"
 storeGcLockPath :: ServerConfig -> ByteString
 storeGcLockPath config = configStateDirectory config <> "/gc.lock"
 
+-- | An operation that this daemon does not serve to the client that sent it:
+-- one that it does not have, one of goonix from a client that did not give
+-- the signal, or the session query from a remote client.  The client is told
+-- "invalid operation N" and the connection ends: nothing of the operation was
+-- read, so what follows it on the connection cannot be told from the next
+-- operation.  The C++ daemon does the same, as upstream's: the error is
+-- thrown before startWork, and processConnection sends it and stops
+-- (nix-daemon.cc, "if (!errorAllowed) throw").
+newtype InvalidOperation = InvalidOperation Word32
+
+instance Show InvalidOperation where
+  show (InvalidOperation operation) = "invalid operation " ++ show operation
+
+instance Exception InvalidOperation
+
 handleConnection :: ServerConfig -> Session -> Store -> Socket -> IORef Settings -> Fd -> ByteString -> IO ()
 handleConnection config session store client settingsRef rootFd rootPath = do
   magic <- readIntSocket client
@@ -327,9 +342,14 @@ handleConnection config session store client settingsRef rootFd rootPath = do
                 Just Collector.GCLimitReached -> throwIO exception
                 Nothing -> pure ()
               case fromException exception of
-                Just (StoreError message status) -> writeSocket client (encodeInt stderrError <> encodeString message <> if clientVersion .&. 0xff >= 8 then encodeInt status else B.empty)
-                Nothing -> writeSocket client (encodeInt stderrError <> encodeString (C.pack (show (exception :: SomeException))) <> encodeInt 1)
-              loop clientVersion
+                Just refusal@(InvalidOperation _) ->
+                  -- Tell the client and end the connection.
+                  writeSocket client (encodeInt stderrError <> encodeString (C.pack (show refusal)) <> if clientVersion .&. 0xff >= 8 then encodeInt 1 else B.empty)
+                Nothing -> do
+                  case fromException exception of
+                    Just (StoreError message status) -> writeSocket client (encodeInt stderrError <> encodeString message <> if clientVersion .&. 0xff >= 8 then encodeInt status else B.empty)
+                    Nothing -> writeSocket client (encodeInt stderrError <> encodeString (C.pack (show (exception :: SomeException))) <> encodeInt 1)
+                  loop clientVersion
             Right () -> loop clientVersion
 
 dispatch :: ServerConfig -> Session -> Store -> Socket -> IORef Settings -> Fd -> ByteString -> Word32 -> Word32 -> IO ()
@@ -337,7 +357,7 @@ dispatch config session store client settingsRef rootFd rootPath clientVersion o
   -- goonix: for a client that did not give the signal, an operation of the
   -- fork is one that does not exist (Wire.hs).  Nothing of it is read.
   _ | goonixPeerLevel clientVersion < goonixOperationLevel operation ->
-      throwIO (StoreError (C.pack ("invalid operation " ++ show operation)) 1)
+      throwIO (InvalidOperation operation)
   19 -> do
     settings <- readIORef settingsRef
     fields <- readSetOptions client clientVersion
@@ -560,11 +580,11 @@ dispatch config session store client settingsRef rootFd rootPath clientVersion o
   -- operation that does not exist; the C++ daemon does the same.
   85 -> do
     settings <- readIORef settingsRef
-    when (remote settings) (throwIO (StoreError "invalid operation 85" 1))
+    when (remote settings) (throwIO (InvalidOperation operation))
     report <- sessionReport session (trusted settings)
     writeFrame client stderrLast
     writeSocket client (encodeStrings report)
-  _ -> throwIO (StoreError (C.pack ("invalid operation " ++ show operation)) 1)
+  _ -> throwIO (InvalidOperation operation)
   where
     readDerivationFile path = do
       bytes <- B.readFile (C.unpack path)

@@ -1,10 +1,10 @@
 ;; The second client of sessions.sh: one that gives no goonix signal in its
 ;; greeting, as a client of upstream.  For such a client the operations of
 ;; goonix do not exist: the daemon answers operation 85 as it answers an
-;; operation that no daemon has, and reads nothing after it.  The greeting
-;; and the questions are written here byte by byte.
+;; operation that no daemon has, reads nothing after it, and ends the
+;; connection.  The greeting and the questions are written here byte by byte.
 (use-modules (guix store) (guix remote-procedures) (guix serialization)
-             (ice-9 match)
+             (ice-9 binary-ports) (ice-9 match)
              (srfi srfi-11) (srfi srfi-34))
 
 (define (say . text) (for-each display text) (newline) (force-output))
@@ -93,6 +93,35 @@ version and nothing above it.  Return the port and the word the daemon sent."
   (other
    (assert #f "the daemon did not refuse operation 99: " other)))
 (say "refused as an operation that does not exist")
+
+(define (after-refusal operation)
+  "Send OPERATION and nothing after it, and keep this side of the connection
+open.  Return 'ended if the daemon refuses it and then ends the connection,
+'open if the connection is still there some seconds after the refusal, or
+what else happened."
+  (let-values (((port daemon) (greet)))
+    (write-int operation port)
+    (force-output port)
+    (let ((result
+           (if (= %stderr-error (read-int port))
+               (begin
+                 (read-maybe-utf8-string port)
+                 (read-int port)                  ;status
+                 (match (select (list port) '() '() 10)
+                   (((_) _ _)
+                    (if (eof-object? (get-u8 port)) 'ended 'more-was-sent))
+                   (_ 'open)))
+               'not-refused)))
+      (close-port port)
+      result)))
+
+;; A daemon that refused an operation read nothing of it; what the client
+;; sends next could be the rest of it.  Upstream's daemon ends the connection.
+(let ((ends (map after-refusal '(99 85))))
+  (assert (equal? ends '(ended ended))
+          "after refusing operations 99 and 85 the connection is " ends
+          ", not ended"))
+(say "the connection ended after each refusal")
 
 ;; The same client is served what upstream has.
 (let-values (((port daemon) (greet)))

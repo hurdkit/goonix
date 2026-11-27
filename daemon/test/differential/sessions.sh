@@ -31,7 +31,8 @@
 # a second client, which gives no signal in its greeting, as a client of
 # upstream: the daemon announces to it the protocol version of this tree's
 # client, refuses it operation 85 exactly as it refuses an operation that no
-# daemon has, and serves it what upstream has.
+# daemon has, ends the connection after each of the two refusals, and serves
+# it what upstream has.
 #
 # Usage: sessions.sh [DAEMON] [FIXTURE]
 set -euo pipefail
@@ -114,6 +115,8 @@ goonix_run_capped "$root/pre-inst-env" guile --no-auto-compile \
 test "$status" -eq 0 || fail "the client without the signal ended with status $status"
 grep -Fqx 'refused as an operation that does not exist' "$fixture/no-signal.log" \
   || fail "a client without the signal was not refused operation 85"
+grep -Fqx 'the connection ended after each refusal' "$fixture/no-signal.log" \
+  || fail "a connection was kept after an operation was refused on it"
 grep -Fqx "served upstream's operations" "$fixture/no-signal.log" \
   || fail "a client without the signal was not served"
 if test "$SESSIONS_EXPECT" = report; then

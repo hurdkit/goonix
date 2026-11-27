@@ -119,8 +119,8 @@ third: for this daemon the sessions it reports, for the C++ daemon its
 answer without sessions, and for both that the other connections are served,
 that `(guix daemon-sessions)` asks and reads the answer, and that nothing is
 refused. A second client then gives no signal in its greeting: for both
-daemons it is refused the operation as one that does not exist, and served
-what upstream has.
+daemons it is refused the operation as one that does not exist, the
+connection it asked on is ended, and it is served what upstream has.
 
 Because it is one process, the daemon also creates the store and state
 directories once at start-up (`initialiseState`) rather than per client as the
