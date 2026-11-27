@@ -16,6 +16,7 @@
   #:use-module (guix gexp)
   #:use-module (guix ca)
   #:use-module (guix ca adopt)
+  #:use-module (guix ca opaque)
   #:use-module (guix ca scan)
   #:use-module (guix ca policy)
   #:use-module (guix sets)
@@ -23,6 +24,7 @@
   #:use-module (guix derivations)
   #:use-module (guix monads)
   #:use-module (gnu packages bootstrap)
+  #:use-module (ice-9 match)
   #:use-module (ice-9 textual-ports)
   #:use-module (srfi srfi-1)
   #:use-module (srfi srfi-64))
@@ -284,6 +286,65 @@
       (test-assert "the adopted output is registered and references that input"
         (and (valid-path? store path)
              (member opaque-path (references store path)))))))
+
+(test-group "an item the opaque table names is not adopted through a dependent"
+  ;; An adopted dependent's references are adopted recursively.  An item the
+  ;; opaque table (guix ca opaque) names is refused there as glibc is: it is
+  ;; returned unchanged, no graft is made for it, and the dependent's adopted
+  ;; output keeps the reference to its input-addressed path.  The table
+  ;; exists because the scanner cannot see every self path, so a clean scan
+  ;; does not overrule it: these fixtures scan clean.  Each fixture is named
+  ;; as its entry's package derivation would be (name, then a version), and
+  ;; the dependent references it as a derivation input, as util-linux
+  ;; references file.
+  (define (entry->derivation-name entry)
+    (match entry
+      ((name) (fresh-name name))
+      ((name version) (string-append name "-" version))))
+  (define (adopt-dependent-of item-name)
+    ;; Return the item, its output, the adopted dependent and its output.
+    (let* ((item (ia-plain item-name (fresh-name "opaque-table-item")))
+           (_ (build-derivations store (list item)))
+           (dependent (ia-ref (fresh-name "adopt-table-dependent") item "DEP"))
+           (_ (build-derivations store (list dependent)))
+           (adopted (adopt-derivation store dependent #:guile guile-drv)))
+      (build-derivations store (list adopted))
+      (values item (realised item) adopted (realised adopted))))
+  (for-each
+   (lambda (entry)
+     (let ((label (car entry)))
+       (call-with-values
+           (lambda () (adopt-dependent-of (entry->derivation-name entry)))
+         (lambda (item item-path adopted adopted-path)
+           (test-assert (string-append "the " label " fixture scans clean")
+             (not (item-flagged? store item-path)))
+           (test-assert (string-append label " is not adopted (returned unchanged)")
+             (eq? item (adopt-derivation store item #:guile guile-drv)))
+           (test-equal (string-append "the dependent of " label
+                                      " is adopted content-addressed")
+             "content" (assoc-ref (derivation-builder-environment-vars adopted)
+                                  "goonixAddressing"))
+           (test-equal (string-append "the adopted dependent still names the"
+                                      " input-addressed " label)
+             (string-append item-path "/DEP") (read-all adopted-path))
+           (test-equal (string-append "the adopted dependent references the"
+                                      " input-addressed " label " alone")
+             (list item-path) (references store adopted-path))))))
+   %opaque-packages)
+  ;; Matching is by the derivation's parsed name, not a prefix:
+  ;; commencement's file-boot0 is not in the table, and its adoption graft is
+  ;; accepted (DECISIONS 93).
+  (call-with-values
+      (lambda () (adopt-dependent-of (fresh-name "file-boot0")))
+    (lambda (item item-path adopted adopted-path)
+      (test-assert "file-boot0 is adopted (a graft, not the original)"
+        (not (eq? item (adopt-derivation store item #:guile guile-drv))))
+      (test-assert "the adopted dependent of file-boot0 references its adopted copy"
+        (let ((refs (references store adopted-path)))
+          (and (= 1 (length refs))
+               (not (member item-path refs))
+               (string=? (read-all adopted-path)
+                         (string-append (car refs) "/DEP"))))))))
 
 (close-connection store)
 (test-end "ca-adopt")

@@ -149,6 +149,80 @@ has added anything to the store.  See 'assert-goonix-daemon'."
     (assert-goonix-daemon store name)
     (mvalue store)))
 
+;;; Parameters and suspended lowerings.
+;;;
+;;; (guix monads)'s state-with-parameters sets its parameters globally when
+;;; its monadic value starts and resets them once the value has returned, and
+;;; a gexp's lowering switches grafting the same way (set-grafting).  A build
+;;; handler can leave a value in the middle: a build accumulator
+;;; (map/accumulate-builds in guix/store.scm) suspends the item that requests
+;;; a build, goes on with the other items, and resumes the first one after
+;;; the builds.  Plain lowering requests builds in few places.  Under the
+;;; adopted policy every adoption requests one, so a value is suspended while
+;;; its settings are in force, and the other items of the accumulator were
+;;; lowered with them: with grafting off, when the suspended value was a gexp
+;;; lowered without grafts, or with the addressing and name of a suspended
+;;; package.  The procedures below set parameters for exactly the time
+;;; control spends inside a value.
+
+(define (swapping-parameters parameters initial mvalue)
+  "Return a value in the state monad that runs MVALUE with PARAMETERS, a list
+of parameters, set while control is inside MVALUE and only then.  INITIAL is
+a thunk returning the values to start from; it is called when MVALUE is first
+entered.  Whenever control leaves MVALUE, because it returned or because a
+build handler suspended it, the parameters get back the values they had
+outside; when a suspended MVALUE is resumed, they get back the values they
+had inside it."
+  (lambda (state)
+    (let ((inside #f)
+          (outside #f))
+      (define (current)
+        (map (lambda (parameter) (parameter)) parameters))
+      (define (install! settings)
+        (for-each (lambda (parameter setting) (parameter setting))
+                  parameters settings))
+      (dynamic-wind
+        (lambda ()
+          (set! outside (current))
+          (install! (or inside (initial))))
+        (lambda ()
+          (mvalue state))
+        (lambda ()
+          (set! inside (current))
+          (install! outside))))))
+
+(define (state-with-parameters/suspendable parameters values mvalue)
+  "Like state-with-parameters, for an MVALUE that a build handler may suspend:
+PARAMETERS have VALUES only while control is inside MVALUE."
+  (swapping-parameters parameters (const values) mvalue))
+
+(define (state-keeping-parameters parameters mvalue)
+  "Run MVALUE; what it does to PARAMETERS is in force only while control is
+inside it."
+  (swapping-parameters parameters
+                       (lambda ()
+                         (map (lambda (parameter) (parameter)) parameters))
+                       mvalue))
+
+(define (parameter-binder)
+  "Return the procedure that sets parameters around a monadic value under the
+current policy.  Only the adopted policy requests builds inside these values,
+so the others keep state-with-parameters."
+  (if (eq? (%package-addressing-policy) 'adopted)
+      state-with-parameters/suspendable
+      state-with-parameters))
+
+(define-syntax-rule (state-parameterize/with binder ((param value) ...)
+                                             body ...)
+  ;; state-parameterize of (guix monads), with BINDER in the place of
+  ;; state-with-parameters.
+  (let ((parameters (list param ...))
+        (values (list value ...)))
+    (binder parameters values
+            (with-fluids* (map parameter-fluid parameters) values
+              (lambda ()
+                (mbegin %state-monad body ...))))))
+
 (define (lower-bag-with-addressing lower bag . arguments)
   "Apply the package's own addressing around its bag build, after inputs.
 Under the 'adopted policy an ordinary upstream package's input-addressed
@@ -163,41 +237,58 @@ No direct-opaque or glibc-specific dependent promotion is applied."
                         (bootstrap-package? context))))
               (adopt? (adopt-package? context)))
           (let ((lowered
-                 (state-parameterize ((%package-addressing addressing)
-                                      (%package-derivation-name (bag-name bag)))
-                   (let ((drv
-                          (if opaque-input?
-                              ;; Keep the complete upstream derivation, not
-                              ;; just its top-level marker: nested gexps and
-                              ;; packages must be input-addressed too, so the
-                              ;; original output path and its substitutes
-                              ;; remain usable.
-                              (state-parameterize ((%package-addressing-policy
-                                                    'input))
-                                (apply lower bag arguments))
-                              (apply lower bag arguments))))
-                     (if adopt?
-                         (adopt-lowered-derivation lower bag arguments drv)
-                         drv)))))
+                 (state-parameterize/with (parameter-binder)
+                     ((%package-addressing addressing)
+                      (%package-derivation-name (bag-name bag)))
+                   (cond (adopt?
+                          (adopt-lowered-derivation lower bag arguments))
+                         (opaque-input?
+                          ;; Keep the complete upstream derivation, not just
+                          ;; its top-level marker: nested gexps and packages
+                          ;; must be input-addressed too, so the original
+                          ;; output path and its substitutes remain usable.
+                          (input-lowering lower bag arguments))
+                         (else
+                          (apply lower bag arguments))))))
             ;; Upstream's addressing under upstream's policy is upstream's
             ;; lowering, as it was.  Anything else is for a goonix daemon,
-            ;; and is refused before the bag's inputs are lowered.
+            ;; and is refused before the bag's inputs are lowered.  The check
+            ;; runs outside the binder and sets no parameter: when it raises,
+            ;; no parameter of the binder has been set yet.
             (if (and (eq? addressing 'input)
                      (eq? (%package-addressing-policy) 'input))
                 lowered
                 (goonix-daemon-only (bag-name bag) lowered))))
         (apply lower bag arguments))))
 
-(define (adopt-lowered-derivation lower bag arguments drv)
-  "Adopt DRV, the monadic input-addressed derivation of an upstream package
-under the 'adopted policy.  DRV is built with input-addressed inputs (the
-upstream graph); adoption then rewrites its references to adopted items.  If
+(define (input-lowering lower bag arguments)
+  "Return the monadic input-addressed lowering of BAG: upstream's derivation,
+its nested gexps and package inputs included.
+
+goonix: the monadic value is BUILT inside the 'input extent, not only run
+there.  LOWER asks for the derivation of the bag's first input while it
+builds its value, and of the others as the lowering runs (mapm over
+expand-input in guix/packages.scm); a request for a package computes its
+cache key at once, the policy included (package-addressing-key).  A value
+built under 'adopted and run under 'input therefore looked a first input
+that is a package up under the 'adopted key.  It then took that input's
+adoption where a running 'adopted policy had cached one, and the daemon
+refused the input-addressed dependent; where none was cached it filed the
+input's input-addressed derivation under the 'adopted key, which a package
+built from source found later in place of the adoption.  Either way the
+result depended on what the connection had lowered before."
+  (state-parameterize ((%package-addressing-policy 'input))
+    (apply lower bag arguments)))
+
+(define (adopt-lowered-derivation lower bag arguments)
+  "Lower BAG, the bag of an upstream package under the 'adopted policy,
+input-addressed, with input-addressed inputs (the upstream graph), and adopt
+that derivation; adoption then rewrites its references to adopted items.  If
 the scanner flags the item, re-lower the item ITSELF content-addressed from
 source instead; its inputs keep the 'adopted treatment.  An opaque item is
 excluded by adopt-package? and does not enter this path."
   (with-monad %store-monad
-    (>>= (state-parameterize ((%package-addressing-policy 'input))
-           drv)
+    (>>= (input-lowering lower bag arguments)
          (lambda (d)
            (lambda (store)
              (let ((adopt ((module-ref (resolve-module '(guix ca adopt))
@@ -205,6 +296,10 @@ excluded by adopt-package? and does not enter this path."
                            store d)))
                (if (eq? adopt d)
                    ;; Flagged item: build it content-addressed from source.
+                   ;; (adopt-derivation also returns an item the opaque
+                   ;; table names unchanged, but adopt-package? keeps such a
+                   ;; package out of this path, so only flagged and
+                   ;; glibc-named items arrive here.)
                    ;;
                    ;; goonix: only the item's OWN derivation is content.
                    ;; LOWER is the plain bag lowerer, so the item does not
@@ -226,9 +321,10 @@ excluded by adopt-package? and does not enter this path."
                    ;; Table/property opaque items do not enter this path;
                    ;; adopt-package? excludes them before this fallback.
                    (values (run-with-store store
-                             (state-parameterize ((%package-addressing-policy
-                                                   'adopted)
-                                                  (%package-addressing 'content))
+                             (state-parameterize/with
+                                 state-with-parameters/suspendable
+                                 ((%package-addressing-policy 'adopted)
+                                  (%package-addressing 'content))
                                (apply lower bag arguments)))
                            store)
                    (values adopt store))))))))
@@ -312,13 +408,26 @@ input-addressed derivation (a graft, say) leaves its derivation upstream's."
          (arguments (if (memq #:addressing arguments)
                         (strip-keyword arguments #:addressing)
                         arguments)))
-    (let ((lowered
-           (state-parameterize ((%package-derivation-name #f))
-             (apply lower name exp
-                    (append arguments (list #:addressing requested))))))
+    (let* ((lowering
+            (state-parameterize/with (if (eq? policy 'adopted)
+                                         state-with-parameters/suspendable
+                                         state-with-parameters)
+                ((%package-derivation-name #f))
+              (apply lower name exp
+                     (append arguments (list #:addressing requested)))))
+           ;; LOWER switches grafting for the gexp and back (set-grafting).
+           ;; Under the adopted policy the gexp can be suspended in between:
+           ;; its default guile and its extensions are lowered outside the
+           ;; build accumulator of its inputs, and each is an adoption.  The
+           ;; gexp's setting must not be the one its siblings are lowered
+           ;; with.
+           (lowered (if (eq? policy 'adopted)
+                        (state-keeping-parameters (list %graft?) lowering)
+                        lowering)))
       ;; Upstream's addressing under upstream's policy is upstream's lowering,
       ;; as it was.  Anything else is for a goonix daemon, and is refused
-      ;; before the expression is lowered.
+      ;; before the expression is lowered, outside the setting of %graft? and
+      ;; the derivation name: the check sets no parameter.
       (if (and (eq? requested 'input) (eq? policy 'input))
           lowered
           (goonix-daemon-only name lowered)))))
