@@ -693,7 +693,12 @@ first established."
 thus be the code of a one-argument procedure that accepts a store."
   (let* ((major    (store-connection-major-version store))
          (minor    (store-connection-minor-version store))
-         (proto    (logior major minor))
+         ;; goonix: the word also says which level STORE's daemon gave, so
+         ;; that the inferior's connection has it; upstream's
+         ;; 'port->connection' keeps the major and minor version of the word.
+         (proto    ((@ (guix goonix-protocol) version-word-with-level)
+                    (logior major minor)
+                    ((@ (guix store) store-connection-goonix-level) store)))
 
          ;; The address of STORE itself is not a good identifier because it
          ;; keeps changing through the use of "functional caches".  The

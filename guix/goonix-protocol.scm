@@ -17,6 +17,7 @@
 
 (define-module (guix goonix-protocol)
   #:export (goonix-version-word
+            version-word-with-level
             version-word-goonix-level
             goonix-operation-level
             goonix-level-knows?
@@ -49,6 +50,12 @@
 ;;; it to a daemon below that level, and the daemon answers one from a client
 ;;; below that level as it answers an operation that does not exist.
 ;;;
+;;; A connection can be handed to another process, which exchanges no
+;;; greeting of its own: an inferior, or the program that computes the
+;;; derivation of a channel.  That process is told the version of the
+;;; connection in one word, and a goonix client puts the daemon's level in
+;;; that word in the same way, so that the level goes with the connection.
+;;;
 ;;; Code:
 
 (define %tag
@@ -72,13 +79,24 @@
   ;; "goonix-deep-scan" with 'set-build-options'.
   1)
 
+(define (version-word-with-level version level)
+  "Return the word that says, to a process that is handed a connection, the
+protocol VERSION of that connection and the goonix LEVEL its daemon gave:
+VERSION as it is for level 0, which is what upstream writes, and otherwise
+VERSION in the bits upstream reads with the tag and LEVEL above them.
+'port->connection' reads the level back with 'version-word-goonix-level';
+upstream's keeps the major and minor version and nothing else."
+  (if (zero? level)
+      version
+      (logior (logand version #xffff)
+              (ash level 16)
+              (ash %tag 24))))
+
 (define (goonix-version-word version)
   "Return the word that this client sends as its version in the greeting:
 VERSION, the protocol version, in the bits upstream reads, and above them the
 tag and the level of a goonix peer."
-  (logior (logand version #xffff)
-          (ash %level 16)
-          (ash %tag 24)))
+  (version-word-with-level version %level))
 
 (define (version-word-goonix-level word)
   "Return the goonix level that WORD carries, a version word as a peer sent
