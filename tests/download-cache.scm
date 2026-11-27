@@ -16,17 +16,20 @@
 ;;; You should have received a copy of the GNU General Public License
 ;;; along with GNU Guix.  If not, see <http://www.gnu.org/licenses/>.
 
-;;; goonix: the built-in download asks the download cache first.
+;;; goonix: the built-in download asks the download cache first.  The
+;;; cache's copies of Git repositories are addressed as below.
 
 (define-module (test-download-cache)
   #:use-module (guix download-cache)
   #:use-module (guix base32)
   #:use-module ((guix download) #:select (url-fetch))
+  #:use-module (guix git-download)
   #:use-module (guix derivations)
   #:use-module (guix monads)
   #:use-module (guix store)
   #:use-module (guix tests)
   #:use-module (guix tests http)
+  #:use-module ((guix utils) #:select (with-environment-variables))
   #:use-module ((guix build utils)
                 #:select (call-with-temporary-output-file))
   #:use-module ((gcrypt hash) #:select (sha256))
@@ -130,5 +133,89 @@ daemon runs, 'guix perform-download', in an environment where CACHE, a URL or
   content
   (with-http-server `(("/origin/cached-file.txt" 200 ,content))
     (download (%local-url #:path "/origin/cached-file.txt") #f)))
+
+;;;
+;;; Git repositories: their address in the cache.
+;;;
+
+(define (unused-port)
+  "Return a TCP port of the loopback interface that nothing listens on."
+  (let ((sock (socket PF_INET SOCK_STREAM 0)))
+    (bind sock AF_INET INADDR_LOOPBACK 0)
+    (let ((port (sockaddr:port (getsockname sock))))
+      (close-port sock)
+      port)))
+
+(define (unreachable-url path)
+  "Return an HTTP URL ending in PATH on a port where nothing listens."
+  (string-append "http://127.0.0.1:" (number->string (unused-port)) path))
+
+(test-equal "address of a Git repository in the cache"
+  "http://cache.example:8480/git/https/git.savannah.gnu.org/git/sed.git"
+  (download-cache-git-url "http://cache.example:8480/"
+                          "https://git.savannah.gnu.org/git/sed.git"))
+
+(test-equal "no address for a repository that a cache does not serve"
+  '(#f #f #f #f #f #f #f #f #f)
+  (map (lambda (cache url)
+         (download-cache-git-url cache url))
+       '(#f "" "http://cache.example" "http://cache.example"
+         "http://cache.example" "http://cache.example" "http://cache.example"
+         "file:///srv/cache" "http://cache.example")
+       '("https://example.org/r.git" "https://example.org/r.git"
+         "git://example.org/r.git" "https://user@example.org/r.git"
+         "https://example.org/r.git?x=y" "https://example.org/a/../r.git"
+         "ssh://example.org/r.git" "https://example.org/r.git"
+         "file:///srv/r.git")))
+
+(test-equal "a file cache and file repositories, for tests only"
+  "file:///srv/cache/git/file//srv/r.git"
+  (parameterize ((%download-cache-local-files? #t))
+    (download-cache-git-url "file:///srv/cache" "file:///srv/r.git")))
+
+(test-equal "a cache that cannot be reached is found out, once a process"
+  '(#f #f)
+  (let* ((port  (unused-port))
+         (cache (string-append "http://127.0.0.1:" (number->string port))))
+    (let ((first (download-cache-reachable? cache))
+          (sock  (socket PF_INET SOCK_STREAM 0)))
+      ;; Something listens there now, but the answer kept is the first.
+      (setsockopt sock SOL_SOCKET SO_REUSEADDR 1)
+      (bind sock AF_INET INADDR_LOOPBACK port)
+      (listen sock 1)
+      (let ((second (download-cache-reachable? cache)))
+        (close-port sock)
+        (list first second)))))
+
+(test-assert "a cache that listens can be reached"
+  (let ((sock (socket PF_INET SOCK_STREAM 0)))
+    (bind sock AF_INET INADDR_LOOPBACK 0)
+    (listen sock 1)
+    (let ((answer (download-cache-reachable?
+                   (string-append "http://127.0.0.1:"
+                                  (number->string
+                                   (sockaddr:port (getsockname sock)))))))
+      (close-port sock)
+      answer)))
+
+(test-assert "derivations are the same with and without a cache"
+  (let ((git   (lambda ()
+                 (derivation-file-name
+                  (run-with-store %store
+                    (git-fetch (git-reference
+                                (url "https://example.org/r.git")
+                                (commit "v1.0"))
+                               'sha256 hash "r-checkout")))))
+        (plain (lambda ()
+                 (derivation-file-name
+                  (run-with-store %store
+                    (url-fetch "https://example.org/r.tar.gz" 'sha256 hash
+                               "r.tar.gz"))))))
+    (let ((without (list (git) (plain)))
+          (with    (with-environment-variables
+                       '(("GOONIX_DOWNLOAD_CACHE" "http://cache.example"))
+                     (parameterize ((%download-cache "http://cache.example"))
+                       (list (git) (plain))))))
+      (equal? without with))))
 
 (test-end "download-cache")

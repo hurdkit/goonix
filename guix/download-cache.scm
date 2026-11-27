@@ -19,13 +19,19 @@
 (define-module (guix download-cache)
   #:use-module (guix base32)
   #:use-module ((guix build utils) #:select (strip-store-file-name))
+  #:autoload   (guix build download) (open-socket-for-uri)
   #:use-module (web uri)
   #:use-module (srfi srfi-1)
   #:use-module (srfi srfi-26)
   #:use-module (ice-9 match)
   #:export (%download-cache
             download-cache-url
-            cache-first))
+            cache-first
+
+            %download-cache-local-files?
+            %download-cache-connection-timeout
+            download-cache-git-url
+            download-cache-reachable?))
 
 ;;; Commentary:
 ;;;
@@ -38,6 +44,9 @@
 ;;; file by its hash and carries the file's URLs, so that a cache that lacks
 ;;; the file can fetch and keep it.  The daemon checks the hash of what it
 ;;; gets, as for any download, so the cache need not be trusted.
+;;;
+;;; The cache also keeps copies of Git repositories; the procedures below
+;;; give a copy's address and tell whether the cache can be reached at all.
 ;;; doc/goonix/download-cache.md describes what a cache must serve.
 ;;;
 ;;; Code:
@@ -102,5 +111,66 @@ that comes with the derivation, or #f."
                                                   urls))))
       (#f url)
       (first (cons first urls)))))
+
+;;;
+;;; Git repositories.
+;;;
+
+(define %download-cache-local-files?
+  ;; For tests only: also accept a file:// cache, and file:// repositories.
+  (make-parameter #f))
+
+(define %download-cache-connection-timeout
+  ;; Seconds to wait for a connection to the cache before going without it.
+  (make-parameter 3))
+
+(define (download-cache-git-url cache url)
+  "Return the URL at which CACHE, the base URL of a download cache or #f,
+serves its copy of the Git repository at URL, or #f if it serves none.  The
+address is URL with \"://\" written \"/\", below \"/git/\": the copy of
+https://example.org/x.git is at CACHE/git/https/example.org/x.git."
+  (define schemes
+    (if (%download-cache-local-files?) '(http https file) '(http https)))
+
+  (match (and cache (not (string-null? cache))
+              (list (string->uri cache) (string->uri url)))
+    (((? uri? base) (? uri? origin))
+     (let ((scheme (symbol->string (uri-scheme origin))))
+       (and (memq (uri-scheme base) schemes)
+            (memq (uri-scheme origin) schemes)
+            (not (uri-userinfo origin))
+            (not (uri-query origin))
+            (not (uri-fragment origin))
+            (string-prefix? (string-append scheme "://") url)
+            (not (any (cut member <> '("." ".."))
+                      (string-split (uri-path origin) #\/)))
+            (string-append (string-trim-right cache #\/) "/git/" scheme "/"
+                           (string-drop url (+ 3 (string-length scheme)))))))
+    (_ #f)))
+
+(define download-cache-reachable?
+  (let ((answers '()))
+    (lambda (cache)
+      "Return true if a connection to CACHE, the base URL of a download
+cache, can be made within %DOWNLOAD-CACHE-CONNECTION-TIMEOUT seconds.  The
+answer is kept for the rest of the process, so that a cache that cannot be
+reached costs one wait, not one per repository."
+      (match (assoc cache answers)
+        ((_ . answer) answer)
+        (#f
+         (let* ((uri    (string->uri cache))
+                (answer (match (and uri (uri-scheme uri))
+                          ('file (file-exists? (uri-path uri)))
+                          ((or 'http 'https)
+                           (false-if-exception
+                            (begin
+                              (close-port
+                               (open-socket-for-uri
+                                uri #:timeout
+                                (%download-cache-connection-timeout)))
+                              #t)))
+                          (_ #f))))
+           (set! answers (alist-cons cache answer answers))
+           answer))))))
 
 ;;; download-cache.scm ends here
