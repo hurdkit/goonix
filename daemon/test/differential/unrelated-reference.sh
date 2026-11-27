@@ -23,7 +23,8 @@
 # registered yet.
 #
 # Usage: unrelated-reference.sh [DAEMON] [FIXTURE]
-# Runs against DAEMON (default the daemon of this tree); both daemons pass.
+# Runs against DAEMON (default the daemon of this tree); both daemons must
+# pass it.
 set -euo pipefail
 root=$(CDPATH= cd -- "$(dirname "$0")/../../.." && pwd)
 . "$root/daemon/test/lib.sh"
