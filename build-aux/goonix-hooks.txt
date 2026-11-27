@@ -1,6 +1,7 @@
 # Upstream files that goonix changes, with the lines added and removed.
 # Checked by build-aux/check-goonix-hooks.sh; rewrite with --record.
 Makefile.am 5 0
+build-aux/build-self.scm 23 2
 build-aux/pre-inst-env.in 3 0
 config-daemon.ac 7 0
 gnu/local.mk 4 0
@@ -8,6 +9,7 @@ guix/config.scm.in 4 0
 guix/derivations.scm 42 2
 guix/gexp.scm 41 9
 guix/grafts.scm 23 8
+guix/inferior.scm 6 1
 guix/packages.scm 26 2
 guix/remote-procedures.scm 30 0
 guix/scripts/build.scm 22 2

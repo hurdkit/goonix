@@ -231,6 +231,25 @@ Display a spinner when nothing happens."
   "Evaluate EXP in a context where zero environment variables are defined."
   (call-with-clean-environment (lambda () exp ...)))
 
+;; goonix: the version of STORE's connection and, when the calling Guix
+;; keeps it, the level that the connection's daemon gave in the greeting, in
+;; one word.  The build program reads the word with its own
+;; 'port->connection'; upstream's keeps the major and minor version of it.
+;; A calling Guix that has no such level, upstream's or an earlier goonix,
+;; gets its major and minor version alone, as before: what it lacks makes
+;; the expression below fail, when it is expanded or when it is called.
+(define (connection-version-word store)
+  (let ((version (logior (nix-server-major-version store)
+                         (nix-server-minor-version store))))
+    (or (false-if-exception
+         ((eval '(lambda (version store)
+                   ((@ (guix goonix-protocol) version-word-with-level)
+                    version
+                    ((@ (guix store) store-connection-goonix-level) store)))
+                (current-module))
+          version store))
+        version)))
+
 ;; The procedure below is our return value.
 (define* (build source
                 #:key verbose?
@@ -266,7 +285,9 @@ files."
                       ;; caller might be Guix <= 0.16.0.
                       (port   ((store-lift nix-server-socket)))
                       (major  ((store-lift nix-server-major-version)))
-                      (minor  ((store-lift nix-server-minor-version))))
+                      (minor  ((store-lift nix-server-minor-version)))
+                      ;; goonix: see 'connection-version-word'.
+                      (word   ((store-lift connection-version-word))))
     (mbegin %store-monad
       ;; Before 'with-build-handler' was implemented and used, we had to
       ;; explicitly call 'show-what-to-build*'.
@@ -301,7 +322,7 @@ files."
                                       source system version
                                       (if (file-port? port)
                                           (number->string
-                                           (logior major minor))
+                                           word)  ;goonix: version and level
                                           "none")
                                       node))))))
         (format (current-error-port) "Computing Guix derivation for '~a'...  "

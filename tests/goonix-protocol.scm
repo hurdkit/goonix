@@ -17,6 +17,7 @@
 
 (define-module (test-goonix-protocol)
   #:use-module (guix store)
+  #:use-module (guix inferior)
   #:use-module (guix remote-procedures)
   #:use-module (guix serialization)
   #:use-module (guix tests)
@@ -463,5 +464,105 @@ without a word."
   (with-store store
     (list (first (query-sessions store))
           (query-build-records store (make-bytevector 32 0) "out"))))
+
+
+
+;;;
+;;; A connection handed to another process.
+;;;
+
+;; An inferior and the program that computes the derivation of a channel
+;; exchange no greeting: they are told the version of the connection they are
+;; handed in one word, and make their connection with 'port->connection'.
+;; The word carries the daemon's level, so that the level goes with the
+;; connection; the major and minor version in it are all that upstream's
+;; 'port->connection' keeps.
+
+(define (word-with-level version level)
+  ((protocol 'version-word-with-level) version level))
+
+(test-equal "the word for a handed connection: the version alone, or the level above it"
+  (list %protocol-version (logior %signal %protocol-version))
+  (list (word-with-level %protocol-version 0)
+        (word-with-level %protocol-version 1)))
+
+(test-equal "the word for a handed connection reads as upstream reads a version"
+  (list (protocol-major %protocol-version) (protocol-minor %protocol-version))
+  (let ((word (word-with-level %protocol-version 1)))
+    (list (protocol-major word) (protocol-minor word))))
+
+(test-equal "a connection made from the word has the version and the level"
+  (list %protocol-version 1 %protocol-version 0)
+  (let ((with    (port->connection (%make-void-port "rw")
+                                   #:version
+                                   (word-with-level %protocol-version 1)))
+        (without (port->connection (%make-void-port "rw")
+                                   #:version
+                                   (word-with-level %protocol-version 0))))
+    (list (store-connection-version with)
+          (store-connection-goonix-level with)
+          (store-connection-version without)
+          (store-connection-goonix-level without))))
+
+(define %top-builddir
+  (dirname (search-path %load-compiled-path "guix.go")))
+
+(define (in-inferior store code)
+  "Evaluate CODE, a procedure of one argument, in an inferior of this tree
+that is handed STORE."
+  (let* ((inferior (open-inferior %top-builddir #:command "scripts/guix"))
+         (result   (inferior-eval-with-store inferior store code)))
+    (close-inferior inferior)
+    result))
+
+(test-equal "the connection of an inferior has the daemon's level"
+  '(#t #t)
+  (with-store store
+    (let ((level (in-inferior store
+                              '(lambda (store)
+                                 ((@ (guix store) store-connection-goonix-level)
+                                  store)))))
+      (list (positive? level)
+            (= level (store-connection-goonix-level store))))))
+
+(test-equal "an inferior is answered an operation of goonix"
+  "1"
+  ;; The daemon answers on the connection whose greeting this process
+  ;; exchanged: the inferior only has to know that it may ask.
+  (with-store store
+    (in-inferior store
+                 '(lambda (store)
+                    (car ((@ (guix store) query-sessions) store))))))
+
+(define connection-version-word
+  ;; The procedure of that name in build-aux/build-self.scm, which says what
+  ;; word the program that builds a channel is given.  Its definition is
+  ;; evaluated on its own: loading the file looks packages up.
+  (delay
+    (call-with-input-file (string-append %source-directory
+                                         "/build-aux/build-self.scm")
+      (lambda (port)
+        (let loop ()
+          (match (read port)
+            ((? eof-object?)
+             #f)
+            ((and form ('define ('connection-version-word _) _ ...))
+             (let ((module (make-fresh-user-module)))
+               (module-use! module (resolve-interface '(guix store)))
+               (eval form module)
+               (module-ref module 'connection-version-word)))
+            (_
+             (loop))))))))
+
+(test-equal "the program that builds a channel is told the daemon's level"
+  '(#t #t)
+  (with-store store
+    (let* ((word  ((force connection-version-word) store))
+           (level (store-connection-goonix-level store))
+           (plain ((force connection-version-word)
+                   (port->connection (%make-void-port "rw")))))
+      (list (and (positive? level)
+                 (= word (word-with-level %protocol-version level)))
+            (= plain %protocol-version)))))
 
 (test-end "goonix-protocol")
