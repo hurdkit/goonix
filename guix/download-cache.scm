@@ -51,9 +51,10 @@
 ;;; gets, as for any download, so the cache need not be trusted.
 ;;;
 ;;; The cache also keeps copies of Git repositories.  The built-in Git
-;;; download ('git-fetch/download-cache') takes a checkout from the copy
-;;; before it asks the repository; the procedures here give a copy's
-;;; address and tell whether the cache can be reached at all.
+;;; download ('git-fetch/download-cache') and the checkouts of the 'guix'
+;;; command ((guix download-cache git)) take objects from the copy before
+;;; they ask the repository; the procedures here give a copy's address and
+;;; tell whether the cache can be reached at all.
 ;;; doc/goonix/download-cache.md describes what a cache must serve.
 ;;;
 ;;; Code:

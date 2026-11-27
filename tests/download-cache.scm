@@ -16,15 +16,19 @@
 ;;; You should have received a copy of the GNU General Public License
 ;;; along with GNU Guix.  If not, see <http://www.gnu.org/licenses/>.
 
-;;; goonix: the built-in downloads, of files and of Git checkouts, ask the
-;;; download cache first.
+;;; goonix: the built-in downloads, of files and of Git checkouts, and the
+;;; checkouts of the 'guix' command ask the download cache first.
 
 (define-module (test-download-cache)
   #:use-module (guix download-cache)
   #:use-module (guix base32)
   #:use-module ((guix download) #:select (url-fetch %download-methods))
   #:use-module (guix git-download)
-  #:use-module ((guix git) #:select (with-repository))
+  #:use-module ((guix git)
+                #:select (with-repository
+                          update-cached-checkout
+                          url-cache-directory
+                          %repository-cache-directory))
   #:use-module (guix derivations)
   #:use-module (guix monads)
   #:use-module (guix store)
@@ -40,7 +44,9 @@
   #:use-module ((gcrypt hash) #:select (sha256))
   #:use-module (rnrs bytevectors)
   #:use-module (ice-9 ftw)
+  #:use-module (ice-9 match)
   #:use-module (ice-9 textual-ports)
+  #:use-module (srfi srfi-11)
   #:use-module (srfi srfi-26)
   #:use-module (srfi srfi-64))
 
@@ -310,5 +316,115 @@ files in OUTPUT, or #f if there is none."
                                       "v1.0" "/nonexistent/output"
                                       (const 'fallback))
             (download-cache-reachable? cache)))))
+
+;;;
+;;; The client's Git checkouts.
+;;;
+
+(define (cached-checkout url ref checkouts)
+  "Update the checkout of URL to REF below CHECKOUTS, as 'guix pull' and
+'guix style' do.  Return the checkout's directory, its commit, and the URL of
+its remote \"origin\"."
+  (parameterize ((%repository-cache-directory checkouts))
+    (let-values (((directory commit _) (update-cached-checkout url #:ref ref)))
+      (list directory commit
+            (with-repository directory repository
+              (remote-url (remote-lookup repository "origin")))))))
+
+(define (file-contains? file text)
+  (and (string-contains (call-with-input-file file get-string-all) text) #t))
+
+(test-assert "checkout: cloned from the cache's copy, repository unreachable"
+  (with-temporary-git-repository directory
+      '((add "README" "Hello.")
+        (commit "First")
+        (tag "v1.0" "Release."))
+    (call-with-temporary-directory
+     (lambda (tmp)
+       (let ((origin    (unreachable-url "/project.git"))
+             (cache     (string-append tmp "/cache"))
+             (checkouts (string-append tmp "/checkouts")))
+         (copy-in-cache cache origin directory)
+         (match (with-cache (string-append "file://" cache)
+                  (cached-checkout origin '(tag-or-commit . "v1.0") checkouts))
+           ((checkout-directory commit remote)
+            (and (string=? commit (head-commit directory))
+                 ;; What is recorded names the repository, not the cache.
+                 (string=? checkout-directory
+                           (url-cache-directory origin checkouts))
+                 (string=? remote origin)
+                 (not (file-contains? (string-append checkout-directory
+                                                     "/.git/config")
+                                      cache))))))))))
+
+(test-assert "checkout: a branch, the repository unreachable after the copy"
+  ;; The remote's HEAD is asked for: the repository is asked after the
+  ;; copy, fails, and what the copy gave is used.
+  (with-temporary-git-repository directory
+      '((add "README" "Hello.")
+        (commit "First"))
+    (call-with-temporary-directory
+     (lambda (tmp)
+       (let ((origin (unreachable-url "/project.git"))
+             (cache  (string-append tmp "/cache")))
+         (copy-in-cache cache origin directory)
+         (match (with-cache (string-append "file://" cache)
+                  (cached-checkout origin '() (string-append tmp "/checkouts")))
+           ((_ commit remote)
+            (and (string=? commit (head-commit directory))
+                 (string=? remote origin)))))))))
+
+(test-equal "checkout: an existing one asks the copy, then the repository"
+  '(#t #t)
+  (with-temporary-git-repository directory
+      '((add "README" "Hello.")
+        (commit "First"))
+    (call-with-temporary-directory
+     (lambda (tmp)
+       (let* ((origin    (string-append "file://" directory))
+              (cache     (string-append tmp "/cache"))
+              (checkouts (string-append tmp "/checkouts"))
+              (tag       "refs/tags/only-in-the-copy")
+              (first     (cached-checkout origin '() checkouts))
+              (copy      (copy-in-cache cache origin directory)))
+         ;; The copy has a tag that the repository does not have.
+         (invoke (git-command) "-C" copy "update-ref" tag "HEAD")
+         (match (with-cache (string-append "file://" cache)
+                  (cached-checkout origin '() checkouts))
+           ((checkout-directory commit remote)
+            (list (string=? commit (head-commit directory))
+                  (with-repository checkout-directory repository
+                    (->bool (false-if-exception
+                             (reference-lookup repository tag))))))))))))
+
+(test-equal "checkout: the cache has no copy, so the repository is cloned"
+  '(#t #t)
+  (with-temporary-git-repository directory
+      '((add "README" "Hello.")
+        (commit "First"))
+    (call-with-temporary-directory
+     (lambda (tmp)
+       (let ((origin (string-append "file://" directory)))
+         (mkdir-p (string-append tmp "/cache"))
+         (match (with-cache (string-append "file://" tmp "/cache")
+                  (cached-checkout origin '() (string-append tmp "/checkouts")))
+           ((_ commit remote)
+            (list (string=? commit (head-commit directory))
+                  (string=? remote origin)))))))))
+
+(test-equal "checkout: a cache that cannot be reached"
+  '(#t #f)
+  (with-temporary-git-repository directory
+      '((add "README" "Hello.")
+        (commit "First"))
+    (call-with-temporary-directory
+     (lambda (tmp)
+       (let ((origin (string-append "file://" directory))
+             (cache  (unreachable-url "")))
+         (match (with-cache cache
+                  (cached-checkout origin '() (string-append tmp "/checkouts")))
+           ((_ commit remote)
+            (list (string=? commit (head-commit directory))
+                  (download-cache-reachable? cache)))))))))
 
 (test-end "download-cache")

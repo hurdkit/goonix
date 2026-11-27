@@ -18,6 +18,7 @@ MODULES +=					\
   guix/ca/opaque.scm				\
   guix/ca/files.scm				\
   guix/download-cache.scm			\
+  guix/download-cache/git.scm			\
   guix/ca/scan.scm				\
   guix/scripts/ca.scm				\
   guix/flakes.scm				\
