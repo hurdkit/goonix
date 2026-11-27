@@ -18,6 +18,7 @@
              (ice-9 textual-ports)
              (ice-9 match)
              (srfi srfi-1)
+             (srfi srfi-9)
              (srfi srfi-34)
              (srfi srfi-64))
 
@@ -608,6 +609,142 @@ NarSize: 1234\nNarHash: sha256:~a\nReferences: \nSystem: ~a\nDeriver: ~a\n"
          (and (derivation? alone) (derivation? after)
               (string=? (derivation-file-name alone)
                         (derivation-file-name after))))))))
+
+;; An object that records the grafting setting in force when it is lowered.
+;; It lowers to a derivation, as a gexp's extension has to.
+(define-record-type <grafting-witness>
+  (grafting-witness name)
+  grafting-witness?
+  (name grafting-witness-name))
+
+(define %grafting-seen '())
+
+(define-gexp-compiler (grafting-witness-compiler (witness <grafting-witness>)
+                                                 system target)
+  (set! %grafting-seen
+        (cons (cons (grafting-witness-name witness) (%graft?))
+              %grafting-seen))
+  (raw-derivation (grafting-witness-name witness) "/bin/sh" '("-c" "exit 1")
+                  #:system system))
+
+(define (lowered-or default thunk)
+  ;; THUNK's result; DEFAULT, after printing the reason, when THUNK fails, so
+  ;; that a failed lowering fails an assertion instead of ending the file.
+  (catch #t
+    thunk
+    (lambda (key . arguments)
+      (format #t "lowering failed: ~s ~s~%" key arguments)
+      default)))
+
+(test-group "a gexp lowered without grafts keeps that setting to itself"
+  ;; A gexp's lowering switches grafting for the gexp and back.  A build
+  ;; accumulator suspends an item that requests a build, lowers the other
+  ;; items, and resumes it after the builds.  Under 'adopted the gexp below is
+  ;; suspended while its setting is in force: its extension is a package, an
+  ;; extension is lowered outside the accumulator of the gexp's own inputs,
+  ;; and adopting the package requests a build.  The gexp's siblings must be
+  ;; lowered with the setting of the gexp that holds them, and the gexp must
+  ;; find its own setting again when it resumes.  The other policies request
+  ;; no build there; they are run for comparison.
+  (define (settings-seen policy)
+    ;; Lower, with grafting on, a gexp that refers to a witness, to a
+    ;; computed file lowered without grafts, and to another witness.  The
+    ;; computed file has three extensions: a witness, a package, a witness.
+    ;; Return what each witness saw, as (NAME . GRAFTING?) pairs.
+    (let* ((extension (trivial "ca-policy-grafting-extension"
+                               #~(mkdir #$output)))
+           (quiet (computed-file
+                   "ca-policy-grafting-off"
+                   (with-extensions (list (grafting-witness "inside-first")
+                                          extension
+                                          (grafting-witness "inside-last"))
+                     #~(call-with-output-file #$output
+                         (lambda (p) (display "QUIET" p))))
+                   #:guile %bootstrap-guile
+                   #:options '(#:graft? #f)))
+           (before (grafting-witness "sibling-before"))
+           (after (grafting-witness "sibling-after"))
+           (fresh (open-connection-for-tests)))
+      (set! %grafting-seen '())
+      (parameterize ((%graft? #t)
+                     (%package-addressing-policy policy)
+                     (%upstream-package?
+                      (upstream-package-set
+                       (list->setq (list extension %bootstrap-guile)))))
+        (run-with-store fresh
+          (gexp->derivation "ca-policy-grafting-outer"
+                            #~(list #$before #$quiet #$after)
+                            #:guile-for-build (%guile-for-build))))
+      (close-connection fresh)
+      %grafting-seen))
+  (define (seen-by names settings)
+    ;; Every setting each of NAMES saw: an object is lowered once for each
+    ;; setting it is asked for under.
+    (map (lambda (name)
+           (delete-duplicates
+            (filter-map (match-lambda
+                          ((witness . grafting?)
+                           (and (string=? witness name)
+                                (if grafting? 'grafts 'no-grafts))))
+                        settings)))
+         names))
+  (for-each
+   (lambda (policy)
+     (let ((settings (lowered-or '() (lambda () (settings-seen policy)))))
+       (test-equal (format #f "the gexp's siblings are lowered with grafts under '~a"
+                           policy)
+         '((grafts) (grafts))
+         (seen-by '("sibling-before" "sibling-after") settings))
+       (test-equal (format #f "the gexp keeps its own setting throughout under '~a"
+                           policy)
+         '((no-grafts) (no-grafts))
+         (seen-by '("inside-first" "inside-last") settings))))
+   '(input mixed content full adopted)))
+
+(test-group "a package's addressing stays with the package while it is suspended"
+  ;; A gexp that carries the name of the package being lowered is the
+  ;; package's own and takes the package's addressing; any other gexp is
+  ;; content-addressed under 'adopted.  The package's name and addressing are
+  ;; in force while its adoption requests a build, which suspends the
+  ;; package.  A sibling gexp that happens to carry the same name must not be
+  ;; taken for the package's own: lowered with the suspended package's
+  ;; values it came out input-addressed.
+  (define (same-named policy)
+    ;; Lower a gexp that refers to a package and to two computed files with
+    ;; the package's derivation name; return the addressing of its inputs of
+    ;; that name: the package's and the two files'.
+    (let* ((own (trivial "ca-policy-own-name"
+                         #~(call-with-output-file #$output
+                             (lambda (p) (display "PACKAGE" p)))))
+           (file (lambda (text)
+                   (computed-file "ca-policy-own-name-1"
+                                  #~(call-with-output-file #$output
+                                      (lambda (p) (display #$text p)))
+                                  #:guile %bootstrap-guile)))
+           (before (file "BEFORE"))
+           (after (file "AFTER"))
+           (fresh (open-connection-for-tests))
+           (outer
+            (parameterize ((%package-addressing-policy policy)
+                           (%upstream-package?
+                            (upstream-package-set
+                             (list->setq (list own %bootstrap-guile)))))
+              (run-with-store fresh
+                (gexp->derivation "ca-policy-own-name-outer"
+                                  #~(list #$before #$own #$after)
+                                  #:guile-for-build (%guile-for-build))))))
+      (close-connection fresh)
+      (map addressing
+           (filter (lambda (drv)
+                     (string=? (derivation-name drv) "ca-policy-own-name-1"))
+                   (map derivation-input-derivation
+                        (derivation-inputs outer))))))
+  (test-equal "the package and both same-named gexps are content-addressed under 'adopted"
+    '("content" "content" "content")
+    (lowered-or #f (lambda () (same-named 'adopted))))
+  (test-equal "all three are input-addressed under 'input"
+    '(#f #f #f)
+    (lowered-or 'failed (lambda () (same-named 'input)))))
 
 (test-group "a gexp over an adopted input is content-addressed under adopted"
   ;; The plan's policy table (01-content-addressing.md, section 8): under
