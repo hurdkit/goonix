@@ -18,6 +18,14 @@
 (define-module (test-goonix-protocol)
   #:use-module (guix store)
   #:use-module (guix inferior)
+  #:use-module (guix derivations)
+  #:use-module (guix gexp)
+  #:use-module (guix packages)
+  #:use-module ((guix ca policy) #:select (%package-addressing-policy))
+  #:use-module ((guix diagnostics)
+                #:select (formatted-message?
+                          formatted-message-string
+                          formatted-message-arguments))
   #:use-module (guix remote-procedures)
   #:use-module (guix serialization)
   #:use-module (guix tests)
@@ -150,8 +158,9 @@ this tree is based on, or #f if that commit cannot be read here."
 
 (define (call-with-recording-daemon word proc)
   "Run a daemon that sends WORD as its version in the greeting, answers
-'set-options' and the operations of goonix, and ends the connection at any
-other operation.  Call PROC with the file name of its socket.  Return three
+'set-options', 'add-text-to-store' and the operations of goonix, and ends the
+connection at any other operation.  Call PROC with the file name of its
+socket.  Return three
 values: what PROC returned; the word the client sent as its version; and what
 the daemon was asked, a list of operation identifiers where 'set-options' is
 a pair of its identifier and the alist of the settings it came with."
@@ -188,6 +197,17 @@ a pair of its identifier and the alist of the settings it came with."
                             (let ((settings (read-string-pairs port)))
                               (write-int %stderr-last port)
                               (answered (cons 19 settings))))
+                           (8
+                            (let ((name (read-string port)))
+                              (read-latin1-string port)
+                              (read-string-list port)
+                              (write-int %stderr-last port)
+                              (write-string (string-append
+                                             "/gnu/store/"
+                                             (make-string 32 #\a)
+                                             "-" name)
+                                            port)
+                              (answered 8)))
                            (82
                             (read-string port)
                             (read-string port)
@@ -350,6 +370,132 @@ the identifiers of the operations it was sent, the value of the setting
                  (usleep 50000)
                  (loop (+ tries 1)))
                'no-answer)))))))
+
+
+;;;
+;;; Content addressing and a daemon without the signal.
+;;;
+
+;; A daemon that is not goonix's has no content addressing.  Asked to lower
+;; something with an addressing or under a policy that is not upstream's, the
+;; client raises an error that says so before it adds anything to that
+;; daemon's store, and does not fall back to upstream's addressing.  What is
+;; lowered with upstream's addressing under upstream's policy is added as
+;; upstream adds it.
+
+(define (lowering-with-daemon word proc)
+  "Open a connection to a daemon that sends WORD in the greeting and call
+PROC with it.  Return what became of the call and the identifiers of the
+operations that the daemon was sent: 'lowered if PROC returned, or else the
+message of the error it raised."
+  (let-values (((outcome client asked)
+                (call-with-recording-daemon
+                 word
+                 (lambda (file)
+                   (let* ((store   (open-connection file))
+                          (outcome (guard (c ((formatted-message? c)
+                                              (apply format #f
+                                                     (formatted-message-string c)
+                                                     (formatted-message-arguments
+                                                      c)))
+                                             ((store-protocol-error? c)
+                                              (store-protocol-error-message c)))
+                                     (proc store)
+                                     'lowered)))
+                     (close-connection store)
+                     outcome)))))
+    (list outcome
+          (map (match-lambda
+                 ((operation . _) operation)
+                 (operation operation))
+               asked))))
+
+(define (refused? outcome)
+  "Return true if OUTCOME is the message that says that the daemon is not a
+goonix daemon."
+  (and (string? outcome)
+       (->bool (string-contains outcome "not a goonix daemon"))))
+
+(define (refused-before-adding word proc)
+  "Return whether lowering with PROC was refused for that reason, and what
+the daemon that sends WORD was sent."
+  (match (lowering-with-daemon word proc)
+    ((outcome asked)
+     (list (refused? outcome) asked))))
+
+(test-equal "upstream's addressing: a daemon without the signal is added the derivation"
+  '(lowered (8))
+  (lowering-with-daemon %protocol-version
+                        (lambda (store)
+                          (derivation store "upstream" "/bin/sh" '()))))
+
+(test-equal "a content-addressed derivation is refused before it is added"
+  '((#t ()) (#t ()))
+  (map (lambda (addressing)
+         (refused-before-adding
+          %protocol-version
+          (lambda (store)
+            (derivation store "refused" "/bin/sh" '()
+                        #:addressing addressing))))
+       '(content resolved)))
+
+(test-equal "a daemon of a later version without the signal is refused it too"
+  '(#t ())
+  (refused-before-adding
+   #x167
+   (lambda (store)
+     (derivation store "refused" "/bin/sh" '() #:addressing 'content))))
+
+(define (lower-expression store . arguments)
+  "Lower an expression that needs no input with ARGUMENTS on STORE, with a
+derivation made here, in upstream's addressing, for its Guile."
+  (let ((guile (derivation store "guile" "/bin/sh" '())))
+    (parameterize ((%graft? #f))
+      (run-with-store store
+        (apply gexp->derivation "refused" #~(mkdir #$output)
+               #:guile-for-build guile
+               arguments)))))
+
+(test-equal "an expression in upstream's addressing is lowered as upstream lowers it"
+  '(lowered #t)
+  ;; The derivation for Guile, the builder and the derivation.
+  (match (lowering-with-daemon %protocol-version lower-expression)
+    ((outcome asked)
+     (list outcome (equal? asked '(8 8 8))))))
+
+(test-equal "a content-addressed expression is refused before it is lowered"
+  ;; The one thing added is the derivation for Guile, in upstream's
+  ;; addressing, that this test makes first.
+  '(#t (8))
+  (refused-before-adding
+   %protocol-version
+   (lambda (store)
+     (lower-expression store #:addressing 'content))))
+
+(test-equal "an expression under another policy than upstream's is refused before it is lowered"
+  '((#t (8)) (#t (8)) (#t (8)) (#t (8)))
+  (map (lambda (policy)
+         (refused-before-adding
+          %protocol-version
+          (lambda (store)
+            (parameterize ((%package-addressing-policy policy))
+              (lower-expression store)))))
+       '(content full mixed adopted)))
+
+(test-equal "a package under another policy than upstream's is refused before it is lowered"
+  '(#t ())
+  (refused-before-adding
+   %protocol-version
+   (lambda (store)
+     (parameterize ((%package-addressing-policy 'content)
+                    (%graft? #f))
+       (package-derivation store (dummy-package "refused"))))))
+
+(test-assert "a daemon that gives the signal is asked for a content-addressed derivation"
+  ;; The same call, with the test suite's daemon.
+  (with-store store
+    (derivation? (derivation store "asked" "/bin/sh" '()
+                             #:addressing 'content))))
 
 
 ;;;

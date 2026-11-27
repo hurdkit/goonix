@@ -995,7 +995,7 @@ derivation.  It is kept as-is, uninterpreted, in the derivation."
                            (add-output-paths drv-masked)
                            ((module-ref (resolve-interface '(guix ca derivation))
                                         'add-addressed-output-paths)
-                            drv-masked name addressing output-path
+                            store drv-masked name addressing output-path
                             (lambda (output-name algo hash rec?)
                               (fixed-output-path name hash #:hash-algo algo
                                                  #:output output-name

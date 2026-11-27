@@ -19,6 +19,7 @@
   #:use-module (guix derivations)
   #:use-module (guix ca)
   #:use-module (guix ca opaque)
+  #:use-module ((guix ca derivation) #:select (assert-goonix-daemon))
   #:use-module (ice-9 match)
   #:use-module (srfi srfi-1)
   #:export (%package-addressing-policy
@@ -139,6 +140,15 @@ policy is 'adopted', PACKAGE is upstream's, and it is not marked opaque."
   "Return the current mode and marker for the package derivation cache."
   (list (%package-addressing-policy) (%upstream-package?)))
 
+(define (goonix-daemon-only name mvalue)
+  "Return MVALUE, a value in the store monad that lowers NAME with an
+addressing or under a policy that is not upstream's, behind a check of the
+daemon: with a daemon that is not goonix's an error is raised before MVALUE
+has added anything to the store.  See 'assert-goonix-daemon'."
+  (lambda (store)
+    (assert-goonix-daemon store name)
+    (mvalue store)))
+
 (define (lower-bag-with-addressing lower bag . arguments)
   "Apply the package's own addressing around its bag build, after inputs.
 Under the 'adopted policy an ordinary upstream package's input-addressed
@@ -152,20 +162,30 @@ No direct-opaque or glibc-specific dependent promotion is applied."
                     (or (opaque-package? context)
                         (bootstrap-package? context))))
               (adopt? (adopt-package? context)))
-          (state-parameterize ((%package-addressing addressing)
-                               (%package-derivation-name (bag-name bag)))
-            (let ((drv
-                   (if opaque-input?
-                       ;; Keep the complete upstream derivation, not just its
-                       ;; top-level marker: nested gexps and packages must be
-                       ;; input-addressed too, so the original output path and
-                       ;; its substitutes remain usable.
-                       (state-parameterize ((%package-addressing-policy 'input))
-                         (apply lower bag arguments))
-                       (apply lower bag arguments))))
-              (if adopt?
-                  (adopt-lowered-derivation lower bag arguments drv)
-                  drv))))
+          (let ((lowered
+                 (state-parameterize ((%package-addressing addressing)
+                                      (%package-derivation-name (bag-name bag)))
+                   (let ((drv
+                          (if opaque-input?
+                              ;; Keep the complete upstream derivation, not
+                              ;; just its top-level marker: nested gexps and
+                              ;; packages must be input-addressed too, so the
+                              ;; original output path and its substitutes
+                              ;; remain usable.
+                              (state-parameterize ((%package-addressing-policy
+                                                    'input))
+                                (apply lower bag arguments))
+                              (apply lower bag arguments))))
+                     (if adopt?
+                         (adopt-lowered-derivation lower bag arguments drv)
+                         drv)))))
+            ;; Upstream's addressing under upstream's policy is upstream's
+            ;; lowering, as it was.  Anything else is for a goonix daemon,
+            ;; and is refused before the bag's inputs are lowered.
+            (if (and (eq? addressing 'input)
+                     (eq? (%package-addressing-policy) 'input))
+                lowered
+                (goonix-daemon-only (bag-name bag) lowered))))
         (apply lower bag arguments))))
 
 (define (adopt-lowered-derivation lower bag arguments drv)
@@ -292,9 +312,16 @@ input-addressed derivation (a graft, say) leaves its derivation upstream's."
          (arguments (if (memq #:addressing arguments)
                         (strip-keyword arguments #:addressing)
                         arguments)))
-    (state-parameterize ((%package-derivation-name #f))
-      (apply lower name exp
-             (append arguments (list #:addressing requested))))))
+    (let ((lowered
+           (state-parameterize ((%package-derivation-name #f))
+             (apply lower name exp
+                    (append arguments (list #:addressing requested))))))
+      ;; Upstream's addressing under upstream's policy is upstream's lowering,
+      ;; as it was.  Anything else is for a goonix daemon, and is refused
+      ;; before the expression is lowered.
+      (if (and (eq? requested 'input) (eq? policy 'input))
+          lowered
+          (goonix-daemon-only name lowered)))))
 
 (define (input-addressed-derivation? input)
   "Whether a lowered derivation input has no CA addressing marker."
