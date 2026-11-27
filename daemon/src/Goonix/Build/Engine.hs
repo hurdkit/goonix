@@ -829,10 +829,16 @@ offloadFailed settings store trace drvPath drv status = do
 derivationInputs :: Store -> ByteString -> Derivation -> IO (Set.Set ByteString)
 derivationInputs store drvPath current = do
   let isBuiltin = "builtin:" `B.isPrefixOf` builder current
-      direct = Set.filter (\path -> not ("builtin:" `B.isPrefixOf` path))
-        (if isBuiltin
-          then inputSrcs current
-          else Set.insert (topLevelStorePath store (builder current)) (inputSrcs current))
+  inputs <- derivationInputPaths store drvPath current
+  pure (if isBuiltin then inputs
+    else Set.insert (topLevelStorePath store (builder current)) inputs)
+
+-- | The input paths exactly as C++ DerivationGoal::inputsRealised gathers them
+-- (nix/libstore/build.cc:1127-1145), before their closure: the selected
+-- outputs of each direct input derivation and the input sources.
+derivationInputPaths :: Store -> ByteString -> Derivation -> IO (Set.Set ByteString)
+derivationInputPaths store drvPath current = do
+  let direct = Set.filter (\path -> not ("builtin:" `B.isPrefixOf` path)) (inputSrcs current)
   dependencies <- mapM (\(path, selected) -> (\drv -> (path, selected, drv)) <$> readStoreDerivation path)
     (Map.toList (inputDrvs current))
   -- C++: for each direct input derivation, iterate the SELECTED output names; a
@@ -852,6 +858,35 @@ derivationInputs store drvPath current = do
     readStoreDerivation path = do
       bytes <- B.readFile (C.unpack path)
       either (throwIO . storeError) pure (parseDerivation bytes)
+
+-- | The paths a built output of an input-addressed derivation may refer to:
+-- C++ allPaths, its outputs and the closure of its input paths
+-- (DerivationGoal::inputsRealised, nix/libstore/build.cc:1120-1149), which
+-- registerOutputs scans for (build.cc:3301).  Not every valid path: an output
+-- whose contents name some other store item (a derivation file in a comment,
+-- say) must not refer to it.  Such a reference pulled that derivation's whole
+-- build-time graph into the closure of the output, and a references graph
+-- over it failed on the first source that was not in the store.
+outputReferenceCandidates :: Store -> ByteString -> Derivation -> IO [ByteString]
+outputReferenceCandidates store drvPath drv = do
+  inputs <- derivationInputPaths store drvPath drv
+  closureWithOutputs store drv (Set.toList inputs)
+
+-- | The same for a content-addressed goal, C++ goonixInputPaths
+-- (nix/libstore/build-ca.cc:147-155): the outputs and the closure of the
+-- sources and of the builder, which finaliseGoonixOutputs and registerOutputs
+-- scan for.  A resolved derivation has no input derivations; its chosen input
+-- outputs are among its sources.
+goonixReferenceCandidates :: Store -> Derivation -> IO [ByteString]
+goonixReferenceCandidates store drv =
+  closureWithOutputs store drv (Set.toList (inputSrcs drv) ++
+    [topLevelStorePath store (builder drv)
+    | (storeDirectory store <> "/") `B.isPrefixOf` builder drv])
+
+closureWithOutputs :: Store -> Derivation -> [ByteString] -> IO [ByteString]
+closureWithOutputs store drv roots = do
+  closure <- Set.unions . map Set.fromList <$> mapM (referenceClosure store) roots
+  pure (Set.toList (Set.union closure (Set.fromList (map outputPath (Map.elems (outputs drv))))))
 
 trySubstitute :: ServerConfig -> Fd -> Store -> Settings -> BuildTrace -> ByteString -> IO Bool
 trySubstitute config rootFd store settings trace path = do
@@ -1476,28 +1511,51 @@ builderEnvironment store settings work drv = do
   pure (Map.toList (Map.fromList (base ++ custom ++ leaked ++ buildEnv)))
 
 registerBuiltOutputs :: Store -> ByteString -> Derivation -> IO ()
-registerBuiltOutputs store drvPath drv = forM_ (Map.elems (outputs drv)) $ \output -> do
-  let path = outputPath output
-  exists <- Files.fileExist path
-  unless exists $ throwIO (storeError ("builder for `" ++ C.unpack drvPath ++ "' failed to produce output path `" ++ C.unpack path ++ "'"))
-  _ <- canonicaliseAndHash store path
-  when (not (B.null (outputHash output))) $ verifyFixedOutput output path
-  deduplicateTree (storeDirectory store) path
-  (refs, hash) <- scanOutputReferences store path
-  enforceReferencePolicy store drv path refs
-  size <- narSize path
+registerBuiltOutputs store drvPath drv = do
+  candidates <- outputReferenceCandidates store drvPath drv
+  scanned <- forM (Map.elems (outputs drv)) $ \output -> do
+    let path = outputPath output
+    exists <- Files.fileExist path
+    unless exists $ throwIO (storeError ("builder for `" ++ C.unpack drvPath ++ "' failed to produce output path `" ++ C.unpack path ++ "'"))
+    _ <- canonicaliseAndHash store path
+    when (not (B.null (outputHash output))) $ verifyFixedOutput output path
+    deduplicateTree (storeDirectory store) path
+    (found, hash) <- scanReferences path candidates
+    let refs = Set.toList found
+    enforceReferencePolicy store drv path refs
+    size <- narSize path
+    pure (path, (refs, hash, size))
   -- C++ keeps self-references: scanForReferences searches the output's own
   -- path among the candidates (build.cc allPaths inserts drv.outputs) and
   -- registerValidPaths adds every reference, including the path itself
   -- (local-store.cc, no self-filter).  A self-referencing output (e.g. a
   -- `self -> $out` symlink) must report itself in queryReferences, as the
   -- grafts indirect-dependency test requires.
-  registerPath store path hash size refs drvPath
+  let table = Map.fromList scanned
+  order <- siblingOrder [(path, refs) | (path, (refs, _, _)) <- scanned]
+  forM_ order $ \path -> do
+    let (refs, hash, size) = table Map.! path
+    registerPath store path hash size refs drvPath
+
+-- | The outputs of one build in an order to register them in.  C++
+-- registerValidPaths adds them together and then sorts them topologically,
+-- refusing a cycle between them (nix/libstore/local-store.cc:977-1008,
+-- topoSortPaths, nix/libstore/misc.cc:68).  registerPath adds one path whose
+-- references must be valid already, so each output comes after the sibling
+-- outputs it refers to.  A reference of an output to itself is no cycle.
+siblingOrder :: [(ByteString, [ByteString])] -> IO [ByteString]
+siblingOrder entries = reverse . snd <$> foldM (visit Set.empty) (Set.empty, []) (map fst entries)
   where
-    scanOutputReferences store path = do
-      valid <- queryAllValidPaths store
-      (found, hash) <- scanReferences path (path : valid)
-      pure (Set.toList found, hash)
+    table = Map.fromList entries
+    visit visiting (done, acc) path
+      | Set.member path done = pure (done, acc)
+      | Set.member path visiting =
+          throwIO (storeError ("cycle detected in the references of `" ++ C.unpack path ++ "'"))
+      | otherwise = do
+          let siblings = [reference | reference <- Map.findWithDefault [] path table
+                         , reference /= path, Map.member reference table]
+          (done', acc') <- foldM (visit (Set.insert path visiting)) (done, acc) siblings
+          pure (Set.insert path done', path : acc')
 
 -- | goonix: register a resolved CA derivation's outputs (HS-11, C++
 -- finaliseGoonixOutputs + goonixRegisterValidPaths).  Content outputs are
@@ -1511,37 +1569,41 @@ registerCaBuiltOutputs buildUser settings rootFd store originalPath drvPath drv 
       isContent = addressing == Right Content
       contentOutputs = [(output, out) | (output, out) <- Map.toList (outputs drv)
                        , B.null (outputHash out)]
+  -- allPaths: the input closure plus every output path (C++ goonixInputPaths).
+  allPaths <- goonixReferenceCandidates store drv
   when (isContent && not (null contentOutputs)) $ do
-    -- allPaths: the input closure plus every output path (C++ goonixInputPaths).
-    inputClosure <- Set.unions . map Set.fromList <$> mapM (referenceClosure store) (Set.toList (inputSrcs drv))
-    let allPaths = Set.toList (Set.union inputClosure (Set.fromList (map outputPath (Map.elems (outputs drv)))))
     order <- contentOutputOrder drv allPaths ""
     (finals, finaliseds) <- foldM (finaliseOne allPaths) (Map.empty, Map.empty) order
-    -- Register the finalised content outputs, then record facts and choices.
-    forM_ (Map.toList finaliseds) $ \(token, finalised) -> do
+    -- Register the finalised content outputs, then record facts and choices,
+    -- each after the siblings it refers to (contentOutputOrder).
+    forM_ [(token, finaliseds Map.! token) | (_, token) <- order, Map.member token finaliseds] $ \(token, finalised) -> do
       let output = tokenOutputName token
       registerPath store (finalPath finalised) (finalNarHash finalised) (finalNarSize finalised)
         (finalReferences finalised) drvPath
       recordGoonixOutput store originalPath drvPath output (finalPath finalised) "local"
   -- Resolved-addressed and fixed outputs are ordinary registrations, but they
   -- too become facts and choices of the original derivation.
-  forM_ (Map.toList (outputs drv)) $ \(output, out) -> do
+  ordinary <- fmap concat $ forM (Map.toList (outputs drv)) $ \(output, out) -> do
     let path = outputPath out
     alreadyFinalised <- case addressing of
       Right Content | B.null (outputHash out) -> pure True
       _ -> pure False
-    unless alreadyFinalised $ do
+    if alreadyFinalised then pure [] else do
       exists <- Files.fileExist path
       unless exists $ throwIO (storeError ("builder for `" ++ C.unpack drvPath ++ "' failed to produce output path `" ++ C.unpack path ++ "'"))
       _ <- canonicaliseAndHash store path
       when (not (B.null (outputHash out))) $ verifyFixedOutput out path
       deduplicateTree storeDir path
-      valid <- queryAllValidPaths store
-      (refs, hash) <- scanReferences path (path : valid)
+      (refs, hash) <- scanReferences path allPaths
       enforceReferencePolicy store drv path (Set.toList refs)
       size <- fromIntegral . B.length <$> dumpNar path
-      registerPath store path hash size (Set.toList refs) drvPath
-      recordGoonixOutput store originalPath drvPath output path "local"
+      pure [(path, (output, Set.toList refs, hash, size))]
+  let table = Map.fromList ordinary
+  order <- siblingOrder [(path, refs) | (path, (_, refs, _, _)) <- ordinary]
+  forM_ order $ \path -> do
+    let (output, refs, hash, size) = table Map.! path
+    registerPath store path hash size refs drvPath
+    recordGoonixOutput store originalPath drvPath output path "local"
   where
     tokenOutputName token = head ([output | (output, out) <- Map.toList (outputs drv), outputPath out == token] ++ ["out"])
     finaliseOne allPaths (finals, finaliseds) (output, token) = do
@@ -1579,8 +1641,7 @@ finaliseCaOutput buildUser settings rootFd store drvPath drv allPaths finals out
 -- used: it would delete/rewrite the valid final output.
 checkCaBuiltOutputs :: Maybe BuildUser -> Settings -> Fd -> Store -> BuildTrace -> ByteString -> ByteString -> Derivation -> IO ()
 checkCaBuiltOutputs buildUser settings rootFd store trace originalPath drvPath drv = do
-  inputClosure <- Set.unions . map Set.fromList <$> mapM (referenceClosure store) (Set.toList (inputSrcs drv))
-  let allPaths = Set.toList (Set.union inputClosure (Set.fromList (map outputPath (Map.elems (outputs drv)))))
+  allPaths <- goonixReferenceCandidates store drv
   order <- contentOutputOrder drv allPaths ""
   (finals, _) <- foldM (checkOne allPaths) (Map.empty, Map.empty) order
   -- Fixed and resolved-addressed outputs in a CA derivation: verify in place.
