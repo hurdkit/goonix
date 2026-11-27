@@ -14,7 +14,7 @@ guix/scripts/build.scm 22 2
 guix/scripts/deploy.scm 4 1
 guix/scripts/environment.scm 2 0
 guix/scripts/home.scm 6 1
-guix/scripts/perform-download.scm 3 1
+guix/scripts/perform-download.scm 13 7
 guix/scripts/publish.scm 45 0
 guix/scripts/shell.scm 21 6
 guix/scripts/substitute.scm 29 7

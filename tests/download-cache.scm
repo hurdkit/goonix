@@ -16,25 +16,32 @@
 ;;; You should have received a copy of the GNU General Public License
 ;;; along with GNU Guix.  If not, see <http://www.gnu.org/licenses/>.
 
-;;; goonix: the built-in download asks the download cache first.  The
-;;; cache's copies of Git repositories are addressed as below.
+;;; goonix: the built-in downloads, of files and of Git checkouts, ask the
+;;; download cache first.
 
 (define-module (test-download-cache)
   #:use-module (guix download-cache)
   #:use-module (guix base32)
-  #:use-module ((guix download) #:select (url-fetch))
+  #:use-module ((guix download) #:select (url-fetch %download-methods))
   #:use-module (guix git-download)
+  #:use-module ((guix git) #:select (with-repository))
   #:use-module (guix derivations)
   #:use-module (guix monads)
   #:use-module (guix store)
   #:use-module (guix tests)
   #:use-module (guix tests http)
-  #:use-module ((guix utils) #:select (with-environment-variables))
+  #:use-module (guix tests git)
+  #:use-module ((guix utils)
+                #:select (with-environment-variables
+                          call-with-temporary-directory))
   #:use-module ((guix build utils)
-                #:select (call-with-temporary-output-file))
+                #:select (call-with-temporary-output-file mkdir-p invoke))
+  #:use-module (git)
   #:use-module ((gcrypt hash) #:select (sha256))
   #:use-module (rnrs bytevectors)
+  #:use-module (ice-9 ftw)
   #:use-module (ice-9 textual-ports)
+  #:use-module (srfi srfi-26)
   #:use-module (srfi srfi-64))
 
 (define %store
@@ -217,5 +224,91 @@ daemon runs, 'guix perform-download', in an environment where CACHE, a URL or
                      (parameterize ((%download-cache "http://cache.example"))
                        (list (git) (plain))))))
       (equal? without with))))
+
+;;;
+;;; The built-in Git download.
+;;;
+
+(define-syntax-rule (with-cache cache body ...)
+  "Evaluate BODY with CACHE, a URL, as the download cache; a file:// URL is
+accepted there, as are file:// repositories."
+  (parameterize ((%download-cache cache)
+                 (%download-cache-local-files? #t))
+    body ...))
+
+(define (copy-in-cache cache url repository)
+  "Put a bare clone of REPOSITORY where CACHE, a directory, keeps its copy of
+the repository at URL: below git/, URL with \"://\" written \"/\"."
+  (let* ((scheme (string-take url (string-index url #\:)))
+         (rest   (string-drop url (+ 3 (string-length scheme))))
+         (copy   (string-append cache "/git/" scheme "/" rest)))
+    (mkdir-p (dirname copy))
+    (invoke (git-command) "clone" "--quiet" "--bare" repository copy)
+    copy))
+
+(define (head-commit directory)
+  (with-repository directory repository
+    (oid->string (reference-target (repository-head repository)))))
+
+(define (perform-git-download* drv output)
+  "Run the procedure that 'guix perform-download' runs for DRV, a
+builtin:git-download derivation, writing to OUTPUT; return the names of the
+files in OUTPUT, or #f if there is none."
+  (with-environment-variables `(("PATH" ,(getenv "PATH")))
+    ((@@ (guix scripts perform-download) perform-git-download) drv output))
+  (and (file-exists? output)
+       (sort (scandir output (negate (cut member <> '("." ".."))))
+             string<?)))
+
+(define (git-download-derivation url commit)
+  (parameterize ((%download-methods '(upstream)))
+    (run-with-store %store
+      (git-fetch (git-reference (url url) (commit commit))
+                 'sha256 hash "cached-checkout"))))
+
+(unless (member "git-download" (built-in-builders %store))
+  (test-skip 1))
+(test-equal "built-in Git download: the commit comes from the cache's copy"
+  '("README" "doc")
+  ;; The repository itself cannot be reached.
+  (with-temporary-git-repository directory
+      '((add "README" "Hello.")
+        (add "doc/notes" "Notes.")
+        (commit "First"))
+    (call-with-temporary-directory
+     (lambda (tmp)
+       (let ((origin (unreachable-url "/project.git"))
+             (cache  (string-append tmp "/cache")))
+         (copy-in-cache cache origin directory)
+         (with-cache (string-append "file://" cache)
+           (perform-git-download* (git-download-derivation
+                                   origin (head-commit directory))
+                                  (string-append tmp "/out"))))))))
+
+(test-equal "built-in Git download: without the cache's copy, from scratch"
+  '(fallback #f)
+  ;; The cache has no copy: the usual download runs on an empty output.
+  (call-with-temporary-directory
+   (lambda (tmp)
+     (let ((output (string-append tmp "/out"))
+           (seen   'not-called))
+       (with-cache (string-append "file://" tmp)
+         (let ((result (git-fetch/download-cache
+                        (unreachable-url "/project.git")
+                        "0123456789abcdef0123456789abcdef01234567" output
+                        (lambda ()
+                          (set! seen (file-exists? output))
+                          'fallback)
+                        #:git-command (git-command))))
+           (list result seen)))))))
+
+(test-equal "built-in Git download: a cache that cannot be reached"
+  '(fallback #f)
+  (let ((cache (unreachable-url "")))
+    (with-cache cache
+      (list (git-fetch/download-cache "https://example.org/project.git"
+                                      "v1.0" "/nonexistent/output"
+                                      (const 'fallback))
+            (download-cache-reachable? cache)))))
 
 (test-end "download-cache")

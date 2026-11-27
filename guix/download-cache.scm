@@ -18,8 +18,12 @@
 
 (define-module (guix download-cache)
   #:use-module (guix base32)
-  #:use-module ((guix build utils) #:select (strip-store-file-name))
-  #:autoload   (guix build download) (open-socket-for-uri)
+  #:use-module ((guix build utils)
+                #:select (strip-store-file-name delete-file-recursively))
+  #:use-module ((guix utils) #:select (with-environment-variables))
+  #:autoload   (guix build download) (download-method-enabled?
+                                      open-socket-for-uri)
+  #:autoload   (guix build git) (git-fetch)
   #:use-module (web uri)
   #:use-module (srfi srfi-1)
   #:use-module (srfi srfi-26)
@@ -31,7 +35,8 @@
             %download-cache-local-files?
             %download-cache-connection-timeout
             download-cache-git-url
-            download-cache-reachable?))
+            download-cache-reachable?
+            git-fetch/download-cache))
 
 ;;; Commentary:
 ;;;
@@ -45,8 +50,10 @@
 ;;; the file can fetch and keep it.  The daemon checks the hash of what it
 ;;; gets, as for any download, so the cache need not be trusted.
 ;;;
-;;; The cache also keeps copies of Git repositories; the procedures below
-;;; give a copy's address and tell whether the cache can be reached at all.
+;;; The cache also keeps copies of Git repositories.  The built-in Git
+;;; download ('git-fetch/download-cache') takes a checkout from the copy
+;;; before it asks the repository; the procedures here give a copy's
+;;; address and tell whether the cache can be reached at all.
 ;;; doc/goonix/download-cache.md describes what a cache must serve.
 ;;;
 ;;; Code:
@@ -172,5 +179,39 @@ reached costs one wait, not one per repository."
                           (_ #f))))
            (set! answers (alist-cons cache answer answers))
            answer))))))
+
+(define* (git-fetch/download-cache url commit directory fallback
+                                   #:key recursive? (git-command "git"))
+  "Check out COMMIT of the Git repository at URL into DIRECTORY from the
+download cache's copy of it, when there is a cache that can be reached and
+the 'upstream' download method is enabled.  Return true on success.
+Otherwise remove what the attempt left in DIRECTORY and return the value of
+(FALLBACK), which fetches as without a cache.  Submodules are fetched from
+the URLs that the repository records."
+  (define mirror
+    (download-cache-git-url (%download-cache) url))
+
+  (if (and mirror
+           (download-method-enabled? 'upstream)
+           (download-cache-reachable? (%download-cache)))
+      (or (begin
+            (format (current-error-port)
+                    "trying the download cache's copy of ~a...~%" url)
+            ;; A transfer that stalls is given up rather than waited for.
+            (false-if-exception
+             (with-environment-variables
+                 '(("GIT_HTTP_LOW_SPEED_LIMIT" "1")
+                   ("GIT_HTTP_LOW_SPEED_TIME" "60")
+                   ("GIT_TERMINAL_PROMPT" "0"))
+               (git-fetch mirror commit directory
+                          #:recursive? recursive?
+                          #:git-command git-command))))
+          (begin
+            (format (current-error-port)
+                    "the download cache does not have it; using ~a~%" url)
+            (when (file-exists? directory)
+              (delete-file-recursively directory))
+            (fallback)))
+      (fallback)))
 
 ;;; download-cache.scm ends here

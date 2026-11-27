@@ -224,12 +224,16 @@ Note: OUTPUT may differ from the 'out' value of DRV, notably for 'bmCheck' or
                              read/safe))))
         ;; Note: When doing a '--check' build, DRV-OUTPUT and OUTPUT are
         ;; different, hence the #:item argument below.
-        (git-fetch-with-fallback url commit output
-                                 #:hash hash
-                                 #:hash-algorithm algo
-                                 #:recursive? recursive?
-                                 #:item (derivation-output-path drv-output)
-                                 #:git-command %git)))))
+        (git-fetch/download-cache  ;goonix: the download cache's copy first
+         url commit output
+         (lambda ()
+           (git-fetch-with-fallback url commit output
+                                    #:hash hash
+                                    #:hash-algorithm algo
+                                    #:recursive? recursive?
+                                    #:item (derivation-output-path drv-output)
+                                    #:git-command %git))
+         #:recursive? recursive? #:git-command %git)))))
 
 (define (assert-low-privileges)
   (when (zero? (getuid))
