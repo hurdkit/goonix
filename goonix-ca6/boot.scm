@@ -18,6 +18,7 @@
              (gnu build marionette)
              (gnu packages virtualization)
              (ice-9 match)
+             (ice-9 textual-ports)
              (srfi srfi-64))
 
 (define store (open-connection))
@@ -37,7 +38,9 @@
 (format #t "adopted-policy image derivation: ~a~%"
         (derivation-file-name image-drv))
 (build-derivations store (list image-drv))
-(define image-path (derivation->output-path image-drv))
+;; A content-addressed image's derivation names only a token; the daemon
+;; holds the path it realised.  An input-addressed one is unchanged.
+(define image-path (realised-output-path store image-drv "out"))
 (format #t "adopted-policy VM image realised: ~a~%" image-path)
 
 ;; Record what the policy did to the closure: an adopted item's deriver is a
@@ -78,7 +81,7 @@
 ;; QEMU to boot it (KVM is available in the namespace).
 (define qemu-drv (package-derivation store qemu-minimal))
 (build-derivations store (list qemu-drv))
-(define qemu-bin (string-append (derivation->output-path qemu-drv)
+(define qemu-bin (string-append (realised-output-path store qemu-drv "out")
                                 "/bin/qemu-system-x86_64"))
 
 (define command
