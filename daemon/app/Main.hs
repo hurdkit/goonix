@@ -5,7 +5,7 @@ module Main (main) where
 
 import Control.Concurrent (forkIO)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
-import Control.Exception (SomeException, try)
+import Control.Exception (SomeException, handle, throwIO, try)
 import Control.Monad (forM_, void, when)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import qualified Data.ByteString as B
@@ -18,6 +18,7 @@ import Foreign.Storable (peek)
 import qualified Goonix.Config as Config
 import Goonix.Store.Config
 import Goonix.Store.GuixProgram (guixProgram, stateDirectory)
+import Goonix.Store.ReadOnly (StoreError (..))
 import Goonix.Store.Server
 import Goonix.Store.Settings
 import Goonix.Store.Socket (Socket)
@@ -73,7 +74,8 @@ main = do
                 guix <- guixProgram
                 case parseDaemonOptions args of
                     Left message -> hPutStrLn stderr message >> exitFailure
-                    Right options -> do
+                    Right options -> exitOnStoreError $ do
+                        prepareStore store
                         let config = defaultConfig
                               { configStore = store
                               , configDatabase = database
@@ -93,6 +95,15 @@ main = do
                                 sockets -> serveManyPaths config lifecycle sockets
                             listeners -> serveMany config lifecycle listeners
                         readIORef stoppedBy >>= mapM_ endBySignal
+
+-- | A fatal error at start-up or while serving ends the daemon with status 1
+-- (EXIT_FAILURE), as an exception that reaches the C++ daemon's main does;
+-- the message is printed as it prints it ("error: MESSAGE").  Other
+-- exceptions end it with the same status through the runtime's handler.
+exitOnStoreError :: IO () -> IO ()
+exitOnStoreError = handle $ \(StoreError message _) -> do
+    hPutStrLn stderr ("error: " ++ C.unpack message)
+    exitFailure
 
 -- | SIGTERM, SIGINT and SIGHUP ask the daemon to stop: it accepts no further
 -- client, serves the connected ones until each has disconnected, and then
@@ -153,22 +164,23 @@ startDiscovery program = do
   -- The C++ daemon does not wait for the discovery process.
   pure ()
 
--- | Serve several listening sockets.  A listener that fails ends the daemon.
--- A listener returns without failing only when the daemon has been asked to
--- stop, and then all of them have to return: each waits for the clients.
+-- | Serve several listening sockets.  A listener that fails ends the daemon:
+-- its exception is raised again here, so the daemon ends with a non-zero
+-- status, as it does when its only listener fails.  A listener returns
+-- without failing only when the daemon has been asked to stop, and then all
+-- of them have to return: each waits for the clients.
 serveMany :: ServerConfig -> Lifecycle -> [Socket] -> IO ()
 serveMany config lifecycle listeners = do
     done <- newEmptyMVar
-    forM_ listeners $ \listener -> forkIO $ do
-        result <- try (serveListener config lifecycle listener)
-        case result of
-            Left exception -> hPutStrLn stderr (show (exception :: SomeException)) >> putMVar done False
-            Right _ -> putMVar done True
+    forM_ listeners $ \listener -> forkIO $
+        try (serveListener config lifecycle listener) >>= putMVar done
     let wait :: Int -> IO ()
         wait 0 = pure ()
         wait remaining = do
-            stopped <- takeMVar done
-            when stopped (wait (remaining - 1))
+            result <- takeMVar done
+            case result of
+                Left exception -> throwIO (exception :: SomeException)
+                Right () -> wait (remaining - 1)
     wait (length listeners)
 
 serveManyPaths :: ServerConfig -> Lifecycle -> [B.ByteString] -> IO ()

@@ -1,4 +1,5 @@
-/* goonix: small socket bridge; no Haskell code runs in a forked child. */
+/* goonix: small socket bridge and start-up helpers; no Haskell code runs in
+   a forked child. */
 #define _GNU_SOURCE
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -15,6 +16,12 @@
 #include <string.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <limits.h>
+#include <sys/statvfs.h>
+#ifdef __linux__
+#include <sched.h>
+#include <sys/mount.h>
+#endif
 
 /* goonix: bind a Unix-domain socket exactly as the C++ daemon's
    open_unix_domain_socket (nix/nix-daemon/guix-daemon.cc): create the parent
@@ -151,18 +158,96 @@ int goonix_accept_ready(int fd) {
    Haskell code runs, so the dispositions are recorded from a constructor,
    which runs before that. */
 static unsigned long ignored_at_start;
+/* The signal mask the process started with, for goonix_make_store_writable,
+   which starts the daemon again. */
+static sigset_t mask_at_start;
+
+static const int stop_signals[] = { SIGHUP, SIGINT, SIGTERM };
 
 __attribute__((constructor)) static void record_ignored_signals(void) {
-  static const int signals[] = { SIGHUP, SIGINT, SIGTERM };
-  for (size_t i = 0; i < sizeof signals / sizeof signals[0]; i++) {
+  for (size_t i = 0; i < sizeof stop_signals / sizeof stop_signals[0]; i++) {
     struct sigaction action;
-    if (sigaction(signals[i], NULL, &action) == 0 && action.sa_handler == SIG_IGN)
-      ignored_at_start |= 1UL << signals[i];
+    if (sigaction(stop_signals[i], NULL, &action) == 0 && action.sa_handler == SIG_IGN)
+      ignored_at_start |= 1UL << stop_signals[i];
   }
+  sigprocmask(SIG_BLOCK, NULL, &mask_at_start);
 }
 
 int goonix_ignored_at_start(int sig) {
   return sig > 0 && sig < 32 && ((ignored_at_start >> sig) & 1UL);
+}
+
+/* goonix: the C++ LocalStore::ensureStoreWritable (nix/libstore/local-store.cc)
+   for the daemon process.  When STORE is on a read-only mount, a root daemon
+   gets a private mount namespace in which the store is remounted writable
+   (unshare(CLONE_NEWNS), then mount(MS_REMOUNT | MS_BIND)); a daemon that is
+   not root cannot, and fails.
+
+   The C++ daemon does this in each connection's process, which is
+   single-threaded.  This daemon is one threaded process, and unshare gives
+   the new namespace to the calling thread alone: the runtime's other threads,
+   and the builders and helpers that they start, would still see the store
+   read-only.  So once the store is remounted in this thread's namespace, the
+   thread executes the daemon again, with the same arguments and environment:
+   execve ends the other threads, and the program that it starts, with all of
+   its threads and children, runs in the namespace that has the writable
+   store.  The PID stays the same, so systemd's LISTEN_PID still names it, and
+   the inherited sockets stay open.  The dispositions of SIGHUP, SIGINT and
+   SIGTERM and the signal mask are first put back as the process found them,
+   so that the new program records the same ones (the runtime has replaced
+   SIGINT's by then).  _GOONIX_STORE_REMOUNTED, set to STORE for the new
+   program and removed from the environment by it, tells it that the remount
+   is done: a store whose file system itself is read-only stays read-only
+   after a bind remount, and C++ goes on in that case too.
+
+   Returns 0 when the store is writable or has been remounted, 1 when it is
+   read-only and the daemon is not root, and -1 (statvfs), -2 (unshare), -3
+   (mount) or -4 (executing the daemon again) with errno set on failure.  It
+   does not return after a remount.  Without unshare and bind mounts (GNU/Hurd)
+   it does nothing, as C++ does. */
+#define REMOUNTED_STORE "_GOONIX_STORE_REMOUNTED"
+
+extern void getFullProgArgv(int *argc, char **argv[]); /* GHC runtime */
+
+int goonix_make_store_writable(const char *store) {
+  const char *remounted = getenv(REMOUNTED_STORE);
+  int done = remounted != NULL && strcmp(remounted, store) == 0;
+  unsetenv(REMOUNTED_STORE);
+  if (done) return 0;
+#if defined(__linux__) && defined(CLONE_NEWNS) && defined(MS_BIND) && defined(MS_REMOUNT)
+  struct statvfs status;
+  if (statvfs(store, &status) != 0) return -1;
+  if (!(status.f_flag & ST_RDONLY)) return 0;
+  if (getuid() != 0) return 1;
+  if (unshare(CLONE_NEWNS) == -1) return -2;
+  if (mount(NULL, store, "none", MS_REMOUNT | MS_BIND, NULL) == -1) return -3;
+
+  int argc = 0;
+  char **argv = NULL;
+  getFullProgArgv(&argc, &argv);
+  if (argc < 1 || argv == NULL) { errno = EINVAL; return -4; }
+  char **arguments = calloc((size_t)argc + 1, sizeof *arguments);
+  if (arguments == NULL) return -4;
+  for (int i = 0; i < argc; i++) arguments[i] = argv[i];
+  if (setenv(REMOUNTED_STORE, store, 1) != 0) return -4;
+  /* The file that /proc/self/exe names, so that the process keeps its name
+     (the kernel takes it from the file name given to execve); the link itself
+     when that file is gone. */
+  char self[PATH_MAX];
+  const char *program = "/proc/self/exe";
+  ssize_t length = readlink(program, self, sizeof self - 1);
+  if (length > 0) {
+    self[length] = '\0';
+    if (access(self, X_OK) == 0) program = self;
+  }
+  for (size_t i = 0; i < sizeof stop_signals / sizeof stop_signals[0]; i++)
+    signal(stop_signals[i], goonix_ignored_at_start(stop_signals[i]) ? SIG_IGN : SIG_DFL);
+  sigprocmask(SIG_SETMASK, &mask_at_start, NULL);
+  execv(program, arguments);
+  return -4;
+#else
+  return 0;
+#endif
 }
 
 int goonix_peer_uid(int fd, uid_t *uid) {

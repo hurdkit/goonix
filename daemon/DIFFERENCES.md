@@ -140,6 +140,37 @@ none of which changes the store's behaviour:
   symlink-to-directory no further, so the symlink adds no root. It is not
   created here.
 
+A store on a read-only mount, as Guix System and NixOS mount it, is made
+writable once, at start-up, for the same reason (inventory 3.5). C++ does it in
+each connection's process: a root daemon unshares that process's mount
+namespace and remounts the store with `MS_REMOUNT | MS_BIND`, and the builds
+that the process starts see the writable store. Here the daemon does the same
+before it opens a socket or starts a helper. `unshare` moves only the calling
+thread of a threaded process to the new namespace, so after the remount that
+thread executes the daemon again, with the same PID, arguments, environment and
+inherited sockets; every thread of the daemon and every builder and helper it
+starts is then in the namespace where the store is writable. Outside it the
+store stays read-only, as it does outside the C++ connection processes. What
+differs:
+
+- A daemon that is not root, on a read-only store, prints C++'s message
+  ("'STORE' is read-only; make sure to mount it read-write for proper
+  guix-daemon operation") and ends with status 1. The C++ daemon starts and
+  refuses every client with that message. The same holds for the other
+  errors of these start-up steps, such as a build users group that does not
+  exist ("the group `G' specified in `build-users-group' does not exist").
+- The namespace is the daemon's for its whole life, one for all clients,
+  rather than one per connection.
+
+`daemon/test/differential/store-read-only-mount.sh` runs against either daemon,
+socket-activated as systemd starts it, as root of a user namespace with build
+users: on a read-only bind mount of the store it adds a text and builds a
+derivation, with and without the chroot; the daemon is still running afterwards
+and the store is still read-only outside its namespace. A daemon that is not
+root, and one whose build users group does not exist, either refuse the client
+with C++'s message or end with a non-zero status after printing it; neither
+ends with status 0.
+
 The Unix-socket start-up itself matches the C++ `open_unix_domain_socket`
 exactly (create the socket directory, chdir and bind the relative `./socket`,
 unlink a stale socket, bind 0666 under `umask(0111)`, chdir back, listen); see

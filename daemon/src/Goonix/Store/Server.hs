@@ -8,6 +8,7 @@ module Goonix.Store.Server
   , serveListener
   , openListener
   , activationSockets
+  , prepareStore
   , Lifecycle
   , newLifecycle
   , requestStop
@@ -31,6 +32,10 @@ import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import Data.Word (Word32, Word64)
+import Foreign.C.Error (Errno, errnoToIOError, getErrno)
+import Foreign.C.String (CString)
+import Foreign.C.Types (CInt (..))
+import GHC.IO.Exception (IOException (ioe_description))
 import Goonix.Store.GuixProgram (absPath)
 import Goonix.Store.Database (Value (Bytes))
 import Goonix.Store.Base32 (encodeBase16)
@@ -62,6 +67,7 @@ import System.Posix.Process (getProcessID)
 import System.Posix.Types (Fd (..))
 import System.Posix.User (getRealUserID)
 import System.IO (hPutStrLn, stderr)
+import System.IO.Error (isDoesNotExistError)
 
 -- | What the accept loops and the connections of one daemon process share so
 -- that the daemon can stop in an orderly way.
@@ -218,20 +224,61 @@ serveListener config lifecycle listener = do
     workers <- goalWorkers shared
     check (Map.null sessions && workers == 0)
 
+-- | The first two steps of the C++ LocalStore constructor
+-- (local-store.cc:72-73), which every other one follows: create the store
+-- directory, then ensureStoreWritable (local-store.cc:313-337).  When the
+-- store is on a read-only mount, as Guix System and NixOS mount it, a root
+-- daemon remounts it writable in a mount namespace of its own, and a daemon
+-- that is not root fails with C++'s message.  C++ takes these steps in each
+-- connection's process, before anything there writes to the store; this
+-- daemon takes them once, at start-up, before it opens a socket or starts a
+-- helper, and goonix_make_store_writable (cbits/sockets.c) then starts the
+-- daemon again so that all of its threads and children are in that
+-- namespace.  The messages are C++'s, as StoreError.
+prepareStore :: ByteString -> IO ()
+prepareStore store = do
+  mkdirParents store
+  result <- B.useAsCString store c_make_store_writable
+  errno <- getErrno
+  let failed message = throwIO (storeError (message ++ ": " ++ describe errno))
+  case result of
+    0 -> pure ()
+    1 -> throwIO (storeError ("'" ++ C.unpack store ++ "' is read-only; make sure to mount it read-write for proper guix-daemon operation"))
+    -1 -> failed "getting info about the store mount point"
+    -2 -> failed "setting up a private mount namespace"
+    -3 -> failed ("remounting " ++ C.unpack store ++ " writable")
+    _ -> failed "executing the daemon again in its private mount namespace"
+  where
+    describe :: Errno -> String
+    describe errno = ioe_description (errnoToIOError "" errno Nothing Nothing)
+
+foreign import ccall unsafe "goonix_make_store_writable"
+  c_make_store_writable :: CString -> IO CInt
+
 initialiseState :: ServerConfig -> IO ()
 initialiseState config = do
   mkdirParents (configStore config)
-  -- C++ LocalStore ctor (local-store.cc:86-107): for a multi-user install
+  -- C++ LocalStore ctor (local-store.cc:88-111): for a multi-user install
   -- (root daemon + build-users-group), the store is owned root:buildUsersGroup
   -- with mode 01775 so build users can create outputs (a builtin runs outside
   -- the chroot and writes the store directly).  Without this a root daemon's
-  -- builtin build fails "Permission denied" writing /gnu/store/<output>.
+  -- builtin build fails "Permission denied" writing /gnu/store/<output>.  As
+  -- there, the store is changed only when its owner, group or mode differs.
   uid <- getRealUserID
   let buildGroup = setting "build-users-group" "" (configDefaultSettings config)
   when (uid == 0 && not (B.null buildGroup)) $ do
-    groupEntry <- getGroupEntryForName (C.unpack buildGroup)
-    Files.setOwnerAndGroup (configStore config) 0 (fromIntegral (groupID groupEntry))
-    Files.setFileMode (configStore config) 0o1775
+    found <- try (getGroupEntryForName (C.unpack buildGroup))
+    groupEntry <- case found of
+      Right entry -> pure entry
+      Left lookupError
+        | isDoesNotExistError lookupError -> throwIO (storeError ("the group `" ++ C.unpack buildGroup ++ "' specified in `build-users-group' does not exist"))
+        | otherwise -> throwIO lookupError
+    let gid = groupID groupEntry
+    status <- Files.getFileStatus (configStore config)
+    when (Files.fileOwner status /= 0 || Files.fileGroup status /= gid
+          || Files.fileMode status .&. 0o7777 /= 0o1775) $ do
+      Files.setOwnerAndGroup (configStore config) 0 gid
+      Files.setFileMode (configStore config) 0o1775
   let state = configStateDirectory config
   user <- getUserEntryForID uid
   mkdirParents (state <> "/gcroots/auto")
